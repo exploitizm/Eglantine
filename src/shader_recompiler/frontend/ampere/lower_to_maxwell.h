@@ -1525,14 +1525,17 @@ case 0x311: { // F2I.FTZ.U64.TRUNC, per nvdisasm: Maxwell's F2I gives 32 bits, s
             if ((!half && !small && !byte && !word) ||
                 ((byte || small || extended_word) &&
                  (insn.Bits(24, 8) || (insn.words[3] & 0xc00001ffU) ||
-                  (opcode == 0xb05 && insn.Bits(62, 2)) ||
+                  (opcode == 0xb05 && insn.Bits(62, 2) && !small) ||
                   insn.Bits(91, 1) != static_cast<u32>(opcode == 0xd05))) ||
                 (opcode != 0xb05 && (insn.words[1] & 0xffffff00U)) ||
                 (opcode == 0xd05 && uniform_register(insn.Bits(32, 8)) == ~0U)) {
                 return fail(index, "native float-to-integer conversion mode");
             }
             const bool is_signed = insn.Bits(72, 1);
-            u32 source = opcode == 0xb05 ? materialize(2, 0, 252, false, false)
+            // U16 constant sources use the ordinary float absolute/negate bits.
+            // Apply them before NaN handling, saturation and rounding.
+            u32 source = opcode == 0xb05 ? materialize(2, 0, 252, small && insn.Bits(62, 1),
+                                                       small && insn.Bits(63, 1))
                        : opcode == 0xd05 ? uniform_register(insn.Bits(32, 8)) : insn.Bits(32, 8);
             if (half) {
                 extract_half({source, 2, false, false}, 0, 252);
