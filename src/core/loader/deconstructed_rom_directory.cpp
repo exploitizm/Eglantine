@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
+#include "core/file_sys/vfs/vfs_layered.h"
 #include <cstring>
 #include <string_view>
 #include "common/logging.h"
@@ -77,11 +79,70 @@ struct PatchCollection {
 
 namespace {
 
+// Extracted dumps may keep base/ and updates/<decimal content version>/ separately.
+// Newer files override older files, while unchanged files remain available from base.
+std::vector<FileSys::VirtualDir> ExtractedLayers(const FileSys::VirtualDir& exefs) {
+    const auto layer = exefs ? exefs->GetParentDirectory() : nullptr;
+    if (!layer) return {};
+    FileSys::VirtualDir root;
+    if (layer->GetName() == "base") {
+        root = layer->GetParentDirectory();
+    } else {
+        const auto updates = layer->GetParentDirectory();
+        const auto name = layer->GetName();
+        u64 version{};
+        const auto parsed = std::from_chars(name.data(), name.data() + name.size(), version);
+        if (!updates || updates->GetName() != "updates" || name.empty() ||
+            parsed.ec != std::errc{} || parsed.ptr != name.data() + name.size()) return {};
+        root = updates->GetParentDirectory();
+    }
+    if (!root) return {};
+    const auto base = root->GetSubdirectory("base");
+    const auto updates = root->GetSubdirectory("updates");
+    std::vector<std::pair<u64, FileSys::VirtualDir>> versions;
+    if (updates) {
+        for (const auto& update : updates->GetSubdirectories()) {
+            const auto name = update->GetName();
+            u64 version{};
+            const auto parsed = std::from_chars(name.data(), name.data() + name.size(), version);
+            if (parsed.ec == std::errc{} && parsed.ptr == name.data() + name.size() && !name.empty())
+                versions.emplace_back(version, update);
+        }
+    }
+    std::sort(versions.begin(), versions.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::vector<FileSys::VirtualDir> layers;
+    for (const auto& [version, update] : versions) {
+        LOG_INFO(Loader, "Using extracted update version {} at {}", version, update->GetFullPath());
+        layers.push_back(update);
+    }
+    if (base) layers.push_back(base);
+    return layers;
+}
+
+FileSys::VirtualDir ExtractedExeFS(const FileSys::VirtualDir& exefs) {
+    const auto layers = ExtractedLayers(exefs);
+    if (layers.empty()) return exefs;
+    std::vector<FileSys::VirtualDir> dirs;
+    for (const auto& layer : layers)
+        if (auto dir = layer->GetSubdirectory("exefs")) dirs.push_back(std::move(dir));
+    return FileSys::LayeredVfsDirectory::MakeLayeredDirectory(std::move(dirs));
+}
+
 // RomFS for a loose ExeFS: the first .romfs file next to main, else a romfs/ directory next to
 // the exefs/ directory (the usual layout of an extracted title).
 FileSys::VirtualFile FindLooseRomFS(const FileSys::VirtualDir& exefs_dir) {
     if (exefs_dir == nullptr) {
         return nullptr;
+    }
+    const auto layers = ExtractedLayers(exefs_dir);
+    if (!layers.empty()) {
+        std::vector<FileSys::VirtualDir> dirs;
+        for (const auto& layer : layers)
+            if (auto dir = layer->GetSubdirectory("romfs")) dirs.push_back(std::move(dir));
+        if (!dirs.empty()) {
+            LOG_INFO(Loader, "Using layered extracted RomFS ({} directories)", dirs.size());
+            return FileSys::CreateRomFS(FileSys::LayeredVfsDirectory::MakeLayeredDirectory(std::move(dirs)));
+        }
     }
     for (const auto& f : exefs_dir->GetFiles()) {
         if (f->GetExtension() == "romfs") {
@@ -169,8 +230,9 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys
     : AppLoader(std::move(file_))
     , override_update(override_update_)
 {
-    const auto file_dir = file->GetContainingDirectory();
-    const auto sidecar_dirs = FindSidecarDirs(file_dir);
+    const auto physical_dir = file->GetContainingDirectory();
+    const auto file_dir = ExtractedExeFS(physical_dir);
+    const auto sidecar_dirs = FindSidecarDirs(physical_dir);
 
     // Title ID
     const auto npdm = file_dir->GetFile("main.npdm");
@@ -233,7 +295,7 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys
         name = control->GetApplicationName();
     }
 
-    romfs = FindLooseRomFS(file_dir);
+    romfs = FindLooseRomFS(physical_dir);
     if (const auto title_dir = file_dir->GetParentDirectory()) {
         romfs_version = RomFSProductVersion(title_dir->GetSubdirectory("romfs"));
     }
@@ -270,7 +332,7 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
             return {ResultStatus::ErrorNullFile, {}};
         }
 
-        dir = file->GetContainingDirectory();
+        dir = ExtractedExeFS(file->GetContainingDirectory());
     }
 
     // Read meta to determine title ID
