@@ -15,12 +15,13 @@
 namespace Service::Audio {
 using namespace AudioCore::AudioOut;
 
-IAudioOut::IAudioOut(Core::System& system_, Manager& manager, size_t session_id,
+IAudioOut::IAudioOut(Core::System& system_, std::shared_ptr<Manager> manager_, size_t session_id,
                      const std::string& device_name, const AudioOutParameter& in_params,
                      Kernel::KProcess* handle, u64 applet_resource_user_id)
     : ServiceFramework{system_, "IAudioOut"}, service_context{system_, "IAudioOut"},
       event{service_context.CreateEvent("AudioOutEvent")}, process{handle},
-      impl{std::make_shared<AudioCore::AudioOut::Out>(system_, manager, event, session_id)} {
+      manager{std::move(manager_)},
+      impl{std::make_shared<AudioCore::AudioOut::Out>(system_, *manager, event, session_id)} {
 
     // clang-format off
     static const FunctionInfo functions[] = {

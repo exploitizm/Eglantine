@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <memory>
+
 #include "audio_core/audio_out_manager.h"
 #include "audio_core/out/audio_out.h"
 #include "core/hle/service/cmif_types.h"
@@ -43,7 +45,7 @@ private:
         AudioCore::AudioOut::AudioOutParameter parameter,
         InCopyHandle<Kernel::KProcess> process_handle, ClientAppletResourceUserId aruid);
 
-    std::optional<AudioCore::AudioOut::Manager> impl;
+    std::shared_ptr<AudioCore::AudioOut::Manager> impl;
 };
 
 } // namespace Service::Audio

@@ -15,7 +15,7 @@ using namespace AudioCore::AudioOut;
 
 IAudioOutManager::IAudioOutManager(Core::System& system_)
     : ServiceFramework{system_, "audout:u"}
-    , impl(system_)
+    , impl{std::make_shared<AudioCore::AudioOut::Manager>(system_)}
 {
     // clang-format off
     static const FunctionInfo functions[] = {
@@ -84,7 +84,7 @@ Result IAudioOutManager::OpenAudioOutAuto(
     LOG_DEBUG(Service_Audio, "Opening new AudioOut, sessionid={}, free sessions={}", new_session_id,
               impl->num_free_sessions);
 
-    auto audio_out = std::make_shared<IAudioOut>(system, *impl, new_session_id, device_name,
+    auto audio_out = std::make_shared<IAudioOut>(system, impl, new_session_id, device_name,
                                                  parameter, process_handle.Get(), aruid.pid);
     R_TRY(audio_out->GetImpl()->GetSystem().Initialize(device_name, parameter, process_handle.Get(),
                                                        aruid.pid));
