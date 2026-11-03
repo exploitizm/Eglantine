@@ -598,7 +598,14 @@ void Maxwell3D::ProcessMacroUpload(u32 data) {
 }
 
 void Maxwell3D::ProcessMacroBind(u32 data) {
-    GetNativeMacroPositions()[regs.load_mme.start_address_ptr++] = data;
+    // A pointer past the macro start addresses binds nothing, as on the split thread's front
+    // (FrontWrite). Title 4 (Donkey Kong Bananza) left 0x3a400040 there and the bind wrote 3.7 GB
+    // past the table, into the JIT's code.
+    const auto positions = GetNativeMacroPositions();
+    const u32 pointer = regs.load_mme.start_address_ptr++;
+    if (pointer < positions.size()) {
+        positions[pointer] = data;
+    }
 }
 
 void Maxwell3D::ProcessFirmwareCall4() {
