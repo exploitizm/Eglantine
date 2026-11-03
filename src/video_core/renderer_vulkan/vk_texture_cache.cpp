@@ -317,8 +317,10 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
         return host;
     };
     if (huge_bcn) {
-        // Native bytes, up to 1 GiB on the host.
-        while (level_offset + 1 < levels && NativeMipBytes(info, level_offset) > (u64{1} << 30)) {
+        // Native bytes, up to 256 MiB on the host. The PS5 maps at most about 6 GiB for its GPU, and
+        // a sparse image (UsesSparseLayers) maps all of its size, bound or not: title 1's three
+        // terrain arrays took 1.1 GiB of it at 1 GiB here.
+        while (level_offset + 1 < levels && NativeMipBytes(info, level_offset) > (u64{256} << 20)) {
             ++level_offset;
         }
         const ImageInfo host = host_info();
@@ -2179,6 +2181,10 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
         const ImageInfo host_info = TrimmedHostInfo(runtime_.device, info, host_level_offset);
         const u64 texels = u64{host_info.size.width} * host_info.size.height *
                            host_info.size.depth * static_cast<u64>(host_info.resources.layers);
+        LOG_INFO(Render_Vulkan, "Sparse image {:#x}: {}x{}x{} {} levels {} layers, format {}, {} MiB on the host",
+                 gpu_addr_, host_info.size.width, host_info.size.height, host_info.size.depth,
+                 host_info.resources.levels, host_info.resources.layers, static_cast<u32>(info.format),
+                 runtime_.device.GetLogical().GetImageMemoryRequirements(*original_image).size >> 20);
         if (UsesSparseLayers(runtime_.device, info, gpu_addr_) && InitSparseLayers()) {
             flags |= VideoCommon::ImageFlagBits::SparseLayers;
         } else if (texels <= (u64{1} << 28)) {

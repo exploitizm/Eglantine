@@ -117,6 +117,7 @@ SparseBuffer MultiRangeBufferCache::CreateSparse(const Device& device, Scheduler
     if (dld.vkCreateBuffer(logical, &buffer_ci, nullptr, &raw) != VK_SUCCESS) {
         return SparseBuffer{};
     }
+    LOG_INFO(Render_Vulkan, "Sparse buffer over {} ranges: {} MiB", sources.size(), total >> 20);
     SparseBuffer handle{raw, logical, dld};
     std::vector<VkSparseMemoryBind> binds;
     binds.reserve(sources.size());
