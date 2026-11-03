@@ -1955,6 +1955,59 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
                                         [[maybe_unused]] u64 total_size_bytes,
                                         [[maybe_unused]] std::span<BufferCopy> copies) {
     if constexpr (USE_MEMORY_MAPS) {
+        // A large upload goes in batches of up to 8 MiB, which the staging pool takes from its
+        // stream buffer (reused as the GPU gets past it), not in one staging buffer of its whole
+        // size: title 4 (Donkey Kong Bananza) synchronised a 2.4 GB buffer at once, and no 2.4 GB
+        // staging buffer could be made on the console.
+        constexpr u64 MaxUploadBatch = u64{8} << 20;
+        if (total_size_bytes > MaxUploadBatch) {
+            boost::container::small_vector<BufferCopy, 16> batch;
+            u64 batch_bytes = 0;
+            const auto flush = [&] {
+                if (batch.empty()) {
+                    return;
+                }
+                auto staging = runtime.UploadStagingBuffer(batch_bytes);
+                u64 offset = 0;
+                for (BufferCopy& copy : batch) {
+                    device_memory.ReadBlockUnsafe(buffer.CpuAddr() + copy.dst_offset,
+                                                  staging.mapped_span.data() + offset, copy.size);
+                    copy.src_offset = staging.offset + offset;
+                    offset += copy.size;
+                }
+                const std::span<BufferCopy> batch_span(batch.data(), batch.size());
+                const bool can_reorder = runtime.CanReorderUpload(buffer, batch_span);
+                runtime.CopyBuffer(buffer, staging.buffer, batch_span, true, can_reorder);
+                batch.clear();
+                batch_bytes = 0;
+            };
+            // Every 128 MiB the queued copies are submitted and waited for, so the stream buffer
+            // (256 MiB) is free again: left queued, each batch past it got a staging buffer of its
+            // own (230 of 8 MiB, 1.8 GB, in title 4) and the pool ran out.
+            u64 since_wait = 0;
+            for (const BufferCopy& copy : copies) {
+                for (u64 done = 0; done < copy.size;) {
+                    const u64 piece = (std::min<u64>)(copy.size - done, MaxUploadBatch);
+                    if (batch_bytes + piece > MaxUploadBatch) {
+                        flush();
+                        if (since_wait >= (u64{128} << 20)) {
+                            runtime.Finish();
+                            since_wait = 0;
+                        }
+                    }
+                    since_wait += piece;
+                    batch.push_back(BufferCopy{
+                        .src_offset = 0,
+                        .dst_offset = copy.dst_offset + done,
+                        .size = static_cast<size_t>(piece),
+                    });
+                    batch_bytes += piece;
+                    done += piece;
+                }
+            }
+            flush();
+            return;
+        }
         auto upload_staging = runtime.UploadStagingBuffer(total_size_bytes);
         const std::span<u8> staging_pointer = upload_staging.mapped_span;
         for (BufferCopy& copy : copies) {
