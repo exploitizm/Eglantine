@@ -1660,7 +1660,10 @@ bool TextureCache<P>::UploadWrittenLayers(Image& image) {
             }
         }
         image.dirty_layers.clear();
-        if (layers.empty() || layers.size() == num_layers) {
+        // An image that keeps only some of its levels (host_level_offset) is never uploaded whole: its
+        // staging buffer would be the size of every level of every layer.
+        const bool by_layers_only = image.host_level_offset != 0 && False(image.flags & ImageFlagBits::AcceleratedUpload);
+        if (layers.empty() || (layers.size() == num_layers && !by_layers_only)) {
             return false;
         }
         UploadLayers(image, layers);
@@ -1719,6 +1722,14 @@ void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
     if constexpr (requires { &Runtime::AccelerateImageUploadLayers; }) {
         if (False(image.flags & ImageFlagBits::AcceleratedUpload)) {
             // Plain formats: each layer unswizzled on its own into its layer of the image.
+            if (image.host_level_offset != 0 && layers.size() > 3) {
+                // Every level of a layer is unswizzled, and only those the host keeps are copied: a few
+                // layers at a time, so the staging buffer stays small.
+                for (size_t first = 0; first < layers.size(); first += 3) {
+                    UploadLayers(image, layers.subspan(first, (std::min<size_t>)(3, layers.size() - first)));
+                }
+                return;
+            }
             ImageInfo layer_info = image.info;
             layer_info.resources.layers = 1;
             const size_t layer_size = CalculateUnswizzledSizeBytes(layer_info);
@@ -1733,6 +1744,11 @@ void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
                     UnswizzleImage(*gpu_memory, layer_addr, layer_info, swizzle_data,
                                    staging.mapped_span.subspan(i * layer_size, layer_size));
                 for (BufferImageCopy copy : layer_copies) {
+                    // A host image that keeps only the levels from host_level_offset on.
+                    if (copy.image_subresource.base_level < static_cast<s32>(image.host_level_offset)) {
+                        continue;
+                    }
+                    copy.image_subresource.base_level -= static_cast<s32>(image.host_level_offset);
                     copy.buffer_offset += i * layer_size;
                     copy.image_subresource.base_layer = static_cast<s32>(layers[i]);
                     copies.push_back(copy);

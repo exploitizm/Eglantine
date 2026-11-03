@@ -271,6 +271,32 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
     return device.GetDeviceLocalMemory() < (u64{7} << 30) ? (u64{256} << 20) : (u64{512} << 20);
 }
 
+// A native BCn 2D array whose mip chain is over 1.5 GiB (title 1's BC6H terrain arrays: 8192x8192x68,
+// 85 MiB a layer). Its sparse image would need a block of zeroes mapped over every 2 MiB of its range,
+// and the console's driver refuses one past about 2 GiB, so it keeps only its mip levels from
+// `level_offset` on, as a huge ASTC array does (TrimmedHostInfo).
+[[nodiscard]] u64 NativeMipBytes(const ImageInfo& info, u32 skip) {
+    using namespace VideoCore::Surface;
+    const u32 block_width = DefaultBlockWidth(info.format);
+    const u32 block_height = DefaultBlockHeight(info.format);
+    u64 bytes = 0;
+    for (s32 level = static_cast<s32>(skip); level < info.resources.levels; ++level) {
+        const u32 width = (std::max)(info.size.width >> level, 1U);
+        const u32 height = (std::max)(info.size.height >> level, 1U);
+        bytes += u64{(width + block_width - 1) / block_width} * ((height + block_height - 1) / block_height) *
+                 BytesPerBlock(info.format);
+    }
+    return bytes * info.resources.layers;
+}
+
+[[nodiscard]] bool IsHugeBcnArray(const ImageInfo& info) {
+    if (!IsPixelFormatBCn(info.format) || info.type != ImageType::e2D || info.resources.layers <= 1 ||
+        info.num_samples != 1 || info.size.depth != 1) {
+        return false;
+    }
+    return NativeMipBytes(info, 0) > (u64{3} << 29);
+}
+
 // The host shape of an image whose decoded copy would not fit in VRAM: a GPU-decoded ASTC array
 // over 1 GiB as RGBA8 (title 1's 8192x8192x68 ASTC 8x8 virtual textures are 24 GB each) keeps only
 // its mip levels from `level_offset` on, so host mip 0 is guest mip `level_offset`. Normalized
@@ -278,7 +304,8 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
 [[nodiscard]] ImageInfo TrimmedHostInfo(const Device& device, const ImageInfo& info, u32& level_offset) {
     level_offset = 0;
     const bool decoded = WillUseAcceleratedAstcDecode(device, info);
-    if (info.type != ImageType::e2D || !(decoded || WillUseGpuBcnTranscode(device, info))) {
+    const bool huge_bcn = IsHugeBcnArray(info);
+    if (info.type != ImageType::e2D || !(decoded || huge_bcn || WillUseGpuBcnTranscode(device, info))) {
         return info;
     }
     const u32 levels = static_cast<u32>(info.resources.levels);
@@ -289,6 +316,17 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
         host.resources.levels -= static_cast<s32>(level_offset);
         return host;
     };
+    if (huge_bcn) {
+        // Native bytes, up to 1 GiB on the host.
+        while (level_offset + 1 < levels && NativeMipBytes(info, level_offset) > (u64{1} << 30)) {
+            ++level_offset;
+        }
+        const ImageInfo host = host_info();
+        LOG_WARNING(Render_Vulkan, "{}x{}x{} BCn array would be {} MiB on the host; keeping mip levels {}+ ({}x{})",
+                    info.size.width, info.size.height, info.resources.layers, NativeMipBytes(info, 0) >> 20,
+                    level_offset, host.size.width, host.size.height);
+        return host;
+    }
     // Switch 2 ASTC textures decoded on the GPU keep at most 2048 texels a side: a 4K texture is
     // held from its next mip level on (a quarter of the video memory and decode work). The game's
     // own mips are used, so nothing is resampled. EDEN_NS2_FULL_TEXTURES=1 keeps them whole.
