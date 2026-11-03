@@ -3775,6 +3775,131 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     for (u32 level = 0; level < levels; ++level) {
         decode_bytes += u64{(std::max)(width >> level, 1U)} * (std::max)(height >> level, 1U) * 4 * layers;
     }
+    // A large texture is decoded and encoded one mip level and a few layers at a time: its RGBA8
+    // decode image (4 bytes a texel) and BC output for all levels and layers at once were ~600 MiB
+    // in title 1 (Mario Kart World), and the 128 MiB output buffer found no block in the 12 GiB the
+    // PS5 shares. Each group's decode image and output go on the pending list with the work that
+    // reads them, and past GroupsInFlightBytes of them the oldest group is waited for.
+    constexpr u64 GroupDecodeBytes = u64{32} << 20;
+    constexpr u64 GroupsInFlightBytes = u64{128} << 20;
+    if (decode_bytes > 2 * GroupDecodeBytes) {
+        const bool group_bc3 = !IsOpaqueBc1Astc(device, info) &&
+                               Settings::GetAstcRecompression() != Settings::AstcRecompression::Bc1;
+        const u64 group_block_bytes = group_bc3 ? 16 : 8;
+        // The input holds each layer's levels from `skip` on (UploadImageContents), so its layer
+        // stride is that tail's size with trimmed levels, as in ASTCDecoderPass::AssembleInto.
+        const u64 input_layer_stride =
+            skip != 0 ? u64{info.layer_stride} - VideoCommon::FullUploadSwizzles(info)[skip].buffer_offset
+                      : u64{info.layer_stride};
+        static u32 reported{};
+        if (reported++ < 16) {
+            LOG_INFO(Render_Vulkan,
+                     "ASTC {}x{}x{} ({} levels from {}, format {}) re-compressed to {} in groups: "
+                     "{} MiB decoded",
+                     width, height, layers, levels, skip, static_cast<u32>(info.format),
+                     group_bc3 ? "BC3" : "BC1", decode_bytes >> 20);
+        }
+        for (u32 level = 0; level < levels; ++level) {
+            const VideoCommon::SwizzleParameters* swizzle = nullptr;
+            for (const VideoCommon::SwizzleParameters& candidate : swizzles) {
+                if (candidate.level == static_cast<s32>(level + skip)) {
+                    swizzle = &candidate;
+                    break;
+                }
+            }
+            if (swizzle == nullptr) {
+                continue;
+            }
+            const u32 level_width = (std::max)(width >> level, 1U);
+            const u32 level_height = (std::max)(height >> level, 1U);
+            const u32 blocks_x = Common::DivCeil(level_width, 4U);
+            const u32 blocks_y = Common::DivCeil(level_height, 4U);
+            const u64 layer_decode = u64{level_width} * level_height * 4;
+            const u32 group = static_cast<u32>(
+                std::clamp<u64>(GroupDecodeBytes / layer_decode, 1, layers));
+            for (u32 first = 0; first < layers; first += group) {
+                const u32 count = (std::min)(group, layers - first);
+                ReleaseTranscodes(GroupsInFlightBytes);
+                PendingTranscode part{
+                    .tick = 0,
+                    .image = memory_allocator.CreateImage(VkImageCreateInfo{
+                        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                        .pNext = nullptr,
+                        .flags = 0,
+                        .imageType = VK_IMAGE_TYPE_2D,
+                        .format = DecodeFormat,
+                        .extent = {level_width, level_height, 1},
+                        .mipLevels = 1,
+                        .arrayLayers = count,
+                        .samples = VK_SAMPLE_COUNT_1_BIT,
+                        .tiling = VK_IMAGE_TILING_OPTIMAL,
+                        .usage = VK_IMAGE_USAGE_STORAGE_BIT,
+                        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                        .queueFamilyIndexCount = 0,
+                        .pQueueFamilyIndices = nullptr,
+                        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                    }, true),
+                    .views = {},
+                };
+                // One view per layer for the decoder, then one of all of them for the encoder.
+                for (u32 layer = 0; layer < count; ++layer) {
+                    part.views.push_back(
+                        MakeStorageView(device.GetLogical(), 0, *part.image, DecodeFormat, layer, 1));
+                }
+                part.views.push_back(MakeStorageView(device.GetLogical(), 0, *part.image, DecodeFormat));
+                std::vector<u32> local_layers(count);
+                std::iota(local_layers.begin(), local_layers.end(), 0U);
+                StagingBufferRef part_map = map;
+                part_map.offset += u64{first} * input_layer_stride;
+                astc_decoder_pass->AssembleInto(
+                    info, skip, image.guest_size_bytes,
+                    ASTCDecoderPass::Target{
+                        .image = *part.image,
+                        .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .initialized = false,
+                        .level_view = [&part](s32) { return *part.views.back(); },
+                        .wait = false,
+                        .layers = local_layers,
+                        .layer_view = [&part](s32, u32 layer) { return *part.views[layer]; },
+                    },
+                    part_map, std::span<const VideoCommon::SwizzleParameters>(swizzle, 1));
+                const u64 size = u64{blocks_x} * blocks_y * count * group_block_bytes;
+                const auto output = staging_buffer_pool.Request(size, MemoryUsage::DeviceLocal);
+                bc_encoder_pass->Encode(*part.views.back(), level_width, level_height, count,
+                                        group_bc3, output.buffer, output.offset, size, 0);
+                scheduler.Record([](vk::CommandBuffer cmdbuf) {
+                    const VkMemoryBarrier barrier{
+                        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                        .pNext = nullptr,
+                        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+                    };
+                    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, barrier);
+                });
+                const VideoCommon::BufferImageCopy copy{
+                    .buffer_offset = 0,
+                    .buffer_size = size,
+                    .buffer_row_length = blocks_x * 4,
+                    .buffer_image_height = blocks_y * 4,
+                    .image_subresource{
+                        .base_level = static_cast<s32>(level),
+                        .base_layer = static_cast<s32>(first),
+                        .num_layers = static_cast<s32>(count),
+                    },
+                    .image_offset{0, 0, 0},
+                    .image_extent{level_width, level_height, 1},
+                };
+                image.UploadMemory(output.buffer, output.offset,
+                                   std::span<const VideoCommon::BufferImageCopy>(&copy, 1));
+                part.tick = scheduler.CurrentTick();
+                part.bytes = layer_decode * count + size;
+                pending_transcode_bytes += part.bytes;
+                pending_transcodes.push_back(std::move(part));
+            }
+        }
+        return;
+    }
     // The decode image lives only until the encode ran. Sub-allocated, not dedicated: streaming
     // worlds transcode ~100 textures a second, and a vkAllocateMemory plus a vkFreeMemory for each
     // took several percent of the GPU thread. VMA still gives large ones their own block.
