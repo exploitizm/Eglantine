@@ -40,8 +40,11 @@ class UpdateDescriptorQueue final {
     static constexpr size_t FRAMES_IN_FLIGHT = 8;
 
 public:
-    static constexpr size_t GUEST_FRAME_PAYLOAD_SIZE = 0x80000;
-    static constexpr size_t COMPUTE_FRAME_PAYLOAD_SIZE = 0x20000;
+    // A quarter of upstream's sizes: at 24 bytes an entry and 8 frames they held 120 MiB of the
+    // PS5's shared 12 GiB (96 + 24 MiB), and a frame that needs more waits for the worker and
+    // starts its payload again (Acquire). Title 4 (Donkey Kong Bananza) draws ~4,400 times a frame.
+    static constexpr size_t GUEST_FRAME_PAYLOAD_SIZE = 0x20000;
+    static constexpr size_t COMPUTE_FRAME_PAYLOAD_SIZE = 0x8000;
 
     explicit UpdateDescriptorQueue(const Device& device_, size_t frame_payload_size_,
                                    bool supports_descriptor_buffer_ = false);
