@@ -1732,7 +1732,15 @@ void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
             }
             ImageInfo layer_info = image.info;
             layer_info.resources.layers = 1;
-            const size_t layer_size = CalculateUnswizzledSizeBytes(layer_info);
+            // Only the levels the host keeps are unswizzled: a BC6H terrain layer (8192x8192, 85 MiB
+            // with its full chain) asked for 85 MiB of staging for the few MiB of levels it keeps,
+            // and the console's shared pool had no such block left.
+            const s32 first_level = static_cast<s32>(image.host_level_offset);
+            ImageInfo kept_info = layer_info;
+            kept_info.size.width = (std::max)(layer_info.size.width >> first_level, 1U);
+            kept_info.size.height = (std::max)(layer_info.size.height >> first_level, 1U);
+            kept_info.resources.levels -= first_level;
+            const size_t layer_size = CalculateUnswizzledSizeBytes(kept_info);
             auto staging = runtime.UploadStagingBuffer(layer_size * layers.size());
             std::vector<BufferImageCopy> copies;
             for (size_t i = 0; i < layers.size(); ++i) {
@@ -1742,7 +1750,7 @@ void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
                                  &swizzle_data_buffer);
                 auto layer_copies =
                     UnswizzleImage(*gpu_memory, layer_addr, layer_info, swizzle_data,
-                                   staging.mapped_span.subspan(i * layer_size, layer_size));
+                                   staging.mapped_span.subspan(i * layer_size, layer_size), first_level);
                 for (BufferImageCopy copy : layer_copies) {
                     // A host image that keeps only the levels from host_level_offset on.
                     if (copy.image_subresource.base_level < static_cast<s32>(image.host_level_offset)) {
