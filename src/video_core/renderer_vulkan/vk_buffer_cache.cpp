@@ -469,6 +469,10 @@ void BufferCacheRuntime::Wait(u64 tick) {
     scheduler.Wait(tick);
 }
 
+void BufferCacheRuntime::WaitSubmittedTick(u64 tick) {
+    scheduler.GetMasterSemaphore().Wait(tick);
+}
+
 void BufferCacheRuntime::Finish() {
     VideoCommon::ReadbackDiagnostics::Scope diagnostic{
         VideoCommon::ReadbackDiagnostics::Event::BufferFinish};

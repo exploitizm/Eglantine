@@ -199,8 +199,14 @@ public:
     void DumpCurrentEntry(const char* reason);
     void CheckSubmitHash(const CommandListHeader& header, u64 submit_hash);
     void RecordParsedEntry(const CommandListHeader& header, std::span<const CommandHeader> commands);
-    /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
+    /// Reads a command list on pages the GPU wrote into command_headers, from the copies the
+    /// buffer cache made after the work that wrote them or from guest memory for pages flushed
+    /// since. False when not all are current (or the list isn't GPU-written): the caller drains,
+    /// flushes and reads guest memory.
+    bool ReadGpuWrittenCommands(GPUVAddr address, u32 count);
+    /// Whether the entry lies on device pages the GPU has written (NX2).
     bool IsGpuWrittenCommands(GPUVAddr address, size_t size);
+    /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
     void FlushGpuWrittenCommands(GPUVAddr address, size_t size);
 
 private:
