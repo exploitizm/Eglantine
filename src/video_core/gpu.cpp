@@ -242,6 +242,33 @@ struct GPU::Impl {
             raster_area.completed_generation = 0;
             return raster_area;
         }
+        // Reversible PS5 comparison with the original core's CPU readback path.
+        // Keep GPU-owner handling above: a GPU worker must not queue a wait on itself.
+        static const bool original_readback = [] {
+            const char* value = std::getenv("EDEN_NX2_ORIGINAL_READBACK");
+            return value == nullptr || std::strcmp(value, "0") != 0;
+        }();
+        if (original_readback && g_nx2_ampere.load(std::memory_order_relaxed)) {
+            [[maybe_unused]] static const bool reported = [] {
+                LOG_WARNING(HW_GPU, "PS5 comparison: original CPU readback path active "
+                                    "(EDEN_NX2_ORIGINAL_READBACK=0 restores ordered reads)");
+                return true;
+            }();
+            auto area = renderer->ReadRasterizer()->GetFlushArea(addr, size);
+            // This path cannot certify the newer readback cache's work generation.
+            area.completed_generation = 0;
+            if (area.preemtive) {
+                return area;
+            }
+            area.preemtive = true;
+            const u64 fence = RequestSyncOperation([this, &area] {
+                renderer->ReadRasterizer()->FlushRegion(
+                    area.start_address, area.end_address - area.start_address);
+            });
+            gpu_thread.TickGPU(is_async);
+            WaitForSyncOperation(fence);
+            return area;
+        }
         static const bool unsafe_preemptive_reads = [] {
             const char* value = std::getenv("EDEN_NX2_UNSAFE_PREEMPTIVE_READS");
             return value != nullptr && std::strcmp(value, "1") == 0;
