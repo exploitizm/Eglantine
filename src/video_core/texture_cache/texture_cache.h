@@ -660,10 +660,10 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     if (!flags[Dirty::RenderTargets]) {
         for (size_t index = 0; index < NUM_RT; ++index) {
             ImageViewId& color_buffer_id = render_targets.color_buffer_ids[index];
-            PrepareImageView(color_buffer_id, true, is_clear && IsFullClear(color_buffer_id));
+            PrepareRenderTarget(color_buffer_id, is_clear && IsFullClear(color_buffer_id));
         }
         const ImageViewId depth_buffer_id = render_targets.depth_buffer_id;
-        PrepareImageView(depth_buffer_id, true, is_clear && IsFullClear(depth_buffer_id));
+        PrepareRenderTarget(depth_buffer_id, is_clear && IsFullClear(depth_buffer_id));
         return;
     }
 
@@ -677,11 +677,11 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
 
     for (size_t index = 0; index < NUM_RT; ++index) {
         ImageViewId& color_buffer_id = render_targets.color_buffer_ids[index];
-        PrepareImageView(color_buffer_id, true, is_clear && IsFullClear(color_buffer_id));
+        PrepareRenderTarget(color_buffer_id, is_clear && IsFullClear(color_buffer_id));
     }
     const ImageViewId depth_buffer_id = render_targets.depth_buffer_id;
 
-    PrepareImageView(depth_buffer_id, true, is_clear && IsFullClear(depth_buffer_id));
+    PrepareRenderTarget(depth_buffer_id, is_clear && IsFullClear(depth_buffer_id));
 
     rt_active_mask = 0;
     rt_image_id = {};
@@ -3557,6 +3557,35 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
         MarkModification(image);
     }
     lru_cache.Touch(image.lru_index, frame_tick);
+}
+
+template <class P>
+void TextureCache<P>::PrepareRenderTarget(ImageViewId image_view_id, bool invalidate) {
+    if (image_view_id && !invalidate && !slot_image_views[image_view_id].IsBuffer()) {
+        const ImageViewBase& image_view = slot_image_views[image_view_id];
+        Image& image = slot_images[image_view.image_id];
+        // What the guest wrote into a large render target is not uploaded: the GPU draws into it.
+        // Title 1 (Mario Kart World) re-uploaded a 144 MiB target 128 times as a race started, and
+        // its staging buffers found no free block that size in the console's shared pool.
+        if (True(image.flags & ImageFlagBits::CpuModified) &&
+            MapSizeBytes(image) > RenderTargetUploadMaxBytes &&
+            False(image.flags & ImageFlagBits::SparseLayers)) {
+            static u32 reported{};
+            if (reported++ < 8) {
+                LOG_INFO(HW_GPU, "Render target {:#x} ({} MiB): the guest's writes are not uploaded",
+                         image.gpu_addr, MapSizeBytes(image) >> 20);
+            }
+            image.flags &= ~ImageFlagBits::CpuModified;
+            image.dirty_layers.clear();
+            // Pages a partial write left untracked are tracked again (MarkPartialWrite).
+            RestorePartialPages(image);
+            if (False(image.flags & ImageFlagBits::Tracked)) {
+                TrackImage(image, image_view.image_id);
+            }
+            runtime.TransitionImageLayout(image);
+        }
+    }
+    PrepareImageView(image_view_id, true, invalidate);
 }
 
 template <class P>

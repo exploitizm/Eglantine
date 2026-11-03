@@ -159,6 +159,9 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     using BufferType = typename P::BufferType;
 
     static constexpr u32 LayerUploadMinSize = 64U << 20;
+    /// Render targets larger than this skip uploads of what the guest wrote (PrepareRenderTarget), and
+    /// images larger than this are not downloaded (IsDownloadable).
+    static constexpr size_t RenderTargetUploadMaxBytes = 32U << 20;
     static constexpr size_t LargeScratchCapacity = 64U << 20;
 
     /// Large layered images whose refresh can decode only the layers written since the last one.
@@ -467,6 +470,9 @@ private:
 
     /// Prepare an image view to be used
     void PrepareImageView(ImageViewId image_view_id, bool is_modification, bool invalidate);
+
+    /// Prepares a render target (PrepareImageView), without uploading the guest's writes into a large one.
+    void PrepareRenderTarget(ImageViewId image_view_id, bool invalidate);
 
     /// Execute copies from one image to the other, even if they are incompatible
     void CopyImage(ImageId dst_id, ImageId src_id, std::vector<ImageCopy> copies);
