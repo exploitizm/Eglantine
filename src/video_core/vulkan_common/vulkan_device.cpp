@@ -772,6 +772,13 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
             }
         }
     }
+    // EDEN_VMA_BLOCK_MIB=<n>: blocks of n MiB (4 to 256) instead of 64. Allocations over half a block
+    // get memory of their own, freed exactly when they go.
+    const VkDeviceSize block_size = [] {
+        const char* value = std::getenv("EDEN_VMA_BLOCK_MIB");
+        const unsigned long mib = value != nullptr ? std::strtoul(value, nullptr, 10) : 0;
+        return VkDeviceSize{mib == 0 ? 64UL : (std::clamp)(mib, 4UL, 256UL)} << 20;
+    }();
     const VmaAllocatorCreateInfo allocator_info{
             .flags = flags,
             .physicalDevice = physical,
@@ -779,7 +786,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
             // 64 MiB blocks on discrete GPUs too: with 256 MiB ones, Switch 2 titles' mix of
             // texture sizes left ~38% of the image blocks empty (2 GB of an 8 GB card in title
             // 1), which the texture cache counted as used and kept evicting textures for.
-            .preferredLargeHeapBlockSize = 64u * 1024u * 1024u,
+            .preferredLargeHeapBlockSize = block_size,
             .pAllocationCallbacks = nullptr,
             .pDeviceMemoryCallbacks = nullptr,
             .pHeapSizeLimit = heap_size_limit != 0 ? heap_size_limits.data() : nullptr,
