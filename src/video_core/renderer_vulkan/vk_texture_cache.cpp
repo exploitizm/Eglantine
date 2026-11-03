@@ -271,10 +271,10 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
     return device.GetDeviceLocalMemory() < (u64{7} << 30) ? (u64{256} << 20) : (u64{512} << 20);
 }
 
-// A native BCn 2D array whose mip chain is over 1.5 GiB (title 1's BC6H terrain arrays: 8192x8192x68,
-// 85 MiB a layer). Its sparse image would need a block of zeroes mapped over every 2 MiB of its range,
-// and the console's driver refuses one past about 2 GiB, so it keeps only its mip levels from
-// `level_offset` on, as a huge ASTC array does (TrimmedHostInfo).
+// A native BCn 2D array whose mip chain is over MaxTextureArrayBytes (title 1's BC6H terrain
+// arrays: 8192x8192x68, 85 MiB a layer). Its sparse image would need a block of zeroes mapped over
+// every 2 MiB of its range, and the console's driver refuses one past about 2 GiB, so it keeps only
+// its mip levels from `level_offset` on, as a huge ASTC array does (TrimmedHostInfo).
 [[nodiscard]] u64 NativeMipBytes(const ImageInfo& info, u32 skip) {
     using namespace VideoCore::Surface;
     const u32 block_width = DefaultBlockWidth(info.format);
@@ -289,12 +289,25 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
     return bytes * info.resources.layers;
 }
 
+// The most a texture array keeps on the host: 128 MiB, or EDEN_MAX_TEXTURE_ARRAY_MIB=<n> (32 to
+// 1536). From swizardlv/Eglantine 3b4d7dcc2b: a native BCn array or a GPU-decoded ASTC array over it
+// keeps only the mip levels that fit, so the PS5's shared 12 GiB holds the arrays at a lower
+// resolution instead of running out (title 1).
+[[nodiscard]] u64 MaxTextureArrayBytes() {
+    static const u64 bytes = [] {
+        const char* value = std::getenv("EDEN_MAX_TEXTURE_ARRAY_MIB");
+        const unsigned long mib = value != nullptr ? std::strtoul(value, nullptr, 10) : 0;
+        return u64{mib == 0 ? 128UL : (std::clamp)(mib, 32UL, 1536UL)} << 20;
+    }();
+    return bytes;
+}
+
 [[nodiscard]] bool IsHugeBcnArray(const ImageInfo& info) {
     if (!IsPixelFormatBCn(info.format) || info.type != ImageType::e2D || info.resources.layers <= 1 ||
         info.num_samples != 1 || info.size.depth != 1) {
         return false;
     }
-    return NativeMipBytes(info, 0) > (u64{3} << 29);
+    return NativeMipBytes(info, 0) > MaxTextureArrayBytes();
 }
 
 // The host shape of an image whose decoded copy would not fit in VRAM: a GPU-decoded ASTC array
@@ -317,10 +330,10 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
         return host;
     };
     if (huge_bcn) {
-        // Native bytes, up to 256 MiB on the host. The PS5 maps at most about 6 GiB for its GPU, and
+        // Native bytes, up to MaxTextureArrayBytes on the host. The PS5 maps at most about 6 GiB for its GPU, and
         // a sparse image (UsesSparseLayers) maps all of its size, bound or not: title 1's three
         // terrain arrays took 1.1 GiB of it at 1 GiB here.
-        while (level_offset + 1 < levels && NativeMipBytes(info, level_offset) > (u64{256} << 20)) {
+        while (level_offset + 1 < levels && NativeMipBytes(info, level_offset) > MaxTextureArrayBytes()) {
             ++level_offset;
         }
         const ImageInfo host = host_info();
@@ -352,10 +365,11 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
         }
         return bytes * info.resources.layers;
     };
-    if (decoded_bytes(level_offset) <= (u64{1} << 30)) {
+    if (decoded_bytes(level_offset) <= MaxTextureArrayBytes()) {
         return level_offset != 0 ? host_info() : info;
     }
-    const u64 limit = TrimmedAstcArrayLimit(device);
+    // The smaller of this core's limit (EDEN_NX2_ASTC_ARRAY_MIB) and EDEN_MAX_TEXTURE_ARRAY_MIB.
+    const u64 limit = (std::min)(TrimmedAstcArrayLimit(device), MaxTextureArrayBytes());
     while (level_offset + 1 < levels && decoded_bytes(level_offset) > limit) {
         ++level_offset;
     }
