@@ -15,7 +15,7 @@ namespace Service {
 struct Nx2SparseRegion {
     static constexpr u64 BlockSize = 4ULL << 20;
 
-    enum class Block : u8 { Empty, Backed, Failed, Pending };
+    enum class Block : u8 { Empty, Backed, Failed, Pending, Written };
 
     struct PendingBlock {
         u64 index;
@@ -27,11 +27,18 @@ struct Nx2SparseRegion {
         : size{size_}, blocks(Common::DivCeil(size, BlockSize)), generation{generation_} {}
 
     std::optional<PendingBlock> BeginBacking(u64 block) {
-        if (block >= blocks.size() || blocks[block] != Block::Empty) {
+        if (tiles || block >= blocks.size() || blocks[block] != Block::Empty) {
             return std::nullopt;
         }
         blocks[block] = Block::Pending;
         return PendingBlock{block, generation, (std::min)(BlockSize, size - block * BlockSize)};
+    }
+
+    void UseTiles() {
+        tiles = true;
+        for (auto& block : blocks) {
+            if (block == Block::Pending) block = Block::Written;
+        }
     }
 
     bool IsPending(const PendingBlock& pending) const {
@@ -50,6 +57,8 @@ struct Nx2SparseRegion {
     u64 size;
     std::vector<Block> blocks;
     bool warned{};
+    bool tiles{};
+    std::vector<bool> tile_pages;
     u64 generation;
 };
 

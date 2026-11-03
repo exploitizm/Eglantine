@@ -76,7 +76,10 @@ NvResult nvhost_as_gpu::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> i
                     [this](u64 gpu_address, u64 cpu_address, u64 size) {
                         Nx2BackSparse(gpu_address, cpu_address, size);
                     },
-                    [this](u64 gpu_address, u64 size) { Nx2Reserve(gpu_address, size); });
+                    [this](u64 gpu_address, u64 size) { Nx2Reserve(gpu_address, size); },
+                    [this](u64 gpu_address, u64 cpu_address, u64 size) {
+                        Nx2SparseTile(gpu_address, cpu_address, size);
+                    });
             }
             return result;
         }
@@ -771,5 +774,38 @@ Kernel::KEvent* nvhost_as_gpu::QueryEvent(u32 event_id) {
     LOG_CRITICAL(Service_NVDRV, "Unknown AS GPU Event {}", event_id);
     return nullptr;
 }
+
+
+void nvhost_as_gpu::Nx2SparseTile(u64 gpu_address, u64 cpu_address, u64 size) {
+    DAddr device{};
+    Core::Asid asid{};
+    {
+        std::scoped_lock lock(mutex);
+        auto it = nx2_sparse_ranges.upper_bound(gpu_address);
+        auto* session = container.GetSession(nx2_session);
+        if (it == nx2_sparse_ranges.begin() || session == nullptr) {
+            return;
+        }
+        --it;
+        const auto& [start, range] = *it;
+        const auto& [region_size, device_address] = range;
+        if (gpu_address + size > start + region_size) {
+            return;
+        }
+        // In GPU-thread order: command lists submitted before the request still see the old tile.
+        // Unmapping first keeps the SMMU's reverse map right and invalidates the caches over the tile,
+        // whose contents are now what the game's memory holds there.
+        device = device_address + (gpu_address - start);
+        asid = session->asid;
+    }
+    auto& smmu = system.Host1x().MemoryManager();
+    system.GPU().RunInOrder([&smmu, device, cpu_address, size, asid] {
+        smmu.Unmap(device, size);
+        if (cpu_address != 0) {
+            smmu.Map(device, cpu_address, size, asid, true);
+        }
+    });
+}
+
 
 } // namespace Service::Nvidia::Devices

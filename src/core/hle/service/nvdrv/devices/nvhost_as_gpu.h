@@ -249,6 +249,8 @@ private:
     void Nx2Sparse(u64 gpu_address, u64 size, bool create);
     void Nx2BackSparse(u64 gpu_address, u64 cpu_address, u64 size);
     void Nx2Reserve(u64 gpu_address, u64 size);
+    // A tile of a sparse region (nx2:gpu 216): its device pages show process memory, or nothing.
+    void Nx2SparseTile(u64 gpu_address, u64 cpu_address, u64 size);
     std::map<u64, std::pair<u64, DAddr>> nx2_sparse_ranges; ///< GPU address -> (size, device)
 };
 

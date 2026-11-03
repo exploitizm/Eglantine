@@ -49,6 +49,9 @@ public:
     /// A block of a sparse region gets memory [cpu_address, +size).
     using BackListener = std::function<void(u64 gpu_address, u64 cpu_address, u64 size)>;
     using ReserveListener = std::function<void(u64 gpu_address, u64 size)>;
+    /// A tile of a sparse region shows process memory [cpu_address, +size), or reads zero again
+    /// (cpu_address 0).
+    using TileListener = std::function<void(u64 gpu_address, u64 cpu_address, u64 size)>;
 
     static Nx2GpuMemoryRegistry& Get() {
         static Nx2GpuMemoryRegistry registry;
@@ -206,9 +209,50 @@ public:
         Run(todo);
     }
 
+    // nx2:gpu 216 (sparse map requests): the tile [gpu_address, +size) of a sparse region now
+    // shows the process memory at cpu_address, the game's own memory (sub 101), or with
+    // cpu_address 0 it is unmapped and reads zero. The GPU mapping stays as it is; only the
+    // region's device pages change, in GPU-thread order.
+    void MapSparseTile(u64 gpu_address, u64 cpu_address, u64 size) {
+        Ordered([&](Calls& todo) {
+            auto it = sparse_regions.upper_bound(gpu_address);
+            if (!Nx2GpuMappingTable::Valid(gpu_address, size) ||
+                (cpu_address != 0 && !Nx2GpuMappingTable::Valid(cpu_address, size)) ||
+                it == sparse_regions.begin()) return;
+            --it;
+            auto& [start, region] = *it;
+            if (gpu_address - start >= region.size || size > region.size - (gpu_address - start))
+                return;
+            if (cpu_address != 0) region.tiles.Map(gpu_address, cpu_address, size);
+            else region.tiles.Unmap(gpu_address, size);
+            // Do not replay a retired backing into a newly opened address space. Keep only
+            // pieces outside this remap, then replay the tile overlays below.
+            const u64 end = gpu_address + size;
+            std::map<u64, SparseBacking> kept;
+            for (auto block = region.blocks.begin(); block != region.blocks.end();) {
+                const u64 first = block->first;
+                const auto backing = block->second;
+                const u64 last = first + backing.size;
+                if (last <= gpu_address || first >= end) { ++block; continue; }
+                block = region.blocks.erase(block);
+                if (first < gpu_address) kept.emplace(first, SparseBacking{backing.cpu, gpu_address - first});
+                if (last > end) kept.emplace(end, SparseBacking{backing.cpu + end - first, last - end});
+            }
+            region.blocks.merge(kept);
+            for (auto& [owner, listener] : listeners) {
+                if (listener.tile) {
+                    todo.push_back([tile = listener.tile, gpu_address, cpu_address, size] {
+                        tile(gpu_address, cpu_address, size);
+                    });
+                }
+            }
+        });
+    }
+
     void AddListener(const void* owner, Listener listener, UnmapListener unmap_listener,
                      ReleaseListener release_listener = {}, SparseListener sparse_listener = {},
-                     BackListener back_listener = {}, ReserveListener reserve_listener = {}) {
+                     BackListener back_listener = {}, ReserveListener reserve_listener = {},
+                     TileListener tile_listener = {}) {
         Ordered([&](Calls& todo) {
             const auto& added =
                 listeners
@@ -216,7 +260,7 @@ public:
                                                        std::move(release_listener),
                                                        std::move(sparse_listener),
                                                        std::move(back_listener),
-                                                       std::move(reserve_listener)})
+                                                       std::move(reserve_listener), std::move(tile_listener)})
                     .first->second;
             if (added.sparse) {
                 for (const auto& [gpu_address, region] : sparse_regions) {
@@ -230,6 +274,15 @@ public:
                                 back(gpu, cpu, bytes);
                             });
                         }
+                    }
+                }
+            }
+            if (added.tile) {
+                for (const auto& [gpu, region] : sparse_regions) {
+                    for (const auto& tile : region.tiles.Effective()) {
+                        todo.push_back([call = added.tile, tile] {
+                            call(tile.gpu, tile.cpu, tile.size);
+                        });
                     }
                 }
             }
@@ -297,6 +350,7 @@ private:
         SparseListener sparse;
         BackListener back;
         ReserveListener reserve;
+        TileListener tile;
     };
 
     struct SparseBacking {
@@ -307,6 +361,7 @@ private:
     struct SparseRegion {
         u64 size;
         std::map<u64, SparseBacking> blocks;
+        Nx2GpuMappingTable tiles;
     };
 
     // A change from the game's side: `change` updates the state under `mutex` and adds the listener

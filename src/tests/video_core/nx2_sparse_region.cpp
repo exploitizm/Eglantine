@@ -68,3 +68,15 @@ TEST_CASE("Nx2 sparse backing rejects pending indices outside a replacement", "[
     CHECK_FALSE(replacement.FinishBacking(*pending, true));
     CHECK(replacement.blocks[0] == Nx2SparseRegion::Block::Empty);
 }
+
+
+TEST_CASE("Nx2 game-owned tiles cancel pending backing and forbid new backing", "[nx2_mapping]") {
+    Nx2SparseRegion region{2 * Nx2SparseRegion::BlockSize, 7};
+    const auto pending = region.BeginBacking(0);
+    REQUIRE(pending);
+    region.UseTiles();
+    CHECK_FALSE(region.IsPending(*pending));
+    CHECK_FALSE(region.FinishBacking(*pending, true));
+    CHECK(region.blocks[0] == Nx2SparseRegion::Block::Written);
+    CHECK_FALSE(region.BeginBacking(1));
+}

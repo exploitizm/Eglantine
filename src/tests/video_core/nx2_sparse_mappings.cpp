@@ -31,7 +31,8 @@ public:
                 events.push_back({create ? 's' : 'd', gpu, 0, size});
             },
             [this](u64 gpu, u64 cpu, u64 size) { events.push_back({'b', gpu, cpu, size}); },
-            [this](u64 gpu, u64 size) { events.push_back({'v', gpu, 0, size}); });
+            [this](u64 gpu, u64 size) { events.push_back({'v', gpu, 0, size}); },
+            [this](u64 gpu, u64 cpu, u64 size) { events.push_back({'t', gpu, cpu, size}); });
     }
 
     ~Recorder() {
@@ -233,5 +234,25 @@ TEST_CASE("Nx2 remapped GPU ranges replace their backing", "[nx2_mapping]") {
     CHECK(events == std::vector<Event>{{'r', 0, 0x1000000, 0x1000}});
     events.clear();
     registry.ReleaseBacking(0x1100000, 0x1000);
+    CHECK(events.empty());
+}
+
+
+TEST_CASE("Nx2 tile remaps replace retired sparse backing for new listeners", "[nx2_mapping]") {
+    CleanRegistry clean;
+    auto& registry = Nx2GpuMemoryRegistry::Get();
+    std::vector<Event> events;
+    Recorder first{events};
+    REQUIRE(registry.CreateSparse(0x100000, 0x4000));
+    registry.BackSparse(0x100000, 0x800000, 0x4000);
+    registry.MapSparseTile(0x100000, 0, 0x4000);
+    registry.MapSparseTile(0x101000, 0x900000, 0x1000);
+    std::vector<Event> replay;
+    Recorder second{replay};
+    CHECK(replay == std::vector<Event>{{'s', 0x100000, 0, 0x4000},
+                                      {'t', 0x101000, 0x900000, 0x1000}});
+    events.clear();
+    registry.MapSparseTile(0x103000, 0x900000, 0x2000);
+    registry.MapSparseTile(0x100000, 0x900000, 0);
     CHECK(events.empty());
 }
