@@ -207,6 +207,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     std::vector<u32> BindSparseLayers(Image& image, std::span<const u32> layers);
 
     /// Uploads `layers` of the image from guest memory.
+    bool UploadLayerBatches(Image& image, std::span<const u32> layers, size_t bytes_per_layer);
     void UploadLayers(Image& image, std::span<const u32> layers);
 
     struct PendingUnswizzle {

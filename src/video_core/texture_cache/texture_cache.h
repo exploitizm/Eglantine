@@ -43,6 +43,16 @@ inline bool NativeDrawDiagnostics() {
     return enabled;
 }
 
+// Optional staging target for layer groups; one oversized layer is uploaded on its own.
+inline size_t TextureUploadBatchBytes() {
+    static const size_t bytes = [] {
+        const char* value = std::getenv("EDEN_TEXTURE_UPLOAD_BATCH_KIB");
+        const unsigned long kib = value != nullptr ? std::strtoul(value, nullptr, 10) : 0;
+        return kib == 0 ? size_t{0} : size_t{(std::clamp)(kib, 256UL, 65536UL)} << 10;
+    }();
+    return bytes;
+}
+
 using Tegra::Texture::TICEntry;
 using Tegra::Texture::TSCEntry;
 using VideoCore::Surface::GetFormatType;
@@ -1656,6 +1666,19 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         runtime.InsertUploadMemoryBarrier();
         return;
     }
+    if constexpr (requires { &Runtime::AccelerateImageUploadLayers; }) {
+        if (const size_t budget = TextureUploadBatchBytes(); budget != 0 &&
+            image.info.type == ImageType::e2D && image.info.resources.layers > 1 &&
+            MapSizeBytes(image) > budget &&
+            (False(image.flags & ImageFlagBits::Converted) ||
+             True(image.flags & ImageFlagBits::AcceleratedUpload))) {
+            std::vector<u32> layers(static_cast<size_t>(image.info.resources.layers));
+            std::iota(layers.begin(), layers.end(), 0U);
+            UploadLayers(image, layers);
+            runtime.InsertUploadMemoryBarrier();
+            return;
+        }
+    }
     ++images_uploaded;
     uploaded_bytes += image.guest_size_bytes;
     largest_upload = (std::max<u64>)(largest_upload, image.guest_size_bytes);
@@ -1847,6 +1870,34 @@ std::vector<u32> TextureCache<P>::BindSparseLayers(Image& image, std::span<const
 }
 
 template <class P>
+bool TextureCache<P>::UploadLayerBatches(Image& image, std::span<const u32> layers,
+                                        size_t bytes_per_layer) {
+    const size_t budget = TextureUploadBatchBytes();
+    if (budget == 0 || bytes_per_layer == 0) {
+        return false;
+    }
+    const size_t batch_layers = (std::max)(size_t{1}, budget / bytes_per_layer);
+    if (layers.size() <= batch_layers) {
+        return false;
+    }
+    static u64 batches = 0;
+    ++batches;
+    if (batches <= 8 || (batches & (batches - 1)) == 0) {
+        LOG_INFO(HW_GPU, "Texture upload batching: image={:#x} layers={} bytes_per_layer={} "
+                        "layers_per_batch={} target_bytes={}",
+                 image.gpu_addr, layers.size(), bytes_per_layer, batch_layers, budget);
+    }
+    for (size_t first = 0; first < layers.size();) {
+        const size_t count = (std::min)(batch_layers, layers.size() - first);
+        UploadLayers(image, layers.subspan(first, count));
+        // Record every consumer before completing the group and reusing staging storage.
+        runtime.Finish();
+        first += count;
+    }
+    return true;
+}
+
+template <class P>
 void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
     if constexpr (requires { &Runtime::AccelerateImageUploadLayers; }) {
         if (False(image.flags & ImageFlagBits::AcceleratedUpload)) {
@@ -1870,6 +1921,9 @@ void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
             kept_info.size.height = (std::max)(layer_info.size.height >> first_level, 1U);
             kept_info.resources.levels -= first_level;
             const size_t layer_size = CalculateUnswizzledSizeBytes(kept_info);
+            if (UploadLayerBatches(image, layers, layer_size)) {
+                return;
+            }
             auto staging = runtime.UploadStagingBuffer(layer_size * layers.size());
             std::vector<BufferImageCopy> copies;
             for (size_t i = 0; i < layers.size(); ++i) {
@@ -1901,6 +1955,9 @@ void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
         auto uploads = FullUploadSwizzles(image.info);
         const size_t level_offset = uploads[image.host_level_offset].buffer_offset;
         const size_t tail = image.info.layer_stride - level_offset;
+        if (UploadLayerBatches(image, layers, tail)) {
+            return;
+        }
         auto staging = runtime.UploadStagingBuffer(tail * layers.size());
         for (size_t i = 0; i < layers.size(); ++i) {
             gpu_memory->ReadBlock(image.gpu_addr + u64{layers[i]} * image.info.layer_stride +
