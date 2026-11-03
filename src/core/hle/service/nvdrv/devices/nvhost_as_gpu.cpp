@@ -6,9 +6,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <cstring>
+#include <functional>
 #include <cstdlib>
 #include <optional>
 #include <utility>
+#include <vector>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -133,138 +135,166 @@ void nvhost_as_gpu::OnOpen(NvCore::SessionId session_id, DeviceFD fd) {
     nx2_session = session_id;
 }
 
+// The Switch 2 address-space changes queue their GPU page table and SMMU updates with RunInOrder,
+// which waits for room in the GPU thread's queue. So they queue them after `mutex` is released: the
+// GPU thread takes `mutex` to back a sparse block (Nx2BackSparse), and a full queue with `mutex`
+// held stopped both (Mario Kart World at its first load screen).
 void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
-    std::scoped_lock lock(mutex);
-    auto* session = container.GetSession(nx2_session);
-    if (!gmmu || session == nullptr) {
-        LOG_ERROR(Service_NVDRV, "Switch 2 GPU mapping {:#x}+{:#x}: no address space or session",
-                  gpu_address, size);
-        return;
-    }
-    // The same CPU range is often mapped twice (at its own address and in a sparse region), so
-    // reuse its SMMU mapping.
+    Tegra::MemoryManager* target = nullptr;
     DAddr device_address{};
-    bool heap = false;
-    const auto backing = std::find_if(nx2_device_ranges.begin(), nx2_device_ranges.end(),
-                                      [&](const auto& entry) {
-        const auto [start, length] = entry.first;
-        return cpu_address >= start && cpu_address - start <= length &&
-               size <= length - (cpu_address - start);
-    });
-    if (backing != nx2_device_ranges.end()) {
-        const auto it = backing;
-        device_address = it->second.address + (cpu_address - it->first.first);
-        heap = it->second.heap;
-    } else if (session->has_preallocated_area && session->mapper->IsInBounds(cpu_address, size)) {
-        device_address = session->mapper->Map(cpu_address, size);
-        heap = true;
-    } else {
-        auto& smmu = system.Host1x().MemoryManager();
-        device_address = smmu.Allocate(Common::AlignUp(size, 0x20000));
-        if (device_address == 0) {
-            LOG_CRITICAL(Service_NVDRV, "Switch 2 GPU memory {:#x}+{:#x}: out of SMMU space",
-                         cpu_address, size);
+    {
+        std::scoped_lock lock(mutex);
+        auto* session = container.GetSession(nx2_session);
+        if (!gmmu || session == nullptr) {
+            LOG_ERROR(Service_NVDRV, "Switch 2 GPU mapping {:#x}+{:#x}: no address space or session",
+                      gpu_address, size);
             return;
         }
-        smmu.Map(device_address, cpu_address, size, session->asid, true);
+        // The same CPU range is often mapped twice (at its own address and in a sparse region), so
+        // reuse its SMMU mapping.
+        bool heap = false;
+        const auto backing = std::find_if(nx2_device_ranges.begin(), nx2_device_ranges.end(),
+                                          [&](const auto& entry) {
+            const auto [start, length] = entry.first;
+            return cpu_address >= start && cpu_address - start <= length &&
+                   size <= length - (cpu_address - start);
+        });
+        if (backing != nx2_device_ranges.end()) {
+            const auto it = backing;
+            device_address = it->second.address + (cpu_address - it->first.first);
+            heap = it->second.heap;
+        } else if (session->has_preallocated_area && session->mapper->IsInBounds(cpu_address, size)) {
+            device_address = session->mapper->Map(cpu_address, size);
+            heap = true;
+        } else {
+            auto& smmu = system.Host1x().MemoryManager();
+            device_address = smmu.Allocate(Common::AlignUp(size, 0x20000));
+            if (device_address == 0) {
+                LOG_CRITICAL(Service_NVDRV, "Switch 2 GPU memory {:#x}+{:#x}: out of SMMU space",
+                             cpu_address, size);
+                return;
+            }
+            smmu.Map(device_address, cpu_address, size, session->asid, true);
+        }
+        if (backing == nx2_device_ranges.end()) {
+            nx2_device_ranges[{cpu_address, size}] = {device_address, heap};
+        }
+        Nx2GpuMemoryRegistry::Get().RecordDeviceRange(cpu_address, size, device_address);
+        static const bool trace_native_image = std::getenv("EDEN_NX2_IMAGE_TRACE") != nullptr;
+        static u32 traced_maps{};
+        if (trace_native_image && traced_maps++ < 4096) {
+            auto& smmu = system.Host1x().MemoryManager();
+            const auto* device_pointer = smmu.GetPointer<u8>(device_address);
+            const auto* cpu_pointer = system.ApplicationMemory().GetPointerSilent(cpu_address);
+            LOG_INFO(Service_NVDRV, "Native address-space map: owner={} session={} gpu={:#x} "
+                     "cpu={:#x} device={:#x} size={:#x} heap={} reused={} device_physical={:#x} "
+                     "cpu_physical={:#x} same_backing={}", fmt::ptr(this), nx2_session.id,
+                     gpu_address, cpu_address, device_address, size, heap,
+                     backing != nx2_device_ranges.end(),
+                     device_pointer ? system.DeviceMemory().GetRawPhysicalAddr(device_pointer) : 0,
+                     cpu_pointer ? system.DeviceMemory().GetRawPhysicalAddr(cpu_pointer) : 0,
+                     device_pointer != nullptr && device_pointer == cpu_pointer);
+        }
+        nx2_gpu_views.Map(gpu_address, cpu_address, size);
+        target = gmmu.get();
     }
-    if (backing == nx2_device_ranges.end()) {
-        nx2_device_ranges[{cpu_address, size}] = {device_address, heap};
-    }
-    Nx2GpuMemoryRegistry::Get().RecordDeviceRange(cpu_address, size, device_address);
-    static const bool trace_native_image = std::getenv("EDEN_NX2_IMAGE_TRACE") != nullptr;
-    static u32 traced_maps{};
-    if (trace_native_image && traced_maps++ < 4096) {
-        auto& smmu = system.Host1x().MemoryManager();
-        const auto* device_pointer = smmu.GetPointer<u8>(device_address);
-        const auto* cpu_pointer = system.ApplicationMemory().GetPointerSilent(cpu_address);
-        LOG_INFO(Service_NVDRV, "Native address-space map: owner={} session={} gpu={:#x} "
-                 "cpu={:#x} device={:#x} size={:#x} heap={} reused={} device_physical={:#x} "
-                 "cpu_physical={:#x} same_backing={}", fmt::ptr(this), nx2_session.id,
-                 gpu_address, cpu_address, device_address, size, heap,
-                 backing != nx2_device_ranges.end(),
-                 device_pointer ? system.DeviceMemory().GetRawPhysicalAddr(device_pointer) : 0,
-                 cpu_pointer ? system.DeviceMemory().GetRawPhysicalAddr(cpu_pointer) : 0,
-                 device_pointer != nullptr && device_pointer == cpu_pointer);
-    }
-    nx2_gpu_views.Map(gpu_address, cpu_address, size);
-    system.GPU().RunInOrder([gmmu = gmmu.get(), gpu_address, device_address, size] {
-        gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
+    system.GPU().RunInOrder([target, gpu_address, device_address, size] {
+        target->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
     });
     LOG_DEBUG(Service_NVDRV, "Switch 2 GPU mapping {:#x}+{:#x} -> CPU {:#x}", gpu_address, size,
               cpu_address);
 }
 
 void nvhost_as_gpu::Nx2Unmap(u64 gpu_address, u64 size) {
-    std::scoped_lock lock(mutex);
-    if (!gmmu) {
-        return;
+    Tegra::MemoryManager* target = nullptr;
+    {
+        std::scoped_lock lock(mutex);
+        if (!gmmu) {
+            return;
+        }
+        nx2_gpu_views.Unmap(gpu_address, size);
+        target = gmmu.get();
     }
-    nx2_gpu_views.Unmap(gpu_address, size);
     // The GPU thread may still be running command lists that use the range.
-    system.GPU().RunInOrder([gmmu = gmmu.get(), gpu_address, size] { gmmu->Unmap(gpu_address, size); });
+    system.GPU().RunInOrder([target, gpu_address, size] { target->Unmap(gpu_address, size); });
     LOG_DEBUG(Service_NVDRV, "Switch 2 GPU unmapping {:#x}+{:#x}", gpu_address, size);
 }
 
 void nvhost_as_gpu::Nx2Release(u64 cpu_address, u64 size) {
-    std::scoped_lock lock(mutex);
-    auto* session = container.GetSession(nx2_session);
     auto& smmu = system.Host1x().MemoryManager();
-    std::erase_if(nx2_device_ranges, [&](const auto& entry) {
-        const auto [start, length] = entry.first;
-        if (start >= cpu_address + size || cpu_address >= start + length ||
-            nx2_gpu_views.UsesBacking(start, length)) {
-            return false;
-        }
-        const auto range = entry.second;
-        auto* const mapper = range.heap && session != nullptr ? session->mapper.get() : nullptr;
-        system.GPU().RunInOrder([&smmu, mapper, range, start, length] {
-            if (range.heap) {
-                if (mapper != nullptr) {
-                    mapper->Unmap(start, length);
-                }
-                return;
+    std::vector<std::function<void()>> releases;
+    {
+        std::scoped_lock lock(mutex);
+        auto* session = container.GetSession(nx2_session);
+        std::erase_if(nx2_device_ranges, [&](const auto& entry) {
+            const auto [start, length] = entry.first;
+            if (start >= cpu_address + size || cpu_address >= start + length ||
+                nx2_gpu_views.UsesBacking(start, length)) {
+                return false;
             }
-            smmu.Unmap(range.address, length);
-            smmu.Free(range.address, Common::AlignUp(length, 0x20000));
+            const auto range = entry.second;
+            auto* const mapper = range.heap && session != nullptr ? session->mapper.get() : nullptr;
+            releases.push_back([&smmu, mapper, range, start, length] {
+                if (range.heap) {
+                    if (mapper != nullptr) {
+                        mapper->Unmap(start, length);
+                    }
+                    return;
+                }
+                smmu.Unmap(range.address, length);
+                smmu.Free(range.address, Common::AlignUp(length, 0x20000));
+            });
+            return true;
         });
-        return true;
-    });
+    }
+    for (auto& release : releases) {
+        system.GPU().RunInOrder(std::move(release));
+    }
     LOG_DEBUG(Service_NVDRV, "Switch 2 released backing {:#x}+{:#x}", cpu_address, size);
 }
 
 void nvhost_as_gpu::Nx2Sparse(u64 gpu_address, u64 size, bool create) {
-    std::scoped_lock lock(mutex);
-    if (!gmmu) {
-        return;
-    }
     auto& smmu = system.Host1x().MemoryManager();
+    Tegra::MemoryManager* target = nullptr;
     if (!create) {
-        const auto it = nx2_sparse_ranges.find(gpu_address);
-        if (it == nx2_sparse_ranges.end()) {
-            return;
+        u64 region_size{};
+        DAddr device_address{};
+        {
+            std::scoped_lock lock(mutex);
+            const auto it = nx2_sparse_ranges.find(gpu_address);
+            if (!gmmu || it == nx2_sparse_ranges.end()) {
+                return;
+            }
+            region_size = it->second.first;
+            device_address = it->second.second;
+            nx2_sparse_ranges.erase(it);
+            target = gmmu.get();
         }
-        const u64 region_size = it->second.first;
-        const DAddr device_address = it->second.second;
-        nx2_sparse_ranges.erase(it);
         // After the command lists that may still use it.
-        system.GPU().RunInOrder([gmmu = gmmu.get(), &smmu, gpu_address, region_size,
-                                 device_address] {
-            gmmu->Unmap(gpu_address, region_size);
+        system.GPU().RunInOrder([target, &smmu, gpu_address, region_size, device_address] {
+            target->Unmap(gpu_address, region_size);
             smmu.Unmap(device_address, region_size);
             smmu.Free(device_address, Common::AlignUp(region_size, 0x20000));
         });
         return;
     }
-    const DAddr device_address = smmu.Allocate(Common::AlignUp(size, 0x20000));
-    if (device_address == 0) {
-        LOG_CRITICAL(Service_NVDRV, "Switch 2 sparse region {:#x}+{:#x}: out of SMMU space",
-                     gpu_address, size);
-        return;
+    DAddr device_address{};
+    {
+        std::scoped_lock lock(mutex);
+        if (!gmmu) {
+            return;
+        }
+        device_address = smmu.Allocate(Common::AlignUp(size, 0x20000));
+        if (device_address == 0) {
+            LOG_CRITICAL(Service_NVDRV, "Switch 2 sparse region {:#x}+{:#x}: out of SMMU space",
+                         gpu_address, size);
+            return;
+        }
+        nx2_sparse_ranges[gpu_address] = {size, device_address};
+        target = gmmu.get();
     }
-    nx2_sparse_ranges[gpu_address] = {size, device_address};
-    system.GPU().RunInOrder([gmmu = gmmu.get(), gpu_address, device_address, size] {
-        gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
+    system.GPU().RunInOrder([target, gpu_address, device_address, size] {
+        target->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
     });
     LOG_DEBUG(Service_NVDRV, "Switch 2 sparse region {:#x}+{:#x} -> device {:#x}", gpu_address,
               size, device_address);
@@ -288,29 +318,33 @@ void nvhost_as_gpu::Nx2BackSparse(u64 gpu_address, u64 cpu_address, u64 size) {
 }
 
 void nvhost_as_gpu::Nx2Reserve(u64 gpu_address, u64 size) {
-    std::scoped_lock lock(mutex);
-    if (!gmmu) {
-        return;
-    }
-    nx2_gpu_views.Unmap(gpu_address, size);
+    Tegra::MemoryManager* target = nullptr;
     std::optional<DAddr> device_address;
-    if (auto it = nx2_sparse_ranges.upper_bound(gpu_address); it != nx2_sparse_ranges.begin()) {
-        --it;
-        const auto& [start, range] = *it;
-        const auto& [region_size, region_device] = range;
-        if (gpu_address - start < region_size && size <= region_size - (gpu_address - start)) {
-            device_address = region_device + (gpu_address - start);
+    {
+        std::scoped_lock lock(mutex);
+        if (!gmmu) {
+            return;
         }
+        nx2_gpu_views.Unmap(gpu_address, size);
+        if (auto it = nx2_sparse_ranges.upper_bound(gpu_address); it != nx2_sparse_ranges.begin()) {
+            --it;
+            const auto& [start, range] = *it;
+            const auto& [region_size, region_device] = range;
+            if (gpu_address - start < region_size && size <= region_size - (gpu_address - start)) {
+                device_address = region_device + (gpu_address - start);
+            }
+        }
+        target = gmmu.get();
     }
     if (!device_address) {
         LOG_ERROR(Service_NVDRV, "Switch 2 sparse reservation {:#x}+{:#x} outside its region",
                   gpu_address, size);
     }
-    system.GPU().RunInOrder([gmmu = gmmu.get(), gpu_address, device_address, size] {
+    system.GPU().RunInOrder([target, gpu_address, device_address, size] {
         if (device_address) {
-            gmmu->Map(gpu_address, *device_address, size, Tegra::PTEKind::PITCH, false);
+            target->Map(gpu_address, *device_address, size, Tegra::PTEKind::PITCH, false);
         } else {
-            gmmu->Unmap(gpu_address, size);
+            target->Unmap(gpu_address, size);
         }
     });
 }

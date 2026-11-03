@@ -11,6 +11,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -54,63 +55,75 @@ public:
         return registry;
     }
 
+    // The listeners (nvhost_as_gpu) queue work for the GPU thread, which waits for room in a full
+    // queue, and the GPU thread itself calls BackSparse. So every call works out the listener calls
+    // a change needs under `mutex` and makes them after it is released: holding it across them
+    // stopped Mario Kart World at its first load screen (a CPU core waiting for the queue under
+    // it, the GPU thread waiting for it to back a sparse block). Calls from the game's side hold
+    // `ordered` until their listener calls are made, so the address spaces see the changes in the
+    // order they were made; BackSparse, which the GPU thread makes, does not wait for it.
+
     void Register(u64 address, u64 size) {
         MapAt(address, address, size);
     }
 
     void Unregister(u64 address, u64 size) {
-        std::scoped_lock lk{mutex};
-        if (!Nx2GpuMappingTable::Valid(address, size)) {
-            return;
-        }
-        pending_releases.try_emplace(std::pair{address, size});
-        Apply(mappings.Unmap(address, size));
+        Ordered([&](Calls& todo) {
+            if (!Nx2GpuMappingTable::Valid(address, size)) {
+                return;
+            }
+            pending_releases.try_emplace(std::pair{address, size});
+            Apply(mappings.Unmap(address, size), todo);
+        });
     }
 
     void MapAt(u64 gpu_address, u64 cpu_address, u64 size) {
-        std::scoped_lock lk{mutex};
-        const auto update = mappings.Map(gpu_address, cpu_address, size);
-        if (!update.success) {
-            LOG_ERROR(Service_NVDRV, "Conflicting or invalid nx2 GPU mapping {:#x}+{:#x}",
-                      gpu_address, size);
-            return;
-        }
-        Apply(update);
+        Ordered([&](Calls& todo) {
+            const auto update = mappings.Map(gpu_address, cpu_address, size);
+            if (!update.success) {
+                LOG_ERROR(Service_NVDRV, "Conflicting or invalid nx2 GPU mapping {:#x}+{:#x}",
+                          gpu_address, size);
+                return;
+            }
+            Apply(update, todo);
+        });
     }
 
     std::optional<u64> AcquireNative(u64 address, u64 size) {
-        std::scoped_lock lk{mutex};
-        if (!Nx2GpuMappingTable::Valid(address, size) || SparseOverlaps(address, size)) {
-            return std::nullopt;
-        }
-        const auto update = mappings.Acquire(address, size);
-        if (!update.success) {
-            return std::nullopt;
-        }
-        Apply(update);
-        return update.lease;
+        std::optional<u64> lease;
+        Ordered([&](Calls& todo) {
+            if (!Nx2GpuMappingTable::Valid(address, size) || SparseOverlaps(address, size)) {
+                return;
+            }
+            const auto update = mappings.Acquire(address, size);
+            if (!update.success) {
+                return;
+            }
+            Apply(update, todo);
+            lease = update.lease;
+        });
+        return lease;
     }
 
     void ReleaseNative(u64 lease) {
-        std::scoped_lock lk{mutex};
-        Apply(mappings.Release(lease));
+        Ordered([&](Calls& todo) { Apply(mappings.Release(lease), todo); });
     }
 
     // NormalUnmapGpuMemory4K, or destroying the memory: the GPU range stops reaching it.
     void Unmap(u64 gpu_address, u64 size) {
-        std::scoped_lock lk{mutex};
-        Apply(mappings.Unmap(gpu_address, size));
+        Ordered([&](Calls& todo) { Apply(mappings.Unmap(gpu_address, size), todo); });
     }
 
     // Backing memory [cpu_address, +size) is about to be freed (its GPU mappings are gone): each
     // address space drops its SMMU mapping of it, in GPU-thread order.
     void ReleaseBacking(u64 cpu_address, u64 size, std::function<void()> retired = {}) {
-        std::scoped_lock lk{mutex};
-        auto& callbacks = pending_releases[{cpu_address, size}];
-        if (retired) {
-            callbacks.push_back(std::move(retired));
-        }
-        DrainReleases();
+        Ordered([&](Calls& todo) {
+            auto& callbacks = pending_releases[{cpu_address, size}];
+            if (retired) {
+                callbacks.push_back(std::move(retired));
+            }
+            DrainReleases(todo);
+        });
     }
 
     // Sparse regions (nx2:gpu 214 with the sparse flag): the GPU range reaches device memory of its
@@ -118,93 +131,121 @@ public:
     // The GPU mapping never changes, so the texture cache doesn't rebuild the images over it as
     // blocks get memory; unbacked blocks read zero.
     bool CreateSparse(u64 gpu_address, u64 size) {
-        std::scoped_lock lk{mutex};
-        if (!Nx2GpuMappingTable::Valid(gpu_address, size) ||
-            mappings.HasNativeOverlap(gpu_address, size) || SparseOverlaps(gpu_address, size)) {
-            LOG_ERROR(Service_NVDRV, "Conflicting or invalid nx2 sparse mapping {:#x}+{:#x}",
-                      gpu_address, size);
-            return false;
-        }
-        sparse_regions.emplace(gpu_address, SparseRegion{size, {}});
-        for (auto& [owner, listener] : listeners) {
-            if (listener.sparse) {
-                listener.sparse(gpu_address, size, true);
-                MapOverlays(listener, gpu_address, size);
+        bool created = false;
+        Ordered([&](Calls& todo) {
+            if (!Nx2GpuMappingTable::Valid(gpu_address, size) ||
+                mappings.HasNativeOverlap(gpu_address, size) || SparseOverlaps(gpu_address, size)) {
+                LOG_ERROR(Service_NVDRV, "Conflicting or invalid nx2 sparse mapping {:#x}+{:#x}",
+                          gpu_address, size);
+                return;
             }
-        }
-        return true;
+            sparse_regions.emplace(gpu_address, SparseRegion{size, {}});
+            for (auto& [owner, listener] : listeners) {
+                if (listener.sparse) {
+                    todo.push_back([sparse = listener.sparse, gpu_address, size] {
+                        sparse(gpu_address, size, true);
+                    });
+                    MapOverlays(listener, gpu_address, size, todo);
+                }
+            }
+            created = true;
+        });
+        return created;
     }
 
     bool DestroySparse(u64 gpu_address, u64 size) {
-        std::scoped_lock lk{mutex};
-        const auto it = sparse_regions.find(gpu_address);
-        if (it == sparse_regions.end() || it->second.size != size) {
-            LOG_ERROR(Service_NVDRV, "Unknown nx2 sparse region {:#x}+{:#x}", gpu_address, size);
-            return false;
-        }
-        sparse_regions.erase(it);
-        for (auto& [owner, listener] : listeners) {
-            if (listener.sparse) {
-                listener.sparse(gpu_address, size, false);
+        bool destroyed = false;
+        Ordered([&](Calls& todo) {
+            const auto it = sparse_regions.find(gpu_address);
+            if (it == sparse_regions.end() || it->second.size != size) {
+                LOG_ERROR(Service_NVDRV, "Unknown nx2 sparse region {:#x}+{:#x}", gpu_address, size);
+                return;
             }
-        }
-        Apply(mappings.Unmap(gpu_address, size));
-        return true;
+            sparse_regions.erase(it);
+            for (auto& [owner, listener] : listeners) {
+                if (listener.sparse) {
+                    todo.push_back([sparse = listener.sparse, gpu_address, size] {
+                        sparse(gpu_address, size, false);
+                    });
+                }
+            }
+            Apply(mappings.Unmap(gpu_address, size), todo);
+            destroyed = true;
+        });
+        return destroyed;
     }
 
+    // Usually from the GPU thread (BackSparseWrite): not ordered, see above.
     void BackSparse(u64 gpu_address, u64 cpu_address, u64 size) {
-        std::scoped_lock lk{mutex};
-        auto it = sparse_regions.upper_bound(gpu_address);
-        if (!Nx2GpuMappingTable::Valid(gpu_address, size) ||
-            !Nx2GpuMappingTable::Valid(cpu_address, size) || it == sparse_regions.begin()) {
-            LOG_ERROR(Service_NVDRV, "Invalid nx2 sparse backing {:#x}+{:#x}", gpu_address, size);
-            return;
-        }
-        --it;
-        auto& [start, region] = *it;
-        if (gpu_address - start >= region.size || size > region.size - (gpu_address - start)) {
-            LOG_ERROR(Service_NVDRV, "nx2 sparse backing {:#x}+{:#x} outside its region",
-                      gpu_address, size);
-            return;
-        }
-        region.blocks.insert_or_assign(gpu_address, SparseBacking{cpu_address, size});
-        for (auto& [owner, listener] : listeners) {
-            if (listener.back) {
-                listener.back(gpu_address, cpu_address, size);
+        std::shared_lock running{calls};
+        Calls todo;
+        {
+            std::scoped_lock lk{mutex};
+            auto it = sparse_regions.upper_bound(gpu_address);
+            if (!Nx2GpuMappingTable::Valid(gpu_address, size) ||
+                !Nx2GpuMappingTable::Valid(cpu_address, size) || it == sparse_regions.begin()) {
+                LOG_ERROR(Service_NVDRV, "Invalid nx2 sparse backing {:#x}+{:#x}", gpu_address, size);
+                return;
+            }
+            --it;
+            auto& [start, region] = *it;
+            if (gpu_address - start >= region.size || size > region.size - (gpu_address - start)) {
+                LOG_ERROR(Service_NVDRV, "nx2 sparse backing {:#x}+{:#x} outside its region",
+                          gpu_address, size);
+                return;
+            }
+            region.blocks.insert_or_assign(gpu_address, SparseBacking{cpu_address, size});
+            for (auto& [owner, listener] : listeners) {
+                if (listener.back) {
+                    todo.push_back([back = listener.back, gpu_address, cpu_address, size] {
+                        back(gpu_address, cpu_address, size);
+                    });
+                }
             }
         }
+        Run(todo);
     }
 
     void AddListener(const void* owner, Listener listener, UnmapListener unmap_listener,
                      ReleaseListener release_listener = {}, SparseListener sparse_listener = {},
                      BackListener back_listener = {}, ReserveListener reserve_listener = {}) {
-        std::scoped_lock lk{mutex};
-        const auto& added =
-            listeners
-                .insert_or_assign(owner, Listeners{std::move(listener), std::move(unmap_listener),
-                                                   std::move(release_listener),
-                                                   std::move(sparse_listener),
-                                                   std::move(back_listener),
-                                                   std::move(reserve_listener)})
-                .first->second;
-        if (added.sparse) {
-            for (const auto& [gpu_address, region] : sparse_regions) {
-                added.sparse(gpu_address, region.size, true);
-                if (added.back) {
-                    for (const auto& [block, backing] : region.blocks) {
-                        added.back(block, backing.cpu, backing.size);
+        Ordered([&](Calls& todo) {
+            const auto& added =
+                listeners
+                    .insert_or_assign(owner, Listeners{std::move(listener), std::move(unmap_listener),
+                                                       std::move(release_listener),
+                                                       std::move(sparse_listener),
+                                                       std::move(back_listener),
+                                                       std::move(reserve_listener)})
+                    .first->second;
+            if (added.sparse) {
+                for (const auto& [gpu_address, region] : sparse_regions) {
+                    todo.push_back([sparse = added.sparse, gpu = gpu_address, size = region.size] {
+                        sparse(gpu, size, true);
+                    });
+                    if (added.back) {
+                        for (const auto& [block, backing] : region.blocks) {
+                            todo.push_back([back = added.back, gpu = block, cpu = backing.cpu,
+                                            bytes = backing.size] {
+                                back(gpu, cpu, bytes);
+                            });
+                        }
                     }
                 }
             }
-        }
-        for (const auto& m : mappings.Effective()) {
-            added.map(m.gpu, m.cpu, m.size);
-        }
+            for (const auto& m : mappings.Effective()) {
+                todo.push_back([map = added.map, m] { map(m.gpu, m.cpu, m.size); });
+            }
+        });
     }
 
     void RemoveListener(const void* owner) {
-        std::scoped_lock lk{mutex};
-        listeners.erase(owner);
+        {
+            std::scoped_lock lk{mutex};
+            listeners.erase(owner);
+        }
+        // Calls that took the owner's listener before it went: let them finish.
+        std::unique_lock done{calls};
     }
 
     // A new emulation session starts: forget the previous game's mappings and device ranges (its
@@ -214,6 +255,7 @@ public:
             std::scoped_lock lk{device_mutex};
             device_ranges.clear();
         }
+        std::scoped_lock order{ordered};
         std::scoped_lock lk{mutex};
         mappings.Reset();
         pending_releases.clear();
@@ -241,7 +283,10 @@ public:
     }
 
 private:
-    // Separate lock: ranges are recorded from listeners that run under `mutex`.
+    /// Listener calls a change needs, made once `mutex` is released.
+    using Calls = std::vector<std::function<void()>>;
+
+    // Separate lock: listeners record ranges (RecordDeviceRange) while other calls hold `mutex`.
     std::mutex device_mutex;
     std::map<u64, std::pair<u64, u64>> device_ranges; // cpu start -> (size, device address)
 
@@ -264,6 +309,26 @@ private:
         std::map<u64, SparseBacking> blocks;
     };
 
+    // A change from the game's side: `change` updates the state under `mutex` and adds the listener
+    // calls it needs, which are made after `mutex`, in the order of the changes (`ordered`).
+    template <class Change>
+    void Ordered(Change&& change) {
+        std::scoped_lock order{ordered};
+        std::shared_lock running{calls};
+        Calls todo;
+        {
+            std::scoped_lock lk{mutex};
+            change(todo);
+        }
+        Run(todo);
+    }
+
+    static void Run(Calls& todo) {
+        for (auto& call : todo) {
+            call();
+        }
+    }
+
     bool SparseOverlaps(u64 gpu_address, u64 size) const {
         return std::ranges::any_of(sparse_regions, [&](const auto& entry) {
             const auto& [start, region] = entry;
@@ -271,19 +336,26 @@ private:
         });
     }
 
-    void MapOverlays(const Listeners& listener, u64 gpu_address, u64 size) {
+    // Needs `mutex`.
+    void MapOverlays(const Listeners& listener, u64 gpu_address, u64 size, Calls& todo) {
         for (const auto& m : mappings.Effective()) {
             const u64 first = (std::max)(m.gpu, gpu_address);
             const u64 last = (std::min)(m.gpu + m.size, gpu_address + size);
             if (first < last) {
-                listener.map(first, m.cpu + (first - m.gpu), last - first);
+                todo.push_back([map = listener.map, first, cpu = m.cpu + (first - m.gpu), last] {
+                    map(first, cpu, last - first);
+                });
             }
         }
     }
 
-    void Uncover(const Listeners& listener, u64 gpu_address, u64 size) {
+    // Needs `mutex`.
+    void Uncover(const Listeners& listener, u64 gpu_address, u64 size, Calls& todo) {
+        const auto unmap = [&](u64 address, u64 bytes) {
+            todo.push_back([call = listener.unmap, address, bytes] { call(address, bytes); });
+        };
         if (!listener.reserve) {
-            listener.unmap(gpu_address, size);
+            unmap(gpu_address, size);
             return;
         }
         const u64 end = gpu_address + size;
@@ -295,17 +367,18 @@ private:
                 continue;
             }
             if (address < first) {
-                listener.unmap(address, first - address);
+                unmap(address, first - address);
             }
-            listener.reserve(first, last - first);
+            todo.push_back([reserve = listener.reserve, first, last] { reserve(first, last - first); });
             address = last;
         }
         if (address < end) {
-            listener.unmap(address, end - address);
+            unmap(address, end - address);
         }
     }
 
-    void Apply(const Nx2GpuMappingTable::Update& update) {
+    // Needs `mutex`.
+    void Apply(const Nx2GpuMappingTable::Update& update, Calls& todo) {
         for (const auto& change : update.changes) {
             const auto& range = change.range;
             if (change.map && change.native) {
@@ -313,18 +386,19 @@ private:
             }
             for (auto& [owner, listener] : listeners) {
                 if (change.map) {
-                    listener.map(range.gpu, range.cpu, range.size);
+                    todo.push_back([map = listener.map, range] { map(range.gpu, range.cpu, range.size); });
                 } else {
-                    Uncover(listener, range.gpu, range.size);
+                    Uncover(listener, range.gpu, range.size, todo);
                 }
             }
         }
-        DrainReleases();
+        DrainReleases(todo);
     }
 
-    void DrainReleases() {
-        std::erase_if(pending_releases, [this](const auto& pending) {
-            const auto& [range, retired] = pending;
+    // Needs `mutex`.
+    void DrainReleases(Calls& todo) {
+        std::erase_if(pending_releases, [&](auto& pending) {
+            auto& [range, retired] = pending;
             const auto [cpu, size] = range;
             if (mappings.UsesBacking(cpu, size)) {
                 return false;
@@ -339,16 +413,20 @@ private:
             }
             for (auto& [owner, listener] : listeners) {
                 if (listener.release) {
-                    listener.release(cpu, size);
+                    todo.push_back([release = listener.release, address = cpu, bytes = size] {
+                        release(address, bytes);
+                    });
                 }
             }
-            for (const auto& callback : retired) {
-                callback();
+            for (auto& callback : retired) {
+                todo.push_back(std::move(callback));
             }
             return true;
         });
     }
 
+    std::mutex ordered; ///< Held by calls from the game's side until their listener calls are made
+    std::shared_mutex calls; ///< Shared while listener calls run; RemoveListener waits for them
     std::mutex mutex;
     Nx2GpuMappingTable mappings;
     std::map<std::pair<u64, u64>, std::vector<std::function<void()>>> pending_releases;

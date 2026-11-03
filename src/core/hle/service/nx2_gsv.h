@@ -587,6 +587,12 @@ private:
     // server backs it itself: the client never maps anything there but renders into it (title 4
     // keeps its render targets in six 300 MB regions at 0x81_0000_0000). Back each region with
     // kernel memory placed in the process's alias code region and map that for the GPU.
+    //
+    // 214 and 215 change the service's state under m_region_mutex and call the registry and the GPU
+    // queue after it: the registry's listeners queue work for the GPU thread, which waits for room
+    // in a full queue, and the GPU thread takes m_region_mutex in BackSparseWrite. Holding it across
+    // them stopped Mario Kart World at its first load screen. Freeing, allocating and mapping memory
+    // wait on the guest page table lock, so they are not under it either (see AllocateGpuOnlyBacking).
     void SubCreateGpuOnlyRegion(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         const u64 start = u64{w[3]} | (u64{w[4]} << 32);
@@ -596,25 +602,32 @@ private:
                  w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12]);
         if (last > start && ((last + 1 - start) % Core::Memory::YUZU_PAGESIZE) == 0) {
             const u64 size = last + 1 - start;
-            std::scoped_lock lk{m_region_mutex};
             FreeReleasedRegions();
             if ((w[7] & SparseRegionFlag) != 0 && LazySparseRegions()) {
                 // Title 1's terrain texture arrays and layer pools (170 MB-5.8 GB, mostly empty):
                 // backed whole, they ran the pool dry and the later ones got no memory at all.
                 // The region gets a device range of its own, unbacked pages read zero, and
-                // BackSparseWrite gives a block memory before the GPU writes into it.
+                // BackSparseWrite gives a block memory before the GPU writes into it. The registry
+                // knows the region before the service records it, so no block is backed for a
+                // region the registry lacks.
                 if (Nvidia::Devices::Nx2GpuMemoryRegistry::Get().CreateSparse(start, size)) {
+                    std::scoped_lock lk{m_region_mutex};
                     m_sparse_regions.emplace(start, SparseRegion{size, ++m_sparse_generation});
                     Tegra::Nx2SparseRegionCreated(start, size, SparseBlockSize);
                     Tegra::Nx2AddSparseSpan(start, size);
                     LOG_INFO(Service, "nx2:gpu 214 sparse region [{:#x}, {:#x}] backed as the GPU writes it",
                              start, last);
                 }
-            } else if (const auto address = BackGpuOnlyRegion(start, size)) {
-                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapAt(start, *address, size);
-                LOG_INFO(Service, "nx2:gpu 214 GPU-only region [{:#x}, {:#x}] backed at {:#x} "
-                                  "({} MiB of GPU-only memory in use, peak {} MiB)",
-                         start, last, *address, m_gpu_only_bytes >> 20, m_gpu_only_peak >> 20);
+            } else if (auto backing = AllocateGpuOnlyBacking(size, true, false)) {
+                const u64 address = backing->address;
+                {
+                    std::scoped_lock lk{m_region_mutex};
+                    RegisterGpuOnlyBacking(start, std::move(*backing));
+                    LOG_INFO(Service, "nx2:gpu 214 GPU-only region [{:#x}, {:#x}] backed at {:#x} "
+                                      "({} MiB of GPU-only memory in use, peak {} MiB)",
+                             start, last, address, m_gpu_only_bytes >> 20, m_gpu_only_peak >> 20);
+                }
+                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapAt(start, address, size);
             }
         } else {
             LOG_WARNING(Service, "nx2:gpu 214 unexpected region [{:#x}, {:#x}]", start, last);
@@ -634,38 +647,59 @@ private:
         const u64 last = u64{w[5]} | (u64{w[6]} << 32);
         LOG_DEBUG(Service, "nx2:gpu 215 destroy sparse region [{:#x}, {:#x}] words {:#x} {:#x} {:#x} {:#x}",
                  first, last, w[1], w[2], w[7], w[8]);
-        std::scoped_lock lk{m_region_mutex};
         FreeReleasedRegions();
         if (last > first) {
             const u64 size = last - first + 1;
-            auto& registry = Nvidia::Devices::Nx2GpuMemoryRegistry::Get();
-            const auto sparse = m_sparse_regions.find(first);
+            bool sparse_region = false;
             bool released = true;
-            if (sparse == m_sparse_regions.end()) {
-                registry.Unmap(first, size);
-            } else if (sparse->second.size == size && registry.DestroySparse(first, size)) {
-                m_sparse_regions.erase(sparse);
-                m_region_cv.notify_all();
-                Tegra::Nx2SparseRegionDestroyed(first);
-            } else {
-                LOG_ERROR(Service, "nx2:gpu 215 range [{:#x}, {:#x}] does not match its sparse region",
-                          first, last);
-                released = false;
-            }
-            // The region's backing: all of it, or the blocks a sparse region got as it was written.
-            for (auto region = m_gpu_only_regions.lower_bound(first);
-                 released && region != m_gpu_only_regions.end() && region->first <= last;) {
-                if (region->first + region->second.size - 1 > last) {
-                    ++region;
-                    continue;
+            struct Backing {
+                u64 cpu_address;
+                u64 size;
+                std::shared_ptr<std::atomic<bool>> done;
+            };
+            std::vector<Backing> backings;
+            {
+                // Only the service's own state here; the registry and the GPU queue after it.
+                std::scoped_lock lk{m_region_mutex};
+                if (const auto sparse = m_sparse_regions.find(first); sparse != m_sparse_regions.end()) {
+                    if (sparse->second.size == size) {
+                        sparse_region = true;
+                        m_sparse_regions.erase(sparse);
+                        m_region_cv.notify_all();
+                        Tegra::Nx2SparseRegionDestroyed(first);
+                    } else {
+                        LOG_ERROR(Service, "nx2:gpu 215 range [{:#x}, {:#x}] does not match its sparse region",
+                                  first, last);
+                        released = false;
+                    }
                 }
-                auto done = std::make_shared<std::atomic<bool>>(false);
-                registry.ReleaseBacking(region->second.cpu_address, region->second.size,
-                                        [&sys = system, done] {
+                // The region's backing: all of it, or the blocks a sparse region got as it was written.
+                for (auto region = m_gpu_only_regions.lower_bound(first);
+                     released && region != m_gpu_only_regions.end() && region->first <= last;) {
+                    if (region->first + region->second.size - 1 > last) {
+                        ++region;
+                        continue;
+                    }
+                    auto done = std::make_shared<std::atomic<bool>>(false);
+                    backings.push_back({region->second.cpu_address, region->second.size, done});
+                    m_released_regions.push_back({std::move(region->second), done});
+                    region = m_gpu_only_regions.erase(region);
+                }
+            }
+            auto& registry = Nvidia::Devices::Nx2GpuMemoryRegistry::Get();
+            if (released) {
+                if (!sparse_region) {
+                    registry.Unmap(first, size);
+                } else if (!registry.DestroySparse(first, size)) {
+                    LOG_ERROR(Service, "nx2:gpu 215 sparse region [{:#x}, {:#x}] unknown to the registry",
+                              first, last);
+                }
+            }
+            for (const auto& backing : backings) {
+                registry.ReleaseBacking(backing.cpu_address, backing.size,
+                                        [&sys = system, done = backing.done] {
                     sys.GPU().RunInOrder([done] { done->store(true, std::memory_order_release); });
                 });
-                m_released_regions.push_back({std::move(region->second), done});
-                region = m_gpu_only_regions.erase(region);
             }
         }
         SignalAfterGpu(w[8]);
@@ -673,25 +707,38 @@ private:
         rb.Push(ResultSuccess);
     }
 
-    // Returns the pages of destroyed regions the GPU thread is done with to the kernel.
+    // Returns the pages of destroyed regions the GPU thread is done with to the kernel. Call it
+    // without m_region_mutex: the lock only covers taking them off the list, because unmapping
+    // waits on the guest page table lock (see AllocateGpuOnlyBacking).
     void FreeReleasedRegions() {
+        std::vector<GpuOnlyRegion> done;
+        {
+            std::scoped_lock lk{m_region_mutex};
+            std::erase_if(m_released_regions, [&](ReleasedRegion& released) {
+                if (!released.done->load(std::memory_order_acquire)) {
+                    return false;
+                }
+                done.push_back(std::move(released.region));
+                return true;
+            });
+        }
         auto* const process = system.ApplicationProcess();
-        std::erase_if(m_released_regions, [&](ReleasedRegion& released) {
-            if (!released.done->load(std::memory_order_acquire)) {
-                return false;
-            }
-            auto& region = released.region;
+        u64 freed = 0;
+        for (auto& region : done) {
             if (process != nullptr &&
                 R_FAILED(process->GetPageTable().UnmapPageGroup(
                     region.cpu_address, *region.pages, Kernel::KMemoryState::IoMemory))) {
                 LOG_ERROR(Service, "nx2:gpu could not unmap GPU-only backing {:#x}+{:#x}",
                           region.cpu_address, region.size);
-                return true; // still mapped: keep its pages
+                continue; // still mapped: keep its pages
             }
             region.pages->Close(system.Kernel());
-            m_gpu_only_bytes -= region.size;
-            return true;
-        });
+            freed += region.size;
+        }
+        if (freed != 0) {
+            std::scoped_lock lk{m_region_mutex};
+            m_gpu_only_bytes -= freed;
+        }
     }
 
     struct MappedBacking {
@@ -764,17 +811,6 @@ private:
         m_gpu_only_regions[gpu_address] = {backing.address, backing.size, std::move(backing.pages)};
         m_gpu_only_bytes += backing.size;
         m_gpu_only_peak = (std::max)(m_gpu_only_peak, m_gpu_only_bytes);
-    }
-
-    // Needs m_region_mutex.
-    std::optional<u64> BackGpuOnlyRegion(u64 gpu_address, u64 size) {
-        auto backing = AllocateGpuOnlyBacking(size, true, false);
-        if (!backing) {
-            return std::nullopt;
-        }
-        const u64 address = backing->address;
-        RegisterGpuOnlyBacking(gpu_address, std::move(*backing));
-        return address;
     }
 
     // Runs before a GPU-side write that may land in a sparse region (Tegra::Nx2BackSparseWrite,
