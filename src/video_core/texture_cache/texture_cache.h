@@ -334,6 +334,20 @@ void TextureCache<P>::TickFrame() {
         LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer)",
                  images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads);
         images_uploaded = uploaded_bytes = largest_upload = layer_uploads = 0;
+        // The addresses uploaded the most: recreated images (more than one image object), guest
+        // writes or unmaps that marked them modified, or none of those (uploaded as they are created).
+        std::vector<std::pair<u64, GPUVAddr>> uploaded;
+        for (const auto& [address, stat] : upload_stats) uploaded.emplace_back(stat.bytes, address);
+        std::sort(uploaded.rbegin(), uploaded.rend());
+        for (size_t i = 0; i < std::min<size_t>(12, uploaded.size()); ++i) {
+            const UploadStat& stat = upload_stats[uploaded[i].second];
+            LOG_INFO(HW_GPU, "  uploaded {:#x}: {} times, {} MiB, {} image objects, {} guest writes ({} KiB; by source 0-5: {} {} {} {} {} {}), {} unmaps, {} partial uploads; {}x{}x{} format {} flags {:#x}",
+                     uploaded[i].second, stat.uploads, stat.bytes >> 20, stat.images, stat.writes,
+                     stat.write_bytes >> 10, stat.writes_by[0], stat.writes_by[1], stat.writes_by[2],
+                     stat.writes_by[3], stat.writes_by[4], stat.writes_by[5], stat.unmaps, stat.range_uploads,
+                     stat.width, stat.height, stat.layers, stat.format, stat.flags);
+        }
+        upload_stats.clear();
         astc_opaque_images = astc_alpha_images = 0;
         std::vector<std::pair<u32, u64>> shapes;
         for (const auto& [key, value] : created_shapes) shapes.emplace_back(value.first, key);
@@ -809,6 +823,12 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
             return;
         }
         image.flags |= ImageFlagBits::CpuModified;
+        {
+            UploadStat& stat = upload_stats[image.gpu_addr];
+            ++stat.writes;
+            ++stat.writes_by[(std::min<size_t>)(write_source, stat.writes_by.size() - 1)];
+            stat.write_bytes += size;
+        }
         if (True(image.flags & ImageFlagBits::Tracked)) {
             UntrackImage(image, image_id);
         }
@@ -1010,6 +1030,7 @@ void TextureCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t siz
         }
         if (False(image.flags & ImageFlagBits::CpuModified)) {
             image.flags |= ImageFlagBits::CpuModified;
+            ++upload_stats[image.gpu_addr].unmaps;
             if (True(image.flags & ImageFlagBits::Tracked)) {
                 UntrackImage(image, id);
             }
@@ -1544,6 +1565,23 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         return;
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
+    {
+        UploadStat& stat = upload_stats[image.gpu_addr];
+        ++stat.uploads;
+        stat.bytes += MapSizeBytes(image);
+        if (stat.last_id != image_id) {
+            ++stat.images;
+            stat.last_id = image_id;
+        }
+        if (!image.partial_dirty_pages.empty() || !image.partial_remapped.empty()) {
+            ++stat.range_uploads;
+        }
+        stat.format = static_cast<u32>(image.info.format);
+        stat.width = image.info.size.width;
+        stat.height = image.info.size.height;
+        stat.layers = static_cast<u32>(image.info.resources.layers);
+        stat.flags = static_cast<u32>(image.flags);
+    }
 
     if (!image.partial_dirty_pages.empty() || !image.partial_remapped.empty()) {
         // Only some pages changed and the rest of the image is still tracked.

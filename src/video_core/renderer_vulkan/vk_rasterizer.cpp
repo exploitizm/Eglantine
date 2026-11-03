@@ -1137,7 +1137,9 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
     }
     if (True(which & VideoCommon::CacheType::TextureCache)) {
         std::scoped_lock lock{texture_cache.mutex};
+        texture_cache.write_source = 1;
         texture_cache.WriteMemory(addr, size);
+        texture_cache.write_source = 0;
     }
     if ((True(which & VideoCommon::CacheType::BufferCache))) {
         std::scoped_lock lock{buffer_cache.mutex};
@@ -1154,9 +1156,11 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
 void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
     {
         std::scoped_lock lock{texture_cache.mutex};
+        texture_cache.write_source = 2;
         for (const auto& [addr, size] : sequences) {
             texture_cache.WriteMemory(addr, size);
         }
+        texture_cache.write_source = 0;
     }
     {
         std::scoped_lock lock{buffer_cache.mutex};
@@ -1180,11 +1184,14 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
             return true;
         }
     }
+    // The source is set outside the lock: the port's build replaces this lock (prepare-vulkan-port.py).
+    texture_cache.write_source = 3;
     {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.WriteMemory(addr, size);
     }
     pipeline_cache.InvalidateRegion(addr, size);
+    texture_cache.write_source = 0;
     return false;
 }
 
@@ -1195,7 +1202,9 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
 
     {
         std::scoped_lock lock{texture_cache.mutex};
+        texture_cache.write_source = 4;
         texture_cache.WriteMemory(addr, size);
+        texture_cache.write_source = 0;
     }
     {
         std::scoped_lock lock{buffer_cache.mutex};
@@ -1226,7 +1235,9 @@ bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
     {
         std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
         if (buffer_cache.IsRegionGpuModified(addr, size)) return false;
+        texture_cache.write_source = 5;
         texture_cache.WriteMemory(addr, size);
+        texture_cache.write_source = 0;
         buffer_cache.WriteMemory(addr, size);
     }
     pipeline_cache.InvalidateRegion(addr, size);

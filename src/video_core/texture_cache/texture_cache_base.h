@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <deque>
 #include <limits>
@@ -132,6 +133,20 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 uploaded_bytes{};    ///< Guest bytes those uploads read
     u64 largest_upload{};    ///< Largest of them
     u64 layer_uploads{};     ///< Of them, uploads of only the written layers
+    /// Uploads by image address (last 600 frames), for the images that keep coming back (TickFrame).
+    struct UploadStat {
+        u64 uploads{};
+        u64 bytes{};      ///< The images' whole size each time (a partial or layer upload reads less)
+        u32 images{};     ///< Image objects at the address that were uploaded (more than 1: recreated)
+        u32 writes{};     ///< Guest writes that marked the image modified
+        std::array<u32, 6> writes_by{}; ///< Of them, by write_source
+        u64 write_bytes{};               ///< The size of those writes
+        u32 unmaps{};     ///< GPU unmaps that marked it modified
+        u32 range_uploads{}; ///< Of the uploads, those of only the written pages (RefreshPartialContents)
+        ImageId last_id{};
+        u32 format{}, width{}, height{}, layers{}, flags{};
+    };
+    std::unordered_map<GPUVAddr, UploadStat> upload_stats;
     bool native_thresholds_applied{};
     u64 native_critical_memory{};
     u64 native_expected_memory{};
@@ -202,6 +217,12 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
 
 public:
     explicit TextureCache(Runtime&, Tegra::MaxwellDeviceMemoryManager&);
+
+    /// Where the next WriteMemory calls come from, set by the rasterizer for the upload statistics:
+    /// 1 engines through the memory manager (InvalidateRegion), 2 CPU write batches
+    /// (InnerInvalidation), 3 a CPU write (OnCPUWrite), 4 a CPU invalidation (OnCacheInvalidation),
+    /// 5 TryCacheInvalidation, 0 other.
+    u8 write_source{};
 
     /// Notify the cache that a new frame has been queued
     void TickFrame();
