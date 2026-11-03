@@ -6,7 +6,9 @@
 
 #pragma once
 
+#include <array>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <vector>
 
@@ -147,8 +149,14 @@ namespace Vulkan {
             }
         }
 
+        /// The pool sparse memory of `memory_type` comes from (its own blocks, apart from the
+        /// images' and buffers'); VK_NULL_HANDLE where it cannot be made.
+        VmaPool SparsePool(u32 memory_type) const;
+
         const Device &device;                              ///< Device handle.
         VmaAllocator allocator;                           ///< VMA allocator.
+        mutable std::mutex sparse_pool_mutex;
+        mutable std::array<VmaPool, VK_MAX_MEMORY_TYPES> sparse_pools{};
         const VkPhysicalDeviceMemoryProperties properties; ///< Physical device memory properties.
         VkDeviceSize buffer_image_granularity;            ///< Adjacent buffer/image granularity
         u32 valid_memory_types{~0u};

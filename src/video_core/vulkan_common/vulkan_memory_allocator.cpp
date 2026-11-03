@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -204,7 +205,44 @@ MemoryAllocator::MemoryAllocator(const Device &device_)
     }
 }
 
-MemoryAllocator::~MemoryAllocator() = default;
+MemoryAllocator::~MemoryAllocator() {
+    for (VmaPool pool : sparse_pools) {
+        if (pool != VK_NULL_HANDLE) {
+            vmaDestroyPool(allocator, pool);
+        }
+    }
+}
+
+VmaPool MemoryAllocator::SparsePool(u32 memory_type) const {
+    // Sparse image memory (tiles, layers, tails: ~1,400 pieces of 64 KiB and up in a race of
+    // title 1, Mario Kart World) gets blocks of its own. Mixed into the images' blocks, the pieces
+    // freed as tiles came and went kept those blocks alive: 553 MiB of them stood unused.
+    // EDEN_VMA_SPARSE_POOL=0 leaves it in the default pools.
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_VMA_SPARSE_POOL");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!enabled || memory_type >= sparse_pools.size()) {
+        return VK_NULL_HANDLE;
+    }
+    std::scoped_lock lock{sparse_pool_mutex};
+    if (sparse_pools[memory_type] == VK_NULL_HANDLE) {
+        const VmaPoolCreateInfo pool_ci{
+            .memoryTypeIndex = memory_type,
+            .flags = 0,
+            .blockSize = VkDeviceSize{16} << 20,
+            .minBlockCount = 0,
+            .maxBlockCount = 0,
+            .priority = 0.f,
+            .minAllocationAlignment = 0,
+            .pMemoryAllocateNext = nullptr,
+        };
+        if (vmaCreatePool(allocator, &pool_ci, &sparse_pools[memory_type]) != VK_SUCCESS) {
+            sparse_pools[memory_type] = VK_NULL_HANDLE;
+        }
+    }
+    return sparse_pools[memory_type];
+}
 
 vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated) const
 {
@@ -312,6 +350,22 @@ VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &
     };
     VmaAllocation allocation{};
     VmaAllocationInfo info{};
+    // From the sparse pool of the memory type the default pools would use; a piece the pool cannot
+    // hold (larger than its blocks, or no memory left) comes from the default pools as before.
+    u32 memory_type = 0;
+    if (vmaFindMemoryTypeIndex(allocator, requirements.memoryTypeBits, &alloc_ci, &memory_type) ==
+        VK_SUCCESS) {
+        if (const VmaPool pool = SparsePool(memory_type); pool != VK_NULL_HANDLE) {
+            VmaAllocationCreateInfo pooled_ci = alloc_ci;
+            pooled_ci.pool = pool;
+            if (vmaAllocateMemory(allocator, &requirements, &pooled_ci, &allocation, &info) ==
+                VK_SUCCESS) {
+                memory = info.deviceMemory;
+                offset = info.offset;
+                return allocation;
+            }
+        }
+    }
     if (vmaAllocateMemory(allocator, &requirements, &alloc_ci, &allocation, &info) != VK_SUCCESS) {
         return VK_NULL_HANDLE;
     }
