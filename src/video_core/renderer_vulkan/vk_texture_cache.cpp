@@ -2135,10 +2135,17 @@ void TextureCacheRuntime::ReleaseMsaaScratchImage(VkImage image) {
     }
 }
 
-void TextureCacheRuntime::TickFrame() {
-    while (!pending_transcodes.empty() && scheduler.IsFree(pending_transcodes.front().tick)) {
+void TextureCacheRuntime::ReleaseTranscodes(u64 limit) {
+    while (!pending_transcodes.empty() && (scheduler.IsFree(pending_transcodes.front().tick) ||
+                                           pending_transcode_bytes > limit)) {
+        scheduler.Wait(pending_transcodes.front().tick);
+        pending_transcode_bytes -= pending_transcodes.front().bytes;
         pending_transcodes.pop_front();
     }
+}
+
+void TextureCacheRuntime::TickFrame() {
+    ReleaseTranscodes(~u64{0});
     static constexpr u32 MAX_UNUSED_SCRATCH_FRAMES = 60;
     std::erase_if(msaa_scratch_images, [this](MsaaScratchImage& scratch) {
         if (!scheduler.IsFree(scratch.tick)) {
@@ -3739,6 +3746,15 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     const u32 levels = static_cast<u32>(info.resources.levels) - skip;
     const u32 layers = static_cast<u32>(info.resources.layers);
     constexpr VkFormat DecodeFormat = VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+    // The decode images of finished transcodes go now, not only once a frame, and past 256 MiB of
+    // them the queued work is submitted and waited for: a course loading in title 1 transcoded 310
+    // textures before a frame ended, and their RGBA8 decode images held 1.7 GiB of the 12 GiB the
+    // PS5 shares when its memory ran out.
+    ReleaseTranscodes(u64{256} << 20);
+    u64 decode_bytes = 0;
+    for (u32 level = 0; level < levels; ++level) {
+        decode_bytes += u64{(std::max)(width >> level, 1U)} * (std::max)(height >> level, 1U) * 4 * layers;
+    }
     // The decode image lives only until the encode ran. Sub-allocated, not dedicated: streaming
     // worlds transcode ~100 textures a second, and a vkAllocateMemory plus a vkFreeMemory for each
     // took several percent of the GPU thread. VMA still gives large ones their own block.
@@ -3823,6 +3839,8 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     });
     image.UploadMemory(output.buffer, output.offset, copies);
     pending.tick = scheduler.CurrentTick();
+    pending.bytes = decode_bytes;
+    pending_transcode_bytes += decode_bytes;
     pending_transcodes.push_back(std::move(pending));
 }
 

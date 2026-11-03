@@ -182,8 +182,12 @@ public:
         u64 tick;
         vk::Image image;
         std::vector<vk::ImageView> views;
+        u64 bytes = 0;
     };
     std::deque<PendingTranscode> pending_transcodes;
+    u64 pending_transcode_bytes = 0; ///< What the pending decode images hold
+    /// Frees the decode images the GPU is done with; past `limit` bytes of them, waits for the oldest.
+    void ReleaseTranscodes(u64 limit);
 
     std::optional<BlockLinearUnswizzle3DPass> bl3d_unswizzle_pass;
     const Settings::ResolutionScalingInfo& resolution;
