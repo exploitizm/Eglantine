@@ -615,8 +615,8 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
         break;
     }
     if (maxwell3d->GetNativeMacroEngine().native_turing) {
-        if (program != Maxwell::ShaderType::VertexB && program != Maxwell::ShaderType::Geometry &&
-            program != Maxwell::ShaderType::Pixel) {
+        if (program != Maxwell::ShaderType::VertexA && program != Maxwell::ShaderType::VertexB &&
+            program != Maxwell::ShaderType::Geometry && program != Maxwell::ShaderType::Pixel) {
             if (std::getenv("EDEN_NX2_SHADER_DUMP")) {
                 InitializeNativeCode(nullptr);
             }
@@ -702,7 +702,20 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
                 }
             }
         }
-        InitializeNativeCode(std::move(lowered_native_));
+        if (program == Maxwell::ShaderType::Geometry && sph.common0.geometry_passthrough != 0) {
+            // Passthrough geometry is described by the header; no native body needs lowering.
+            code.resize(sizeof(sph) / sizeof(u64));
+            std::memcpy(code.data(), &sph, sizeof(sph));
+            code.push_back(0xe30000000007000fULL);
+            code.push_back(0);
+            const std::array<u32, 1> offsets{0};
+            Shader::Ampere::AppendNativeAddressMap(code, offsets);
+            cached_lowest = 0;
+            cached_highest = static_cast<u32>((code.size() - 1) * sizeof(u64));
+            native_source_size = sizeof(sph) + sizeof(Shader::Ampere::Instruction);
+        } else {
+            InitializeNativeCode(std::move(lowered_native_));
+        }
     }
     const u64 local_size{sph.LocalMemorySize()};
     ASSERT(local_size <= (std::numeric_limits<u32>::max)());

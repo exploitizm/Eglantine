@@ -85,6 +85,22 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code, bool geo
         return result;
     };
     if (code.empty() || code.size() > 65536) return fail(0, "invalid native program size");
+    // Task/mesh outputs use ISBEWR instead of AST. Maxwell cannot represent their
+    // workgroup output; reject before emitting a misleading partial vertex program.
+    {
+        std::optional<u32> first_access;
+        bool writes_stage_buffer = false, stores_attributes = false;
+        for (u32 index = 0; index < code.size(); ++index) {
+            if (code[index].Bits(12, 4) == 15) continue;
+            const u32 opcode = code[index].Bits(0, 12);
+            writes_stage_buffer |= opcode == 0x927;
+            stores_attributes |= opcode == 0x322;
+            if ((opcode == 0x923 || opcode == 0x927) && !first_access) first_access = index;
+        }
+        if (writes_stage_buffer && !stores_attributes) {
+            return fail(*first_access, "native task or mesh program (outputs through the stage buffer)");
+        }
+    }
     std::optional<GeometryExitEnvelope> geometry_exit;
     if (code.front().Bits(0, 12) == 0x34e) {
         if (!geometry_stage) return fail(0, "native program counter load outside geometry stage");
@@ -2108,6 +2124,8 @@ case 0x311: { // F2I.FTZ.U64.TRUNC, per nvdisasm: Maxwell's F2I gives 32 bits, s
             }
             break;
         }
+        case 0x927:
+            return fail(index, "native stage buffer write");
         case 0x923:
             if (!geometry_stage) return fail(index, "native stage buffer read outside geometry stage");
             if (insn.words[1] || insn.words[2] || insn.Bits(24, 8) == 255)

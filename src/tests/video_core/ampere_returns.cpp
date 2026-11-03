@@ -48,4 +48,48 @@ TEST_CASE("Ampere callees still reject writes to the link", "[video_core][ampere
     REQUIRE(lowered.error == "native callee overwrites link register");
     REQUIRE(lowered.error_offset == 0x30);
 }
+
+TEST_CASE("Ampere task outputs are refused before any instruction is emitted", "[video_core][ampere]") {
+    const std::array<Instruction, 3> code{{
+        {{0x00017902, 0, 0x00000f00, 0}},
+        {{0x00027923, 0, 0, 0}},
+        {{0x00037927, 0, 0, 0}},
+    }};
+    const auto lowered = LowerToMaxwell(code);
+    REQUIRE_FALSE(lowered);
+    REQUIRE(lowered.error == "native task or mesh program (outputs through the stage buffer)");
+    REQUIRE(lowered.error_offset == sizeof(Instruction));
+    REQUIRE(lowered.instructions.empty());
+    REQUIRE(lowered.source_instruction_offsets.empty());
+}
+
+TEST_CASE("Ampere task classification ignores never-executed attribute stores", "[video_core][ampere]") {
+    const std::array<Instruction, 2> code{{
+        {{0x0000f322, 0, 0, 0}},
+        {{0x00007927, 0, 0, 0}},
+    }};
+    const auto lowered = LowerToMaxwell(code);
+    REQUIRE_FALSE(lowered);
+    REQUIRE(lowered.error == "native task or mesh program (outputs through the stage buffer)");
+    REQUIRE(lowered.error_offset == sizeof(Instruction));
+}
+
+TEST_CASE("Ampere ordinary stage writes keep their specific refusal", "[video_core][ampere]") {
+    const std::array<Instruction, 2> code{{
+        {{0x00007927, 0, 0, 0}},
+        {{0xff007322, 0x00007004, 0x000000ff, 0}},
+    }};
+    const auto lowered = LowerToMaxwell(code);
+    REQUIRE_FALSE(lowered);
+    REQUIRE(lowered.error == "native stage buffer write");
+    REQUIRE(lowered.error_offset == 0);
+}
+
+TEST_CASE("Ampere never-executed stage writes do not classify a program as mesh", "[video_core][ampere]") {
+    const std::array<Instruction, 2> code{{
+        {{0x0000f927, 0, 0, 0}},
+        {{0x0000794d, 0, 0x03800000, 0}},
+    }};
+    REQUIRE(LowerToMaxwell(code));
+}
 } // namespace
