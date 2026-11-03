@@ -820,6 +820,12 @@ bool TextureCache<P>::IsDownloadable(const ImageBase& image) const noexcept {
     if (!image.IsSafeGpuCopy() || True(image.flags & (ImageFlagBits::Unbacked | ImageFlagBits::TrimmedLevels))) {
         return false;
     }
+    // What the GPU drew into a large image stays on the GPU: title 1 (Mario Kart World) read a
+    // command list next to a 144 MiB render target, and downloading all of it took a staging buffer
+    // the console's shared pool had no block for.
+    if (image.unswizzled_size_bytes > RenderTargetUploadMaxBytes) {
+        return false;
+    }
     if (image.info.num_samples == 1) {
         return true;
     }
@@ -957,7 +963,7 @@ std::optional<VideoCore::RasterizerDownloadArea> TextureCache<P>::GetFlushArea(D
                                                   cpu_addr, size, image.cpu_addr, image.guest_size_bytes);
             }
         }
-        if (False(image.flags & ImageFlagBits::GpuModified)) {
+        if (False(image.flags & ImageFlagBits::GpuModified) || !IsDownloadable(image)) {
             return;
         }
         if (!area) {
@@ -3703,7 +3709,7 @@ void TextureCache<P>::BindRenderTarget(ImageViewId* old_id, ImageViewId new_id) 
     if (new_id) {
         const ImageViewBase& old_view = slot_image_views[new_id];
         if (True(old_view.flags & ImageViewFlagBits::PreemtiveDownload) &&
-            False(slot_images[old_view.image_id].flags & (ImageFlagBits::Unbacked | ImageFlagBits::TrimmedLevels))) {
+            IsDownloadable(slot_images[old_view.image_id])) {
             const PendingDownload new_download{true, 0, old_view.image_id};
             uncommitted_downloads.emplace_back(new_download);
         }
