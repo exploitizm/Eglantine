@@ -1198,7 +1198,14 @@ private:
         if (!Settings::values.use_speed_limit.GetValue() || Settings::SpeedLimit() == 0) {
             return;
         }
-        const auto interval = std::chrono::nanoseconds{100'000'000'000LL / 60 / Settings::SpeedLimit()};
+        // EDEN_NX2_PRESENT_HZ=<rate>: hold presents to this rate instead of 60 (from
+        // sylvieistaken/selevet-eglantine e8d94946c1; Mario Kart World keeps its full game speed at 30).
+        // Read at each present: the PS5 launcher sets it per game, and one app run starts many games.
+        const char* const present_text = std::getenv("EDEN_NX2_PRESENT_HZ");
+        const long long present_hz =
+            present_text ? (std::max)(std::strtoll(present_text, nullptr, 10), 1LL) : 60LL;
+        const auto interval =
+            std::chrono::nanoseconds{100'000'000'000LL / present_hz / Settings::SpeedLimit()};
         const auto now = std::chrono::steady_clock::now();
         if (now > m_next_vblank + interval) {
             // Running slower than 60 fps: show at once and don't bank the lost time.
