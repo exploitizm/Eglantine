@@ -361,8 +361,38 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
 // over 1 GiB as RGBA8 (title 1's 8192x8192x68 ASTC 8x8 virtual textures are 24 GB each) keeps only
 // its mip levels from `level_offset` on, so host mip 0 is guest mip `level_offset`. Normalized
 // coordinates and derivative LOD still address it correctly; explicit LODs sample one level lower.
+// EDEN_TEXTURE_TRIM_KIB=0 disables sampled-only trimming; eligible images drop mip 0.
+[[nodiscard]] bool TrimsTexture(const Device& device, const ImageInfo& info) {
+    static const u64 min_bytes = [] {
+        const char* value = std::getenv("EDEN_TEXTURE_TRIM_KIB");
+        const unsigned long kib = value != nullptr ? std::strtoul(value, nullptr, 10) : 0;
+        return kib == 0 ? 0 : u64{(std::clamp)(kib, 256UL, 32768UL)} << 10;
+    }();
+    if (min_bytes == 0 || !info.texture_descriptor || info.type != ImageType::e2D ||
+        info.resources.layers != 1 || info.resources.levels < 2 || info.num_samples != 1 ||
+        VideoCore::Surface::GetFormatType(info.format) != VideoCore::Surface::SurfaceType::ColorTexture) {
+        return false;
+    }
+    const u64 bytes = VideoCommon::CalculateGuestSizeInBytes(info);
+    if (bytes < min_bytes || bytes >= (u64{32} << 20)) {
+        return false;
+    }
+    if (IsPixelFormatASTC(info.format)) {
+        return WillUseGpuBcnTranscode(device, info) || WillUseAcceleratedAstcDecode(device, info);
+    }
+    return !IsPixelFormatBCn(info.format) || device.IsOptimalBcnSupported();
+}
+
 [[nodiscard]] ImageInfo TrimmedHostInfo(const Device& device, const ImageInfo& info, u32& level_offset) {
     level_offset = 0;
+    if (TrimsTexture(device, info)) {
+        level_offset = 1;
+        ImageInfo host = info;
+        host.size.width = (std::max)(info.size.width >> 1, 1U);
+        host.size.height = (std::max)(info.size.height >> 1, 1U);
+        host.resources.levels -= 1;
+        return host;
+    }
     const bool decoded = WillUseAcceleratedAstcDecode(device, info);
     const bool huge_bcn = IsHugeBcnArray(info);
     if (info.type != ImageType::e2D || !(decoded || huge_bcn || WillUseGpuBcnTranscode(device, info))) {
@@ -2261,6 +2291,19 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
     }
     if (host_level_offset != 0) {
         flags |= VideoCommon::ImageFlagBits::TrimmedLevels;
+        texture_trim = TrimsTexture(runtime_.device, info);
+        if (texture_trim) {
+            static u64 trimmed = 0, saved = 0;
+            const u64 bytes = VideoCommon::CalculateGuestSizeInBytes(info);
+            ++trimmed;
+            saved += bytes - bytes / 4;
+            if (trimmed <= 8 || trimmed % 256 == 0) {
+                LOG_INFO(Render_Vulkan, "Texture {:#x} {}x{} {} levels, format {}: kept from level 1 "
+                                        "({} textures so far, about {} MiB saved)",
+                         gpu_addr_, info.size.width, info.size.height, info.resources.levels,
+                         static_cast<u32>(info.format), trimmed, saved >> 20);
+            }
+        }
     }
     if (IsHugeAstcArray(runtime->device, info)) {
         flags |= VideoCommon::ImageFlagBits::AcceleratedUpload;

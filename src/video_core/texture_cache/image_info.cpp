@@ -152,6 +152,7 @@ ImageInfo::ImageInfo(const TICEntry& config) noexcept {
                            GetFormatType(format) != SurfaceType::ColorTexture;
         downscaleable = size.height > DownscaleHeightThreshold;
     }
+    texture_descriptor = true;
 }
 
 ImageInfo::ImageInfo(const Maxwell3D::Regs::RenderTargetConfig& ct,

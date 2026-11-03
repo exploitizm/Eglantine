@@ -1650,6 +1650,12 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         QueueAsyncUnswizzle(image, image_id);
         return;
     }
+    if (image.texture_trim && False(image.flags & ImageFlagBits::AcceleratedUpload)) {
+        const std::array<u32, 1> layers{0};
+        UploadLayers(image, layers);
+        runtime.InsertUploadMemoryBarrier();
+        return;
+    }
     ++images_uploaded;
     uploaded_bytes += image.guest_size_bytes;
     largest_upload = (std::max<u64>)(largest_upload, image.guest_size_bytes);
@@ -2017,6 +2023,9 @@ ImageId TextureCache<P>::FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
     boost::container::small_vector<ImageId, 8> image_ids;
     const auto lambda = [&](ImageId existing_image_id, ImageBase& existing_image) {
         if (True(existing_image.flags & ImageFlagBits::Remapped)) {
+            return false;
+        }
+        if (existing_image.texture_trim && !info.texture_descriptor) {
             return false;
         }
         if (info.type == ImageType::Linear || existing_image.info.type == ImageType::Linear)
@@ -2411,10 +2420,11 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     join_alias_indices.clear();
     const bool this_is_linear = info.type == ImageType::Linear;
     const auto region_check = [&](ImageId overlap_id, ImageBase& overlap) {
-        if (True(overlap.flags & ImageFlagBits::Remapped)) {
+        if (True(overlap.flags & ImageFlagBits::Remapped) || overlap.texture_trim) {
             join_ignore_textures.insert(overlap_id);
             return;
         }
+        new_info.texture_descriptor = false;
         const bool overlap_is_linear = overlap.info.type == ImageType::Linear;
         if (this_is_linear != overlap_is_linear) {
             return;
@@ -2737,6 +2747,9 @@ ImageId TextureCache<P>::FindDMAImage(const ImageInfo& info, GPUVAddr gpu_addr) 
     boost::container::small_vector<ImageId, 8> image_ids;
     const auto lambda = [&](ImageId existing_image_id, ImageBase& existing_image) {
         if (True(existing_image.flags & ImageFlagBits::Remapped)) {
+            return false;
+        }
+        if (existing_image.texture_trim && !info.texture_descriptor) {
             return false;
         }
         if (info.type == ImageType::Linear || existing_image.info.type == ImageType::Linear)

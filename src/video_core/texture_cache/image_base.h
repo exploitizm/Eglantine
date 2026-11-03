@@ -109,6 +109,8 @@ struct ImageBase {
     u32 converted_size_bytes = 0;
     u32 scale_rating = 0;
     u32 host_level_offset = 0; ///< Guest mip level held by host mip 0 (see TrimmedLevels).
+    // Sampled-only mip trim: replace instead of reusing for render targets or copies.
+    bool texture_trim = false;
     /// Pages (from the image's first page) the CPU wrote while the rest of a large image stays
     /// tracked; they are re-uploaded alone (partial refresh) and are untracked until then.
     std::vector<u32> partial_dirty_pages;
