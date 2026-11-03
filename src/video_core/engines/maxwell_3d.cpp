@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -297,7 +298,20 @@ size_t Maxwell3D::EstimateIndexBufferSize() {
     auto const max_size = 1ull << (byte_size * CHAR_BIT);
     auto const upper_cap = GetMaxCurrentVertices() * 4 * byte_size;
     auto const lower_cap = std::min<size_t>(size_t(end_address - start_address), upper_cap);
-    return std::min<size_t>(memory_manager.GetMemoryLayoutSize(start_address, byte_size * max_size) / byte_size, lower_cap);
+    const size_t estimate =
+        std::min<size_t>(memory_manager.GetMemoryLayoutSize(start_address, byte_size * max_size) / byte_size, lower_cap);
+    // EDEN_INDEX_ESTIMATE_MIB=<n>: at most n MiB of indices. Switch 2 titles set the index buffer's
+    // limit to a whole memory pool, so an indirect draw counted 2.4 GB of indices (title 4, Donkey
+    // Kong Bananza) and the buffer cache uploaded all of it; no draw reads anywhere near that much.
+    static const size_t cap_bytes = [] {
+        const char* value = std::getenv("EDEN_INDEX_ESTIMATE_MIB");
+        const unsigned long mib = value != nullptr ? std::strtoul(value, nullptr, 10) : 0;
+        return size_t{mib} << 20;
+    }();
+    if (cap_bytes != 0 && byte_size != 0) {
+        return std::min<size_t>(estimate, cap_bytes / byte_size);
+    }
+    return estimate;
 }
 
 u32 Maxwell3D::ProcessShadowRam(u32 method, u32 argument) {
