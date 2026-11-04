@@ -363,7 +363,9 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code, bool geo
         case 0x225: case 0x625: case 0x825: {
             const u32 a = insn.Bits(24, 8);
             const u32 c = insn.Bits(64, 8);
-            if ((insn.words[2] & ~0x2ffU) != 0x078e0000U || (dest & 1) || dest >= 246 ||
+            const u32 carry_output = insn.Bits(81, 3);
+            if ((insn.words[2] & ~0x000e02ffU) != 0x07800000U || (dest & 1) || dest >= 246 ||
+                (carry_output != 7 && insn.Bits(73, 1)) ||
                 (opcode == 0x225 && (insn.words[1] & ~0xffU)) ||
                 (opcode == 0x625 && (!valid_cbuf() || insn.Bits(59, 5))) ||
                 (opcode != 0x625 && c != 255 && ((c & 1) || c >= 246)))
@@ -382,8 +384,26 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code, bool geo
             }
             emit(0x5c10000000000000ULL | predicate | dest | (u64{247} << 8) |
                  (u64{252} << 20) | (u64{1} << 47));
-            emit(0x5c10000000000000ULL | predicate | (dest + 1) | (u64{249} << 8) |
-                 (u64{253} << 20) | (u64{1} << 43));
+            if (carry_output == 7) {
+                emit(0x5c10000000000000ULL | predicate | (dest + 1) | (u64{249} << 8) |
+                     (u64{253} << 20) | (u64{1} << 43));
+            } else {
+                // Keep the low carry, then collect overflow from each high-word add.
+                // Maxwell IADD cannot update CC while consuming its old carry.
+                emit(0x5c10000000000000ULL | predicate | 250 | (u64{255} << 8) |
+                     (u64{255} << 20) | (u64{1} << 43));
+                emit(0x5c10000000000000ULL | predicate | 251 | (u64{249} << 8) |
+                     (u64{253} << 20) | (u64{1} << 47));
+                emit(0x5c10000000000000ULL | predicate | 252 | (u64{255} << 8) |
+                     (u64{255} << 20) | (u64{1} << 43));
+                emit(0x5c10000000000000ULL | predicate | (dest + 1) | (u64{251} << 8) |
+                     (u64{250} << 20) | (u64{1} << 47));
+                emit(0x5c10000000000000ULL | predicate | 252 | (u64{252} << 8) |
+                     (u64{255} << 20) | (u64{1} << 43));
+                // Write the predicate last: it may also be the execution guard.
+                emit(0x5b60000000000000ULL | predicate | 7 | (u64{carry_output} << 3) |
+                     (u64{252} << 8) | (u64{255} << 20) | (u64{7} << 39) | (u64{5} << 49));
+            }
             break;
         }
 case 0x311: { // F2I.FTZ.U64.TRUNC, per nvdisasm: Maxwell's F2I gives 32 bits, so the high word is the value over 2^32, the low the rest. A 64-bit divide starts from 2^64 / x this way (the auto-exposure of 04007EF01F8AE000's Lighting.bfsha)
