@@ -936,34 +936,35 @@ case 0x311: { // F2I.FTZ.U64.TRUNC, per nvdisasm: Maxwell's F2I gives 32 bits, s
                  (u64{insn.Bits(64, 8)} << 20) | (u64{maxwell} << 28));
             break;
         }
-        case 0xb6c: { // TXD 2D or ARRAY_2D, four channels; the two destination pairs anywhere.
+        case 0xb6c: { // TXD 2D or ARRAY_2D; selected channels are packed into destination pairs.
             const u32 binding = insn.Bits(54, 5), offset = insn.Bits(40, 14);
             const u32 coordinates = insn.Bits(24, 8), derivatives = insn.Bits(32, 8);
             // Ampere dimensions: 1 = 2D, 5 = ARRAY_2D; Maxwell TXD's are 2 and 3. The coordinates
             // (x, y[, layer]) and the four gradients sit in the same registers for both.
             const u32 dimension = insn.Bits(61, 3);
-            const u32 high = insn.Bits(64, 8); // destination of the third and fourth channels
-            // Bit 90 (word 2 bit 26) is the sign of the LOD the emit below already copies.
-            if ((insn.words[2] & ~0x040000ffU) != 0x001e0f00 || insn.Bits(59, 2) ||
+            const u32 high = insn.Bits(64, 8); // destination of the third and fourth selected channels
+            const u32 mask = insn.Bits(72, 4), channels = static_cast<u32>(std::popcount(mask));
+            // Preserve native bit 90 in Maxwell TXD bit 49.
+            if ((insn.words[2] & ~0x04000fffU) != 0x001e0000 || mask == 0 || insn.Bits(59, 2) ||
                 (dimension != 1 && dimension != 5) || binding >= 18 || offset > 0x1fff ||
-                (dest & 1) || dest >= 248 || (high & 1) || (high >= 248 && high != 255) ||
+                (channels > 1 && (dest & 1)) || dest >= 248 ||
+                (channels > 2 ? (high & 1) || high >= 248 : high != 255) ||
                 coordinates >= 248 || derivatives >= 247)
                 return fail(index, "native gradient texture mode");
             if (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding)
                 return fail(index, "native texture descriptor buffer conflict");
             result.required_texture_buffer = binding;
-            // Maxwell writes four consecutive registers: when the second pair is elsewhere (Splatoon
-            // Raiders: R12/R18, R18/R44), write them to scratch and move each pair into place.
-            const bool consecutive = high == dest + 2;
+            // Maxwell packs selected results consecutively. Split destination pairs need
+            // scratch results copied back, including only one high result for three channels.
+            const bool consecutive = channels <= 2 || high == dest + 2;
             const u64 target = consecutive ? dest : 248;
             emit(0xde00000000000000ULL | predicate | target | (u64{coordinates} << 8) |
-                 (u64{derivatives} << 20) | (u64{dimension == 5 ? 3U : 2U} << 28) | (u64{15} << 31) |
+                 (u64{derivatives} << 20) | (u64{dimension == 5 ? 3U : 2U} << 28) | (u64{mask} << 31) |
                  (u64{offset} << 36) | (u64{insn.Bits(90, 1)} << 49) | (u64{7} << 51));
             if (!consecutive) {
-                for (u32 i = 0; i < 2; ++i) {
-                    emit(0x5c98000000000000ULL | predicate | (dest + i) | (u64{15} << 39) | (u64{248 + i} << 20));
-                    if (high != 255)
-                        emit(0x5c98000000000000ULL | predicate | (high + i) | (u64{15} << 39) | (u64{250 + i} << 20));
+                for (u32 i = 0; i < channels; ++i) {
+                    emit(0x5c98000000000000ULL | predicate | (i < 2 ? dest + i : high + i - 2) |
+                         (u64{15} << 39) | (u64{248 + i} << 20));
                 }
             }
             break;
