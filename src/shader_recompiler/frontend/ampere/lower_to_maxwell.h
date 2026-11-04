@@ -588,7 +588,8 @@ case 0x311: { // F2I.FTZ.U64.TRUNC, per nvdisasm: Maxwell's F2I gives 32 bits, s
                 break;
             }
             if (insn.Bits(24, 8) == 255 && insn.words[1] == 255 && insn.Bits(74, 1) &&
-                (insn.words[2] & ~0x038006ffU) == 0x000e0000 && insn.Bits(64, 8) < 250) {
+                (insn.words[2] & ~0x07800effU) == 0x000e0000 &&
+                (insn.Bits(64, 8) < 250 || insn.Bits(64, 8) == 255)) {
                 // IMAD.X RZ * RZ + c + carry: the high half of a 64-bit add with a zero addend.
                 // UIMAD.X carries in UPn, swapped in from R239 bit 6-n as IADD3.X does.
                 const u32 carry_in = insn.Bits(87, 3);
@@ -603,7 +604,15 @@ case 0x311: { // F2I.FTZ.U64.TRUNC, per nvdisasm: Maxwell's F2I gives 32 bits, s
                 emit(0x5ca0000000000000ULL | predicate | 250 | (u64{250} << 8) | (u64{255} << 20) |
                      (u64{source} << 39) | (u64{insn.Bits(90, 1)} << 42));
                 if (uniform_carry) emit(0x38f0000000070000ULL | (u64{253} << 8) | (u64{mask} << 20));
-                emit(base(0x5c10000000000000ULL) | (u64{insn.Bits(64, 8)} << 8) | (u64{250} << 20));
+                u32 addend = insn.Bits(64, 8);
+                if (insn.Bits(75, 1)) {
+                    // Extended arithmetic complements the addend; the carry supplies
+                    // the extra one for two's-complement subtraction when appropriate.
+                    emit(0x0400000000000000ULL | predicate | 251 | (u64{addend} << 8) |
+                         (u64{0xffffffffU} << 20) | (u64{2} << 53));
+                    addend = 251;
+                }
+                emit(base(0x5c10000000000000ULL) | (u64{addend} << 8) | (u64{250} << 20));
                 break;
             }
             if (insn.Bits(24, 8) == 255 && insn.Bits(32, 8) == 255) {

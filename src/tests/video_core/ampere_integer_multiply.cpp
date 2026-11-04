@@ -66,6 +66,13 @@ struct IntegerMachine {
                 result = (a >> offset) & 0xff;
                 if (bits(48, 1) && (result & 0x80))
                     result |= 0xffffff00;
+            } else if (opcode == 0x5ca0000000000000ULL) {
+                const u32 select = bits(39, 3);
+                const bool take_a = (select == 7 || predicates[select]) != bool(bits(42, 1));
+                result = take_a ? a : b;
+            } else if ((word >> 56) == 0x04) {
+                REQUIRE(bits(53, 2) == 2); // LOP32I.XOR
+                result = a ^ bits(20, 32);
             } else if (opcode == 0x5c98000000000000ULL) {
                 result = b;
             } else if ((word >> 56) == 0x01) {
@@ -275,5 +282,44 @@ TEST_CASE("Ampere integer multiplication rejects unsupported modifiers",
     for (const u32 bit : {8U, 11U, 12U, 13U, 15U}) {
         const Instruction invalid{{0x02007226, 4, 6U | (1U << bit), 0}};
         REQUIRE_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
+    }
+}
+
+
+TEST_CASE("Ampere zero-product IMAD X preserves complemented addends and carry predicates",
+          "[video_core][ampere][integer_multiply]") {
+    for (const bool complement : {false, true}) {
+        for (const bool invert_carry : {false, true}) {
+            for (u32 carry = 0; carry < 8; ++carry) {
+                for (const u32 source : {2U, 255U}) {
+                    for (const u32 dest : {2U, 4U, 6U}) {
+                        for (const u32 guard : {0U, 1U, 7U, 8U, 9U, 15U}) {
+                            for (const u32 value : {0U, 1U, 0x7fffffffU, 0x80000000U, ~0U}) {
+                                auto machine = SeedMachine();
+                                machine.registers[2] = value;
+                                const auto before = machine;
+                                const Instruction instruction{{
+                                    0x224U | (guard << 12) | (dest << 16) | (255U << 24),
+                                    255,
+                                    0x000e0400U | source | (u32{complement} << 11) |
+                                        (carry << 23) | (u32{invert_carry} << 26), 0}};
+                                const auto lowered = LowerToMaxwell(std::array{instruction, Exit});
+                                INFO(lowered.error);
+                                REQUIRE(lowered);
+                                const bool active =
+                                    ((guard & 7) == 7 || before.predicates[guard & 7]) != bool(guard & 8);
+                                const bool carry_value =
+                                    (carry == 7 || before.predicates[carry]) != invert_carry;
+                                const u32 addend = complement ? ~before.Read(source) : before.Read(source);
+                                const u32 expected = active ? addend + u32{carry_value} : before.Read(dest);
+                                machine.Run(lowered.instructions);
+                                REQUIRE(machine.Read(dest) == expected);
+                                CheckUnchanged(before, machine, dest, 1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
