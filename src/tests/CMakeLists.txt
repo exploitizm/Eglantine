@@ -17,6 +17,7 @@ add_executable(tests
     common/scratch_buffer.cpp
     common/undefined_fix.cpp
     common/unique_function.cpp
+    core/nup_writer.cpp
     core/core_timing.cpp
     core/address_space.cpp
     core/page_heap.cpp
