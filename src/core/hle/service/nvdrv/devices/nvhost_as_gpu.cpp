@@ -178,7 +178,7 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
     // nx2:gpu locks that the GPU thread takes under that lock (sparse blocks backed on write).
     auto* const target = gmmu.get();
     lock.unlock();
-    system.GPU().MapInOrder([gmmu = target, gpu_address, device_address, size] {
+    system.GPU().MapInOrder(gpu_address, size, [gmmu = target, gpu_address, device_address, size] {
         gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
     });
     LOG_DEBUG(Service_NVDRV, "Switch 2 GPU mapping {:#x}+{:#x} -> CPU {:#x}", gpu_address, size,
@@ -265,7 +265,7 @@ void nvhost_as_gpu::Nx2Sparse(u64 gpu_address, u64 size, bool create) {
     // On the GPU thread, as in Nx2Map.
     auto* const target = gmmu.get();
     lock.unlock();
-    system.GPU().MapInOrder([gmmu = target, gpu_address, device_address, size] {
+    system.GPU().MapInOrder(gpu_address, size, [gmmu = target, gpu_address, device_address, size] {
         gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
     });
     LOG_DEBUG(Service_NVDRV, "Switch 2 sparse region {:#x}+{:#x} -> device {:#x}", gpu_address,
@@ -309,7 +309,7 @@ void nvhost_as_gpu::Nx2SparseTile(u64 gpu_address, u64 cpu_address, u64 size) {
         asid = session->asid;
     }
     auto& smmu = system.Host1x().MemoryManager();
-    system.GPU().MapInOrder([&smmu, device, cpu_address, size, asid] {
+    system.GPU().MapInOrder(gpu_address, size, [&smmu, device, cpu_address, size, asid] {
         smmu.Unmap(device, size);
         if (cpu_address != 0) {
             smmu.Map(device, cpu_address, size, asid, true);
