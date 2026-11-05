@@ -221,6 +221,57 @@ TEST_CASE("Ampere wide multiply preserves the full sum for all operand forms and
     }
 }
 
+TEST_CASE("Ampere uniform wide multiply with an immediate runs on the uniform scratch pairs",
+          "[video_core][ampere][integer_multiply][ocarina]") {
+    // Ocarina of Time's divide-by-15: UIMAD.WIDE.U32 UR4, UR6, 0x88888889, URZ.
+    const Instruction ocarina{{0x060478a5U, 0x88888889U, 0x0f8e003fU, 0x002fe200U}};
+    auto machine = SeedMachine();
+    machine.registers[216 + 6] = 0x12345678U;
+    const auto lowered = LowerToMaxwell(std::array{ocarina, Exit});
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    const auto before = machine;
+    machine.Run(lowered.instructions);
+    REQUIRE((machine.Read(216 + 4) | (u64{machine.Read(216 + 5)} << 32)) ==
+            u64{0x12345678U} * 0x88888889U);
+    CheckUnchanged(before, machine, 216 + 4, 2);
+
+    // Other pairs, an accumulator pair and signed multiplies, against the full 64-bit sum.
+    std::mt19937 random{0x8a5825};
+    for (const bool is_signed : {false, true}) {
+        for (const u32 dest : {0U, 4U, 20U, 22U, 26U}) {
+            for (const u32 addend : {63U, 8U, 24U}) {
+                for (u32 test = 0; test < 24; ++test) {
+                    auto state = SeedMachine();
+                    const auto uniform = [](u32 reg) { return reg < 22 ? 216 + reg : 218 + reg; };
+                    const u32 a = 10, immediate = test < 2 ? std::array{~0U, 0x80000000U}[test] : random();
+                    state.registers[uniform(a)] = test < 2 ? ~0U : random();
+                    if (addend != 63) {
+                        state.registers[uniform(addend)] = random();
+                        state.registers[uniform(addend) + 1] = random();
+                    }
+                    const Instruction instruction{
+                        {0x8a5U | (7U << 12) | (dest << 16) | (a << 24), immediate,
+                         0x078e0000U | addend | (u32{is_signed} << 9), 0}};
+                    const auto result = LowerToMaxwell(std::array{instruction, Exit});
+                    INFO(result.error);
+                    REQUIRE(result);
+                    const auto start = state;
+                    const u64 sum = addend == 63 ? 0
+                                                 : start.Read(uniform(addend)) |
+                                                       (u64{start.Read(uniform(addend) + 1)} << 32);
+                    const u64 expected =
+                        Product(start.Read(uniform(a)), immediate, is_signed) + sum;
+                    state.Run(result.instructions);
+                    REQUIRE((state.Read(uniform(dest)) | (u64{state.Read(uniform(dest) + 1)} << 32)) ==
+                            expected);
+                    CheckUnchanged(start, state, uniform(dest), 2);
+                }
+            }
+        }
+    }
+}
+
 TEST_CASE("Ampere IDP4 accumulates signed and unsigned bytes without scratch or alias corruption",
           "[video_core][ampere][integer_multiply]") {
     for (const bool signed_a : {false, true}) {

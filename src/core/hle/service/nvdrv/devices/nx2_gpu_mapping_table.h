@@ -115,6 +115,11 @@ public:
         return {true, 0, Difference(before)};
     }
 
+    /// The process address `gpu` reaches, mapped or leased.
+    std::optional<u64> Translate(u64 gpu) const {
+        return Lookup(gpu);
+    }
+
     bool UsesBacking(u64 cpu, u64 size) const {
         for (const auto& range : mappings) {
             if (Overlaps(cpu, size, range.cpu, range.size)) {

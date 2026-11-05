@@ -70,6 +70,22 @@ public:
         MapAt(address, address, size);
     }
 
+    /// The process address one mapping gives all of GPU range [gpu_address, +size), as the game
+    /// last set it. The address spaces get each change later, from the GPU thread, so a submit
+    /// made right after the game maps its command memory cannot read the words through them yet.
+    std::optional<u64> TranslateRange(u64 gpu_address, u64 size) {
+        std::scoped_lock lk{mutex};
+        const auto first = mappings.Translate(gpu_address);
+        if (!first || size == 0) {
+            return first;
+        }
+        const auto last = mappings.Translate(gpu_address + size - 1);
+        if (!last || *last != *first + size - 1) {
+            return std::nullopt;
+        }
+        return first;
+    }
+
     void Unregister(u64 address, u64 size) {
         Ordered([&](Calls& todo) {
             if (!Nx2GpuMappingTable::Valid(address, size)) {

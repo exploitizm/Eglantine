@@ -63,7 +63,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code, bool geo
         const u32 op = instruction.Bits(0, 12);
         uses_uniform_bank |= op == 0xd08;
         uses_uniform_bank |= op == 0x3c4 || op == 0x2bd || op == 0xc0b || op == 0xc0c || op == 0x986 || op == 0x9a8 || op == 0xc12 || op == 0xc17 || op == 0xe24 || op == 0xc24 || op == 0xd00 || op == 0xd09 || op == 0x9c3 || op == 0xc45 || op == 0x2a4 || op == 0x891 || op == 0x890 || op == 0x290 || op == 0x28c || op == 0x88c || op == 0x287 || op == 0x887 || op == 0x958 || op == 0xab9 || op == 0xabb || op == 0x899 || op == 0xc20 || op == 0xe21 || op == 0xe23 || op == 0xc02 ||
-                             op == 0x886 || op == 0x3c2 || op == 0xc82 || op == 0x882 || op == 0x292 || op == 0x092 || op == 0x892 || op == 0x291 || op == 0x981 || op == 0xc13 || op == 0xc10 || op == 0xc11 || op == 0xc23 || op == 0x526 || op == 0x2be || op == 0x8a4 || op == 0xd05 || (op == 0x984 && instruction.Bits(91, 1)) || op == 0x89c || op == 0x883 || op == 0x2a5 || op == 0xd06 || op == 0x299 || op == 0xc09 || op == 0xc0a || op == 0xf60 || (op == 0x81c && instruction.Bits(67, 1));
+                             op == 0x886 || op == 0x3c2 || op == 0xc82 || op == 0x882 || op == 0x292 || op == 0x092 || op == 0x892 || op == 0x291 || op == 0x981 || op == 0xc13 || op == 0xc10 || op == 0xc11 || op == 0xc23 || op == 0x526 || op == 0x2be || op == 0x8a4 || op == 0x8a5 || op == 0xd05 || (op == 0x984 && instruction.Bits(91, 1)) || op == 0x89c || op == 0x883 || op == 0x2a5 || op == 0xd06 || op == 0x299 || op == 0xc09 || op == 0xc0a || op == 0xf60 || (op == 0x81c && instruction.Bits(67, 1));
     }
     const auto address_of = [](u32 index) { return 0x50U + index * 8 + ((index + 1) / 3) * 8; };
     const auto fail = [&](u32 index, std::string_view reason) {
@@ -149,8 +149,10 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code, bool geo
         bool uniform_guard = false;
         bool checked_guard = false;
         u32 uniform_output = 7; // ULOP3's UPn output: computed in P(6-n), then merged into R239
-        if (opcode == 0x2a4 || opcode == 0x8a4 || opcode == 0x891 || opcode == 0x890 || opcode == 0x290 ||
-            opcode == 0x292 || opcode == 0x092 || opcode == 0x892 || opcode == 0x291) {
+        // 0x8a5 (uniform IMAD.WIDE with an immediate, e.g. Ocarina of Time's divide-by-constant
+        // 0x88888889) runs as 0x825 on the uniform pairs' scratch registers, which stay even.
+        if (opcode == 0x2a4 || opcode == 0x8a4 || opcode == 0x8a5 || opcode == 0x891 || opcode == 0x890 ||
+            opcode == 0x290 || opcode == 0x292 || opcode == 0x092 || opcode == 0x892 || opcode == 0x291) {
             // A UPn guard is swapped into P(6-n) around the op; lowerings that would clobber the
             // saved predicate or write outside scratch unguarded are rejected after emission.
             // Any UPn/!UPn execution predicate, including the inverted ones (0xd = !UP5): the
@@ -177,7 +179,8 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code, bool geo
                 uniform_output = insn.Bits(81, 3);
                 insn.words[2] = (insn.words[2] & ~(7U << 17)) | ((6 - uniform_output) << 17);
             }
-            opcode = opcode == 0x2a4 ? 0x224 : opcode == 0x8a4 ? 0x824 : opcode == 0x891 ? 0x811 : opcode == 0x890 ? 0x810
+            opcode = opcode == 0x2a4 ? 0x224 : opcode == 0x8a4 ? 0x824 : opcode == 0x8a5 ? 0x825
+                   : opcode == 0x891 ? 0x811 : opcode == 0x890 ? 0x810
                    : opcode == 0x292 || opcode == 0x092 ? 0x212 : opcode == 0x892 ? 0x812 : opcode == 0x291 ? 0x211 : 0x210;
         }
         const bool uniform_predication = opcode == 0xabb || opcode == 0xab9 || opcode == 0xc82 || opcode == 0x882;
@@ -1334,8 +1337,69 @@ case 0x311: { // F2I.FTZ.U64.TRUNC, per nvdisasm: Maxwell's F2I gives 32 bits, s
                 }
                 break;
             }
-            if (mode != "fast" || !support_cooperative_matrix)
-                return fail(index, "native matrix multiply cooperative path unavailable");
+            if (mode != "fast" || !support_cooperative_matrix) {
+                // Software warp expansion (Lichii, zortos293/Lichii lower_to_maxwell.h): no tensor
+                // extension, so drivers without cooperative matrices (the PS5's RADV) run it.
+                // Lane t holds D rows t/4 and t/4+8, columns 2(t%4)..+1. Each k pair fetches A
+                // from lane (t&0x1c)+k/2%4 and B from lane (t&3)*8+col*4+k/2%4 with SHFL.IDX,
+                // accumulates in FP32 and rounds to FP16 after each K=8 group, as HMMA.F16 does.
+                // Four accumulators and five temporaries, all in R246..R254 (R240..R245 can hold
+                // live registers or emulated uniform registers).
+                const u32 depth_mode = insn.words[2] & ~0xffU;
+                const u32 depth = depth_mode == 0 ? 8U : 16U;
+                const u32 a_count = depth / 4, b_count = depth / 8;
+                const u32 limit = uses_uniform_bank ? 216U : 246U;
+                if (native_predicate != 7 || (depth_mode != 0 && depth_mode != 0x800) ||
+                    (insn.words[3] & 0xc00001ffU) || dest % 2 || dest + 2 > limit ||
+                    a % a_count || a + a_count > limit || b % b_count || b + b_count > limit ||
+                    (c != 255 && (c % 2 || c + 2 > limit)))
+                    return fail(index, "native half matrix multiply mode");
+                const auto shuffle = [&](u32 target, u32 source, u32 lane) {
+                    emit(0xef10000000000000ULL | predicate | target | (u64{source} << 8) |
+                         (u64{lane} << 20) | (u64{1} << 29) | (u64{0x1f} << 34) | (u64{7} << 48));
+                };
+                const auto round_half = [&](u32 reg) {
+                    emit(0x5ca8000000000000ULL | predicate | reg | (u64{1} << 8) |
+                         (u64{2} << 10) | (u64{reg} << 20));
+                };
+                for (u32 row = 0; row < 2; ++row)
+                    for (u32 col = 0; col < 2; ++col)
+                        extract_half({c == 255 ? 255 : c + row, 0, false, false}, col, 246 + row * 2 + col);
+                for (u32 pair = 0; pair < depth / 2; ++pair) {
+                    emit(0xf0c8000000000000ULL | predicate | 250); // LaneId
+                    emit(0x0400000000000000ULL | predicate | 251 | (u64{250} << 8) | (u64{3} << 20));
+                    emit(0x3848000000000000ULL | predicate | 251 | (u64{251} << 8) | (u64{3} << 20));
+                    emit(0x0400000000000000ULL | predicate | 250 | (u64{250} << 8) | (u64{0x1c} << 20));
+                    mov_imm(254, pair & 3);
+                    for (u32 reg : {250U, 251U})
+                        emit(0x5c10000000000000ULL | predicate | reg | (u64{reg} << 8) | (u64{254} << 20));
+                    for (u32 row = 0; row < 2; ++row) {
+                        for (u32 half = 0; half < 2; ++half) {
+                            shuffle(252, a + (pair >= 4 ? 2 : 0) + row, 250);
+                            extract_half({252, 0, false, false}, half, 252);
+                            for (u32 col = 0; col < 2; ++col) {
+                                mov_imm(254, col * 4);
+                                emit(0x5c10000000000000ULL | predicate | 254 | (u64{251} << 8) | (u64{254} << 20));
+                                shuffle(253, b + pair / 4, 254);
+                                extract_half({253, 0, false, false}, half, 253);
+                                const u32 acc = 246 + row * 2 + col;
+                                emit(0x5980000000000000ULL | predicate | acc | (u64{252} << 8) |
+                                     (u64{253} << 20) | (u64{acc} << 39));
+                            }
+                        }
+                    }
+                    if ((pair & 3) == 3) {
+                        for (u32 reg = 246; reg < 250; ++reg) {
+                            round_half(reg);
+                            if (pair + 1 < depth / 2) extract_half({reg, 2, false, false}, 0, reg);
+                        }
+                    }
+                }
+                for (u32 row = 0; row < 2; ++row)
+                    emit(0x5c18000000000000ULL | predicate | (dest + row) |
+                         (u64{247 + row * 2} << 8) | (u64{246 + row * 2} << 20) | (u64{16} << 39));
+                break;
+            }
             if (insn.Bits(12, 4) != 7)
                 return fail(index, "native matrix multiply requires unconditional participation");
             const u32 register_limit = uses_uniform_bank ? 216U : 246U;

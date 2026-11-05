@@ -480,8 +480,20 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
             size_t offset = 0;
             for (const auto& entry : entries.command_lists) {
                 entries.submitted_offsets.push_back(static_cast<u32>(offset));
-                channel_state->memory_manager->ReadBlockUnsafe(
-                    entry.addr, entries.submitted_words.data() + offset, entry.size * sizeof(u32));
+                // A channel's first command lists (Ocarina's fourth queue) can be submitted before
+                // its address space has the command memory: read those through the mapping the
+                // game made, or the snapshot holds zeros and the commands never run.
+                const size_t bytes = entry.size * sizeof(u32);
+                const auto mapped_cpu = channel_state->memory_manager->IsFullyMappedRange(entry.addr, bytes)
+                                            ? std::nullopt
+                                            : Nx2GpuMemoryRegistry::Get().TranslateRange(entry.addr, bytes);
+                if (mapped_cpu) {
+                    system.ApplicationMemory().ReadBlock(*mapped_cpu, entries.submitted_words.data() + offset,
+                                                         bytes);
+                } else {
+                    channel_state->memory_manager->ReadBlockUnsafe(
+                        entry.addr, entries.submitted_words.data() + offset, bytes);
+                }
                 offset += entry.size;
             }
         }

@@ -174,6 +174,20 @@ inline void Nx2ClearSemaphoreRegions() {
     }
 }
 
+/// GPU VA in the first page that mirrors a release at `address`, or 0.
+inline u64 Nx2SemaphoreMirror(u64 address) {
+    for (const auto& region : g_nx2_semaphore_regions) {
+        const u64 start = region.load(std::memory_order_relaxed);
+        if (start == 0) {
+            continue;
+        }
+        if (address >= start + 0x1000 && address < start + 0x2000) {
+            return address - 0x1000;
+        }
+    }
+    return 0;
+}
+
 // Switch 2 sparse regions (nx2:gpu 214, word 7 bit 0x200: title 1's terrain texture arrays and
 // layer pools, 170 MB-5.8 GB each, of which the game fills a little) get memory per block when the
 // GPU first writes there, not in full. nx2:gpu installs the handler and the span its regions cover;
