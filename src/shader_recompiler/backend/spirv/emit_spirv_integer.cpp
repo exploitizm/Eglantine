@@ -50,7 +50,9 @@ Id EmitIAdd32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
         const Id sub_a{ctx.OpISub(ctx.U32[1], ctx.Const(s32_max), a)};
 
         const Id positive_test{ctx.OpSGreaterThan(ctx.U1, b, sub_a)};
-        const Id negative_test{ctx.OpSLessThan(ctx.U1, b, sub_a)};
+        // a < 0 overflows below INT32_MIN: b < INT32_MIN - a (heydemoura/EglantinePS5 0016).
+        const Id negative_limit{ctx.OpISub(ctx.U32[1], ctx.Const(0x80000000u), a)};
+        const Id negative_test{ctx.OpSLessThan(ctx.U1, b, negative_limit)};
         const Id carry_flag{ctx.OpSelect(ctx.U1, is_positive, positive_test, negative_test)};
         overflow->SetDefinition(carry_flag);
         overflow->Invalidate();
