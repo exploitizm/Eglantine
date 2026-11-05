@@ -3847,8 +3847,6 @@ void TextureCache<P>::PrepareRenderTarget(ImageViewId image_view_id, bool invali
             }
             image.flags &= ~ImageFlagBits::CpuModified;
             image.dirty_layers.clear();
-            // Pages a partial write left untracked are tracked again (MarkPartialWrite).
-            RestorePartialPages(image);
             if (False(image.flags & ImageFlagBits::Tracked)) {
                 TrackImage(image, image_view.image_id);
             }

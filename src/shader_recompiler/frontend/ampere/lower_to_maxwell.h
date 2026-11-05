@@ -2143,7 +2143,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 ((byte || small || short_trunc || extended_word) &&
                  (insn.Bits(24, 8) || (insn.words[3] & 0xc00001ffU) ||
                   (opcode == 0xb05 &&
-                   (insn.Bits(63, 1) || (!small && insn.Bits(62, 1)) ||
+                   ((!small && insn.Bits(62, 2)) ||
                     (small && insn.Bits(59, 3)))) ||
                   insn.Bits(91, 1) != static_cast<u32>(opcode == 0xd05))) ||
                 (opcode != 0xb05 && (insn.words[1] & ~(half ? 0x100000ffU :
@@ -2152,7 +2152,10 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 return fail(index, "native float-to-integer conversion mode");
             }
             const bool is_signed = insn.Bits(72, 1);
-            u32 source = opcode == 0xb05 ? materialize(2, 0, 252, small && insn.Bits(62, 1), false)
+            // U16 constant sources use the ordinary float absolute/negate bits (Pokopia's
+            // F2I.FTZ.U16.NTZ R6, |c[0x3][0xd0]|): apply them before NaN handling and rounding.
+            u32 source = opcode == 0xb05 ? materialize(2, 0, 252, small && insn.Bits(62, 1),
+                                                       small && insn.Bits(63, 1))
                        : opcode == 0xd05 ? uniform_register(insn.Bits(32, 8)) : insn.Bits(32, 8);
             if (half) {
                 extract_half({source, insn.Bits(60, 1) ? 3U : 2U, false, false}, 0, 252);

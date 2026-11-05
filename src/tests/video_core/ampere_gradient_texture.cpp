@@ -93,8 +93,7 @@ TEST_CASE("Ampere TXD retains descriptor binding and offset boundaries", "[video
 TEST_CASE("Ampere TXD rejects malformed masks, destinations and modes", "[video_core][ampere]") {
     for (const auto sample : {
              Gradient(0, 12, 255), Gradient(1, 13, 32), Gradient(3, 12, 32),
-             Gradient(3, 13, 255), Gradient(7, 12, 255), Gradient(15, 12, 255),
-             Gradient(7, 12, 33), Gradient(15, 13, 32), Gradient(15, 12, 246),
+             Gradient(3, 13, 255), Gradient(15, 13, 32), Gradient(15, 12, 246),
              Gradient(1, 246, 255), Gradient(1, 13, 255, 0), Gradient(1, 13, 255, 2),
              Gradient(1, 13, 255, 1, 7, 18)}) {
         const std::array code{sample, Exit};

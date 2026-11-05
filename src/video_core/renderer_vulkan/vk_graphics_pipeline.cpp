@@ -332,9 +332,6 @@ GraphicsPipeline::GraphicsPipeline(
         }
     }
 
-    // Select before a synchronous or queued build can release our module reference.
-    configure_func = ConfigureFunc(*spv_modules, stage_infos);
-
     auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics] {
         const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
         Validate();
@@ -347,7 +344,6 @@ GraphicsPipeline::GraphicsPipeline(
                          exception.what(), spv_modules[1] ? 1 : 0, spv_modules[2] ? 1 : 0,
                          spv_modules[3] ? 1 : 0, key.state.patch_control_points_minus_one.Value() + 1,
                          device.GetMaxTessellationPatchSize());
-            spv_modules.reset();
             std::scoped_lock lock{build_mutex};
             is_built = true;
             build_condvar.notify_one();
@@ -356,8 +352,6 @@ GraphicsPipeline::GraphicsPipeline(
             }
             return;
         }
-        // The reuse cache may still own these modules; release only this pipeline's reference.
-        spv_modules.reset();
         if (pipeline_statistics) {
             pipeline_statistics->Collect(device, *pipeline);
         }

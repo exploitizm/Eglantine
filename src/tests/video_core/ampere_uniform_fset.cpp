@@ -67,7 +67,7 @@ TEST_CASE("Ampere uniform FSET shares register modifier lowering", "[video_core]
 
 TEST_CASE("Ampere uniform FSET rejects unknown modes and register aliases",
           "[video_core][ampere]") {
-    for (const u32 source : {28U, 62U, 64U, 255U}) {
+    for (const u32 source : {64U, 255U}) { // UR28-UR63 lower through scratch registers
         auto invalid = UniformComparison;
         invalid[0].words[1] = source;
         REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
@@ -94,6 +94,6 @@ TEST_CASE("Ampere uniform FSET rejects unknown modes and register aliases",
     const auto lowered = LowerToMaxwell(aliases);
     REQUIRE_FALSE(static_cast<bool>(lowered));
     REQUIRE(lowered.error_offset == 0);
-    REQUIRE(lowered.error == "native program uses lowering scratch registers");
+    REQUIRE(lowered.error == "native register shadowing mode");
 }
 } // namespace

@@ -162,10 +162,11 @@ TEST_CASE("Ampere high multiply respects operand forms signs aliases and predica
                         const auto before = machine;
                         const bool active =
                             ((guard & 7) == 7 || before.predicates[guard & 7]) != bool(guard & 8);
+                        // IMAD.HI adds the 64-bit pair Rc+1:Rc before taking the high word.
                         const u32 expected =
                             active ? static_cast<u32>(
-                                         Product(before.Read(2), before.Read(4), is_signed) >> 32) +
-                                         before.Read(6)
+                                         (Product(before.Read(2), before.Read(4), is_signed) +
+                                          (before.Read(6) | (u64{before.Read(7)} << 32))) >> 32)
                                    : before.Read(dest);
                         machine.Run(lowered.instructions);
                         REQUIRE(machine.Read(dest) == expected);
@@ -340,7 +341,8 @@ TEST_CASE("Ampere integer multiplication rejects unsupported modifiers",
             REQUIRE_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
         }
     }
-    for (const u32 bit : {8U, 11U, 12U, 13U, 15U}) {
+    // Bit 12 selects IDP.2A over IDP.4A, which both lower.
+    for (const u32 bit : {8U, 11U, 13U, 15U}) {
         const Instruction invalid{{0x02007226, 4, 6U | (1U << bit), 0}};
         REQUIRE_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
     }

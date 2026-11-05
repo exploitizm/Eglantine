@@ -175,13 +175,6 @@ public:
     /// of it was still queued.
     bool WaitForSync();
 
-    /// Compute or copy work was just sent: what can write GPU-written command lists.
-    void NoteWriter() {
-        last_writer_position = write_position;
-    }
-    /// Waits until the back executed the compute and copy work sent so far (not what came after).
-    void WaitForWriters();
-
 private:
     enum class Kind : u64 {
         Wrap,   ///< The rest of the ring is unused: continue at its start

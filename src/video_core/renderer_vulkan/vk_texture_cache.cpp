@@ -1304,14 +1304,11 @@ void UseBc3ForSwitch2(const Device& device) {
         return;
     }
     const char* keep = std::getenv("EDEN_NX2_KEEP_ASTC");
-    if (memory >= 20_GiB || (keep != nullptr && keep[0] == '1')) {
+    if (keep != nullptr && keep[0] == '1') {
         return;
     }
-    LOG_WARNING(Render_Vulkan,
-                "Switch 2 program with a {} MiB video memory budget: ASTC textures are "
-                "re-compressed to BC3 for this session (uncompressed ASTC needs a 20 GiB budget). "
-                "Set EDEN_NX2_KEEP_ASTC=1 to keep them uncompressed",
-                memory >> 20);
+    LOG_WARNING(Render_Vulkan, "Switch 2 program: ASTC textures are re-compressed to BC3 for this "
+                               "session. Set EDEN_NX2_KEEP_ASTC=1 to keep them uncompressed");
     Settings::SetAstcRecompressionOverride(Settings::AstcRecompression::Bc3);
 }
 } // Anonymous namespace
@@ -5055,9 +5052,12 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     Image& image, const StagingBufferRef& map,
     std::span<const VideoCommon::SwizzleParameters> swizzles) {
     const ImageInfo& info = image.info;
-    const u32 width = info.size.width;
-    const u32 height = info.size.height;
-    const u32 levels = static_cast<u32>(info.resources.levels);
+    // The host image may hold only the guest levels from host_level_offset on (TrimmedHostInfo):
+    // the staging data and swizzles then start at that level, and host level 0 is that level.
+    const u32 skip = image.host_level_offset;
+    const u32 width = (std::max)(info.size.width >> skip, 1U);
+    const u32 height = (std::max)(info.size.height >> skip, 1U);
+    const u32 levels = static_cast<u32>(info.resources.levels) - skip;
     const u32 layers = static_cast<u32>(info.resources.layers);
     // The BC encoder declares layout(rgba8). Identical byte layout is not enough:
     // its storage image view must have the matching R8G8B8A8_UNORM format.
@@ -5239,13 +5239,13 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
         }
     }
     astc_decoder_pass->AssembleInto(
-        info, 0, image.guest_size_bytes,
+        info, skip, image.guest_size_bytes,
         ASTCDecoderPass::Target{
             .image = *pending.image,
             .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
             .initialized = false,
             .level_view = [&pending](s32 level) { return *pending.views[level]; },
-            .wait = true,
+            .wait = false,
         },
         map, swizzles);
 
