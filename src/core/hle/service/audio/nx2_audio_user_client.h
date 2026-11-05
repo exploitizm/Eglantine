@@ -23,7 +23,7 @@ public:
         : ServiceFramework{system_, "nx2:aud:u"} {
         // clang-format off
         static const FunctionInfo functions[] = {
-            {1, &INx2AudioUserClient::GetAudioOutManager, "GetAudioOutManager"},
+            {1, &INx2AudioUserClient::GetAudioOutManager, "GetAudioOutManager (guessed)"},
             {2, &INx2AudioUserClient::GetAudioRendererManager, "GetAudioRendererManager (guessed)"},
         };
         // clang-format on
@@ -32,14 +32,20 @@ public:
 
 private:
     void GetAudioOutManager(HLERequestContext& ctx) {
-        LOG_DEBUG(Service_Audio, "Returning IAudioOutManager");
+        IPC::RequestParser rp{ctx};
+        const u32 arg = rp.Pop<u32>();
+        LOG_WARNING(Service_Audio, "(STUBBED) Switch 2 aud:u 1 arg={}, returning IAudioOutManager",
+                    arg);
         IPC::ResponseBuilder rb{ctx, 2, 0, 1};
         rb.Push(ResultSuccess);
         rb.PushIpcInterface<IAudioOutManager>(ctx, system);
     }
 
     void GetAudioRendererManager(HLERequestContext& ctx) {
-        LOG_WARNING(Service_Audio, "Switch 2 aud:u 2, returning IAudioRendererManager");
+        IPC::RequestParser rp{ctx};
+        const u32 arg = rp.Pop<u32>();
+        LOG_WARNING(Service_Audio, "(STUBBED) Switch 2 aud:u 2 arg={}, returning IAudioRendererManager",
+                    arg);
         IPC::ResponseBuilder rb{ctx, 2, 0, 1};
         rb.Push(ResultSuccess);
         rb.PushIpcInterface<IAudioRendererManager>(ctx, system);

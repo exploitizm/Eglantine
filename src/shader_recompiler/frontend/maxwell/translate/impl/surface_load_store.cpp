@@ -252,7 +252,11 @@ void TranslatorVisitor::SUST(u64 insn) {
         throw NotImplementedException("Cache {}", sust.cache.Value());
     }
     const bool is_typed{sust.d != 0};
-    if (is_typed && sust.ba != 0) {
+    const bool byte_address{is_typed && sust.ba != 0};
+    if (byte_address && (!env.HasNativeInstructions() || env.ShaderStage() != Stage::Compute ||
+                         sust.is_bound == 0 ||
+                         sust.size != Size::B32 || sust.type != Type::_2D ||
+                         sust.cache != StoreCache::WB)) {
         throw NotImplementedException("BA");
     }
     const ImageFormat format{is_typed ? Format(sust.size) : ImageFormat::Typeless};
@@ -266,13 +270,15 @@ void TranslatorVisitor::SUST(u64 insn) {
 
     IR::Value color;
     if (is_typed) {
+        info.image_byte_address.Assign(byte_address ? 1 : 0);
+        info.image_coherent.Assign(byte_address ? 1 : 0);
         color = MakeColor(ir, sust.data_reg, SizeInRegs(sust.size));
     } else {
         const unsigned mask{SwizzleMask(sust.swizzle)};
-        if (mask != 0xf) {
-            throw NotImplementedException("Non-full mask");
+        if (mask != 0x1 && mask != 0x3 && mask != 0xf) {
+            throw NotImplementedException("Non-PTX-sized mask {:#x}", mask);
         }
-        color = MakeColor(ir, sust.data_reg, 4);
+        color = MakeColor(ir, sust.data_reg, std::popcount(mask));
     }
     ir.ImageWrite(handle, coords, color, info);
 }

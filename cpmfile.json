@@ -279,11 +279,14 @@
             "SIRIT_USE_SYSTEM_SPIRV_HEADERS ON"
         ],
         "repo": "eden-emulator/sirit",
-        "version": "v1.0.5",
-        "patches": [
-            "0001-cooperative-matrix.patch",
-            "0002-compile-options.patch"
-        ]
+        "version": "v1.0.5"
+    },
+    "sirit-ci": {
+        "ci": true,
+        "name": "sirit",
+        "package": "sirit",
+        "repo": "eden-emulator/sirit",
+        "version": "v1.0.7"
     },
     "spirv-headers": {
         "hash": "d624371dd455c66a300344c89812598ffe11b5eedba555779f789e85c29dc67317741858c60e0744a1e6755cc0d2759b8659f0674f4cc31479c4cb6fc25ed23b",
@@ -293,6 +296,11 @@
         "package": "SPIRV-Headers",
         "repo": "KhronosGroup/SPIRV-Headers",
         "version": "vulkan-sdk-1.4.341.0"
+    },
+    "streamline": {
+        "hash": "3dbe29efea68e69dea29ac73dd76ebe397a009baac8873f4ae43e126554c1d2836926ad76295bda44588b6fd498883f665154fd63d96f5bea13d95170e41664a",
+        "repo": "NVIDIA-RTX/Streamline",
+        "version": "v2.14.16"
     },
     "tzdb": {
         "artifact": "%VERSION%.tar.gz",

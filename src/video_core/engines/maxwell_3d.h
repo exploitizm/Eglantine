@@ -2541,6 +2541,19 @@ public:
             return IsShaderConfigEnabled(static_cast<std::size_t>(type));
         }
 
+        // Switch 2 (NVN) task and mesh pipelines (clc597.h): SET_MESH_CONTROL, SET_MESH_SHADER_A
+        // and _B, SET_MESH_INIT_SHADER. While mesh control is on, the vertex slot holds the task
+        // program (or the mesh program when there is no task), the tessellation slot the mesh
+        // program and the geometry slot a pass-through header naming the per-primitive outputs.
+        static constexpr std::size_t MeshControl = 0x114c / 4;
+        static constexpr std::size_t MeshShaderA = 0x1150 / 4;
+        static constexpr std::size_t MeshShaderB = 0x1154 / 4;
+        static constexpr std::size_t MeshInitShader = 0x1158 / 4;
+
+        bool IsMeshEnabled() const {
+            return (reg_array[MeshControl] & 1) != 0;
+        }
+
         struct ConstantBuffer {
             u32 size;
             u32 address_high;
@@ -3057,7 +3070,7 @@ public:
             Maxwell3D::Regs::IndexBuffer index_buffer;
             u32 base_instance{};
             u32 instance_count{};
-            /// Deferred instances submitted before a state change in the current loop.
+            /// Deferred instances already drawn by flushes in the middle of the current loop.
             u32 drawn_instances{};
             std::vector<u8> inline_index_draw_indexes;
         };
@@ -3085,7 +3098,7 @@ public:
         };
         void ProcessMethodCall(Maxwell3D& maxwell3d, u32 method, u32 argument);
         void Clear(Maxwell3D& maxwell3d, u32 layer_count);
-        /// Flush pending instances, retaining continuation only for intervening state writes.
+        /// Draws the waiting instances. loop_continues is set when the loop goes on afterwards.
         void DrawDeferred(Maxwell3D& maxwell3d, bool loop_continues = false);
         /// Instances after the first wait to be drawn together (DrawDeferred).
         [[nodiscard]] bool HasDeferredDraw() const noexcept {
@@ -3108,7 +3121,6 @@ public:
         void ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed, u32 instance_count);
         void ProcessDrawIndirect(Maxwell3D& maxwell3d);
         State draw_state{};
-        u32 instance_index{};
         DrawTextureState draw_texture_state{};
         IndirectParams indirect_state{};
     };
@@ -3170,6 +3182,18 @@ public:
     /// This channel's MME data RAM (shared with its compute engine).
     std::array<u32, 0xc00>& GetNativeDataRam() { return native_data_ram; }
     std::span<u32> GetNativeMacroPositions() { return native_macro_context ? std::span<u32>{native_macro_context->positions} : std::span<u32>{macro_positions}; }
+
+    /// Root tables: eight 256-byte tables written inline (method 0x504 selects a table, bits 0-2,
+    /// and a byte offset, bits 8-15; each 0x508 writes the next word) that shaders read as constant
+    /// banks 24-31. NVN2 keeps push constants in bank 24, which the Ampere lowering reads as bank 17.
+    struct RootTables {
+        static constexpr u32 SelectMethod = 0x504 / 4;
+        static constexpr u32 LoadMethod = 0x508 / 4;
+        std::array<std::array<u32, 64>, 8> tables{};
+        u32 selected{};
+        u32 offset{};
+        bool loaded{};
+    } root_tables;
 
 
     /// Write the value to the register identified by method.
@@ -3329,7 +3353,17 @@ private:
     };
     std::array<RecentWrite, 48> recent_writes{};
     size_t recent_write_index = 0;
+    const bool record_write_history{
+#ifdef NDEBUG
+        std::getenv("EDEN_NX2_3D_HISTORY") != nullptr
+#else
+        true
+#endif
+    };
     void RecordWrite(u32 method, u32 argument, u32 amount, u32 pending) {
+        if (!record_write_history) {
+            return;
+        }
         recent_writes[recent_write_index++ % recent_writes.size()] = {method, argument, amount, pending};
     }
     void DumpRecentWrites(u32 method);

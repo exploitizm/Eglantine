@@ -65,6 +65,7 @@ public:
     }
     void ReleaseOne() noexcept;
     void ReleaseAll() noexcept;
+    /// True when ReleaseAll would change nothing, as for most of the spill slots most of the time.
     inline bool IsReleased() const noexcept {
         return current_references == 0 && is_being_used_count == 0 && !is_scratch && !is_set_last_use &&
                (total_uses != accumulated_uses || (values.empty() && total_uses == 0 && max_bit_width == 0));
@@ -205,6 +206,7 @@ public:
     void ReleaseStackSpace(BlockOfCode& code, const size_t stack_space) noexcept;
 
     inline void EndOfAllocScope() noexcept {
+        // After every IR instruction: skip the locations it left alone.
         for (auto& iter : hostloc_info)
             if (!iter.IsReleased())
                 iter.ReleaseAll();

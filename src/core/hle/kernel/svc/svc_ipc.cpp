@@ -4,15 +4,12 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <chrono>
-
 #include "common/scope_exit.h"
 #include "common/scratch_buffer.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_client_session.h"
 #include "core/hle/kernel/k_hardware_timer.h"
 #include "core/hle/kernel/k_process.h"
-#include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/k_scoped_resource_reservation.h"
 #include "core/hle/kernel/k_server_session.h"
 #include "core/hle/kernel/k_session.h"
@@ -34,37 +31,9 @@ Result SendSyncRequestImpl(KernelCore& kernel, uintptr_t message, size_t buffer_
 
     // Send the request.
     const Result result = session->SendSyncRequest(kernel, message, buffer_size);
-
-    // On hardware an IPC round trip to a system module blocks the caller long enough for a
-    // lower-priority thread it just started on the same core to run until it blocks itself.
-    // Games depend on that: Mario Tennis Fever starts one worker per core with a pointer to an
-    // argument block on the starting thread's stack and returns; the core 0 worker can only run
-    // once the main thread blocks in IPC. HLE services answer before the new thread got anywhere,
-    // the main thread preempts it, reuses the stack, and the worker later reads a null barrier
-    // and waits on address 0xc forever: the boot hangs at "Launching". So keep the caller blocked
-    // a little longer (a longer IPC latency is always legal) until such threads block on
-    // something other than a mutex, or exit, bounded by 20 ms of host time.
-    auto& pending = GetCurrentThread(kernel).GetPendingStartedThreads();
-    if (!pending.empty()) [[unlikely]] {
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
-        for (KThread* thread : pending) {
-            // A thread blocked on a user mutex (e.g. the SDK's thread list lock, held by a sibling
-            // starting on another core) has not reached its own code yet; keep waiting for it.
-            // Its state and lock info change on other cores under the scheduler lock.
-            const auto still_starting = [&] {
-                KScopedSchedulerLock sl{kernel};
-                return thread->GetState() == ThreadState::Runnable ||
-                       thread->GetWaitingLockInfo() != nullptr;
-            };
-            while (still_starting() && std::chrono::steady_clock::now() < deadline) {
-                static_cast<void>(GetCurrentThread(kernel).Sleep(
-                    kernel, kernel.HardwareTimer().GetTick() + 50'000));
-            }
-            thread->Close(kernel);
-        }
-        pending.clear();
+    if (R_SUCCEEDED(result)) {
+        GetCurrentThread(kernel).WaitForStartupThreads(kernel);
     }
-
     R_RETURN(result);
 }
 

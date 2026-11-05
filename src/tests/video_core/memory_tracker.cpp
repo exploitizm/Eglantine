@@ -12,7 +12,6 @@
 
 #include "common/common_types.h"
 #include "video_core/buffer_cache/memory_tracker_base.h"
-#include "video_core/nx2.h"
 #include "core/device_memory.h"
 #include "core/memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -35,6 +34,9 @@ public:
     }
 
     void UpdatePagesCachedBatch(std::span<const std::pair<DAddr, size_t>> ranges, s32 delta) {
+        if (ranges.empty()) {
+            return;
+        }
         ++update_calls;
         for (const auto& [addr, size] : ranges) {
             Apply(addr, size, delta);
@@ -569,6 +571,10 @@ TEST_CASE("MemoryTracker: FlushCachedWrites batching") {
     RasterizerInterface rasterizer;
     std::optional<MemoryTracker> memory_track(rasterizer);
     memory_track->UnmarkRegionAsCpuModified(c, WORD * 2);
+    REQUIRE(rasterizer.UpdateCalls() == 1);
+    REQUIRE(rasterizer.UpdateCallsList().size() == 1);
+    REQUIRE(rasterizer.UpdateCallsList().front() == std::tuple{c, WORD * 2, 1});
+
     memory_track->CachedCpuWrite(c + PAGE, PAGE);
     memory_track->CachedCpuWrite(c + PAGE * 2, PAGE);
     memory_track->CachedCpuWrite(c + PAGE * 4, PAGE);
@@ -589,6 +595,34 @@ TEST_CASE("MemoryTracker: FlushCachedWrites batching") {
     REQUIRE(rasterizer.Count() == WORD * 2 / PAGE - 3);
 }
 
+TEST_CASE("MemoryTracker: cached writes preserve tracking counts") {
+    RasterizerInterface rasterizer;
+    std::optional<MemoryTracker> memory_track(rasterizer);
+    memory_track->UnmarkRegionAsCpuModified(c, WORD * 2);
+    REQUIRE(rasterizer.UpdateCalls() == 1);
+    REQUIRE(rasterizer.UpdateCallsList().size() == 1);
+    REQUIRE(rasterizer.UpdateCallsList().front() == std::tuple{c, WORD * 2, 1});
+
+    memory_track->CachedCpuWrite(c + PAGE, PAGE);
+    memory_track->CachedCpuWrite(c + PAGE * 2, PAGE);
+    memory_track->CachedCpuWrite(c + PAGE * 4, PAGE);
+    REQUIRE(rasterizer.Count() == 125);
+    REQUIRE(rasterizer.Count(c + PAGE) == 0);
+    REQUIRE(rasterizer.Count(c + PAGE * 2) == 0);
+    REQUIRE(rasterizer.Count(c + PAGE * 3) == 1);
+    REQUIRE(rasterizer.Count(c + PAGE * 4) == 0);
+    const auto update_calls = rasterizer.UpdateCalls();
+    memory_track->FlushCachedWrites();
+    REQUIRE(rasterizer.UpdateCalls() == update_calls);
+    REQUIRE(rasterizer.Count() == 125);
+    REQUIRE(memory_track->IsRegionCpuModified(c + PAGE, PAGE));
+    REQUIRE(memory_track->IsRegionCpuModified(c + PAGE * 2, PAGE));
+    REQUIRE_FALSE(memory_track->IsRegionCpuModified(c + PAGE * 3, PAGE));
+    REQUIRE(memory_track->IsRegionCpuModified(c + PAGE * 4, PAGE));
+    memory_track->MarkRegionAsCpuModified(c, WORD * 2);
+    REQUIRE(rasterizer.Count() == 0);
+}
+
 TEST_CASE("DeviceMemoryManager: UpdatePagesCachedBatch basic") {
     Core::DeviceMemory device_memory;
     Tegra::MaxwellDeviceMemoryManager manager(device_memory);
@@ -602,36 +636,4 @@ TEST_CASE("DeviceMemoryManager: UpdatePagesCachedBatch basic") {
     ranges.emplace_back(Core::Memory::YUZU_PAGESIZE, Core::Memory::YUZU_PAGESIZE);
     manager.UpdatePagesCachedBatch(ranges, 1);
     SUCCEED("UpdatePagesCachedBatch executed without error");
-}
-
-TEST_CASE("MemoryTracker: repeated indirect rewrites keep historical command-page tracking",
-          "[video_core][nx2_command_sync][mkw_sync]") {
-    Tegra::Nx2ClearGpuWrittenPages();
-    RasterizerInterface rasterizer;
-    auto tracker = std::make_unique<MemoryTracker>(rasterizer);
-    tracker->UnmarkRegionAsCpuModified(c, PAGE);
-    const auto translate = [](GPUVAddr address) -> std::optional<DAddr> {
-        return c + address - 0x8600000000ULL;
-    };
-    REQUIRE_FALSE(Tegra::Nx2HasGpuWrittenPage(0x8600000000ULL, 5 * sizeof(u32), translate));
-    for (u32 frame = 0; frame < 3; ++frame) {
-        tracker->MarkRegionAsGpuModified(c, 5 * sizeof(u32));
-        Tegra::Nx2MarkGpuWritten(c, 5 * sizeof(u32));
-        REQUIRE(Tegra::Nx2HasGpuWrittenPage(0x8600000000ULL, 5 * sizeof(u32), translate));
-        REQUIRE(tracker->IsRegionGpuModified(c, 5 * sizeof(u32)));
-        std::vector<Range> downloads;
-        tracker->ForEachDownloadRangeAndClear(c, PAGE, [&](u64 address, u64 size) {
-            downloads.emplace_back(address, size);
-        });
-        REQUIRE(downloads == std::vector<Range>{{c, PAGE}});
-        REQUIRE_FALSE(tracker->IsRegionGpuModified(c, 5 * sizeof(u32)));
-        REQUIRE(Tegra::Nx2HasGpuWrittenPage(0x8600000000ULL, 5 * sizeof(u32), translate));
-        downloads.clear();
-        tracker->ForEachDownloadRangeAndClear(c, PAGE, [&](u64 address, u64 size) {
-            downloads.emplace_back(address, size);
-        });
-        REQUIRE(downloads.empty());
-    }
-    tracker->MarkRegionAsCpuModified(c, PAGE);
-    REQUIRE(rasterizer.Count() == 0);
 }

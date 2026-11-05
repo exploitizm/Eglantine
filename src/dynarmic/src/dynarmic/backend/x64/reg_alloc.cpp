@@ -465,6 +465,8 @@ std::optional<HostLoc> RegAlloc::ValueLocation(const IR::Inst* value) const noex
     return std::nullopt;
 }
 
+// The checks that scan every location for def_inst are debug-only: per IR instruction they cost as
+// much as the rest of register allocation.
 void RegAlloc::DefineValueImpl(BlockOfCode& code, IR::Inst* def_inst, HostLoc host_loc) noexcept {
     DEBUG_ASSERT(!ValueLocation(def_inst) && "def_inst has already been defined");
     LocInfo(host_loc).AddValue(host_loc, def_inst);

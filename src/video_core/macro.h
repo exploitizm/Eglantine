@@ -244,7 +244,6 @@ struct MacroEngine {
     }
     // Compiles the macro if its not in the cache, and executes the compiled macro
     void Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u32 method, std::span<const u32> parameters);
-    void ReadNativeMemory(Engines::Maxwell3D& maxwell3d, u32 method, u32 address, u32 value);
     AnyCachedMacro Compile(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> code);
     struct CacheInfo {
         AnyCachedMacro program;

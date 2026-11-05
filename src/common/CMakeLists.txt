@@ -43,6 +43,8 @@ add_library(
     device_power_state.cpp
     device_power_state.h
     div_ceil.h
+    dkb_cpu_trace.cpp
+    dkb_cpu_trace.h
     dynamic_library.cpp
     dynamic_library.h
     elf.h
@@ -121,6 +123,8 @@ add_library(
     swap.h
     thread.cpp
     thread.h
+    thread_cpu_clock.cpp
+    thread_cpu_clock.h
     adpf.cpp
     adpf.h
     thread_queue_list.h

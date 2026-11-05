@@ -117,10 +117,14 @@ public:
 
     // Patching
     enum class PatchKind : u32 { Jg, Jz, Jmp, MovRcx };
+    /// Places in emitted code that jump to a block (or load its entrypoint), patched when it is
+    /// compiled or invalidated: each the place's offset in the code space times four plus its
+    /// PatchKind, 0 when unused. Most blocks are linked from one or two places.
     struct PatchInformation {
         std::array<u32, 2> first{};
         std::unique_ptr<std::vector<u32>> rest;
     };
+    /// Records that the code about to be emitted at the current position is a patch of `kind`.
     void AddPatchLocation(const IR::LocationDescriptor& target_desc, PatchKind kind);
     void Patch(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr);
     virtual void Unpatch(const IR::LocationDescriptor& target_desc);

@@ -6,84 +6,60 @@
 // Refer to the license.txt file included.
 
 #include <charconv>
-#include <optional>
-#include <string_view>
-
 #include "common/logging.h"
-#include "common/net/net.h"
 #include "common/scm_rev.h"
-#include "update_checker.h"
+#include "frontend_common/update_checker.h"
 
 namespace UpdateChecker {
 
 namespace {
 
-constexpr u32 max_changes = 100;
-
-// Release tags are <channel>-build-<number>, where the channel is the branch CI built.
-struct BuildTag {
-    std::string_view channel;
-    u64 number;
-};
-
-std::optional<BuildTag> ParseBuildTag(std::string_view tag) {
-    constexpr std::string_view marker = "-build-";
-    const auto pos = tag.rfind(marker);
-    if (pos == std::string_view::npos || pos == 0)
+std::optional<u64> ParseBuildNumber(std::string_view tag) {
+    constexpr std::string_view prefix = "build-";
+    if (!tag.starts_with(prefix)) {
         return std::nullopt;
-
-    const auto digits = tag.substr(pos + marker.size());
+    }
+    tag.remove_prefix(prefix.size());
     u64 number{};
-    const auto [end, error] = std::from_chars(digits.data(), digits.data() + digits.size(), number);
-    if (digits.empty() || error != std::errc{} || end != digits.data() + digits.size())
+    const auto [end, error] = std::from_chars(tag.data(), tag.data() + tag.size(), number);
+    if (error != std::errc{} || end != tag.data() + tag.size() || number == 0) {
         return std::nullopt;
-
-    return BuildTag{tag.substr(0, pos), number};
+    }
+    return number;
 }
 
 } // namespace
 
-Result Check() {
-    const auto current = ParseBuildTag(Common::g_build_release_tag);
-    if (!current)
-        return Failure::NotReleaseBuild;
-
-    const auto releases = Common::Net::GetReleases();
-    if (!releases)
-        return Failure::Unreachable;
-
-    std::optional<Common::Net::Release> latest;
-    u64 latest_number = current->number;
-    for (const auto& release : *releases) {
-        const auto tag = ParseBuildTag(release.tag);
-        if (tag && tag->channel == current->channel && tag->number > latest_number) {
-            latest = release;
-            latest_number = tag->number;
-        }
+std::optional<Common::Net::Release> SelectUpdate(std::span<const Common::Net::Release> releases,
+                                                 std::string_view build_tag,
+                                                 std::string_view platform) {
+    auto newest = ParseBuildNumber(build_tag);
+    if (!newest) {
+        return std::nullopt;
     }
 
-    if (!latest)
-        return UpToDate{};
-
-    LOG_INFO(Frontend, "Update available: {}", latest->tag);
-
-    Update update{
-        .release = *latest,
-        .changes = {},
-        .changes_complete = false,
-        .compare_url = Common::Net::GetCompareUrl(Common::g_scm_rev, latest->commit),
-    };
-
-    if (auto commits = Common::Net::GetCommits(latest->commit, max_changes)) {
-        for (auto& commit : *commits) {
-            if (commit.sha == Common::g_scm_rev) {
-                update.changes_complete = true;
-                break;
-            }
-            update.changes.push_back(std::move(commit));
+    const Common::Net::Release* selected = nullptr;
+    for (const auto& release : releases) {
+        const auto number = ParseBuildNumber(release.tag);
+        if (number && *number > *newest && !release.GetPlatformAssets(platform).empty()) {
+            newest = number;
+            selected = &release;
         }
     }
+    return selected ? std::make_optional(*selected) : std::nullopt;
+}
 
+std::optional<Common::Net::Release> GetUpdate() {
+    if (!ParseBuildNumber(Common::g_build_release_tag) ||
+        std::string_view{Common::g_build_release_platform}.empty()) {
+        return std::nullopt;
+    }
+
+    auto update = SelectUpdate(Common::Net::GetReleases(), Common::g_build_release_tag,
+                               Common::g_build_release_platform);
+    if (update) {
+        LOG_INFO(Frontend, "Received update {}", update->title);
+    }
     return update;
 }
 

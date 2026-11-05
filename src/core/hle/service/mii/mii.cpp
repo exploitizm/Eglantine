@@ -48,8 +48,8 @@ public:
             {15, D<&IDatabaseService::DestroyFile>, "DestroyFile"},
             {16, D<&IDatabaseService::DeleteFile>, "DeleteFile"},
             {17, D<&IDatabaseService::Format>, "Format"},
-            {18, nullptr, "Import"},
-            {19, nullptr, "Export"},
+            {18, &IDatabaseService::StubReplyZeroed, "Import"},
+            {19, &IDatabaseService::StubReplyZeroed, "Export"},
             {20, D<&IDatabaseService::IsBrokenDatabaseWithClearFlag>, "IsBrokenDatabaseWithClearFlag"},
             {21, D<&IDatabaseService::GetIndex>, "GetIndex"},
             {22, D<&IDatabaseService::SetInterfaceVersion>, "SetInterfaceVersion"},
@@ -57,6 +57,8 @@ public:
             {24, D<&IDatabaseService::ConvertCoreDataToCharInfo>, "ConvertCoreDataToCharInfo"},
             {25, D<&IDatabaseService::ConvertCharInfoToCoreData>, "ConvertCharInfoToCoreData"},
             {26,  D<&IDatabaseService::Append>, "Append"},
+            {27, &IDatabaseService::StubReplyZeroed, "Unknown27"},
+            {28, &IDatabaseService::StubReplyZeroed, "Unknown28"},
         };
         // clang-format on
 
@@ -121,14 +123,16 @@ private:
         R_RETURN(manager->UpdateLatest(metadata, *out_char_info, char_info, source_flag));
     }
 
-    Result BuildRandom(Out<CharInfo> out_char_info, Age age, Gender gender, Race race) {
+    // Age, Gender and Race are u8 enums, but the request passes each one as a 32-bit word.
+    Result BuildRandom(Out<CharInfo> out_char_info, u32 age, u32 gender, u32 race) {
         LOG_DEBUG(Service_Mii, "called with age={}, gender={}, race={}", age, gender, race);
 
-        R_UNLESS(age <= Age::All, ResultInvalidArgument);
-        R_UNLESS(gender <= Gender::All, ResultInvalidArgument);
-        R_UNLESS(race <= Race::All, ResultInvalidArgument);
+        R_UNLESS(age <= static_cast<u32>(Age::All), ResultInvalidArgument);
+        R_UNLESS(gender <= static_cast<u32>(Gender::All), ResultInvalidArgument);
+        R_UNLESS(race <= static_cast<u32>(Race::All), ResultInvalidArgument);
 
-        manager->BuildRandom(*out_char_info, age, gender, race);
+        manager->BuildRandom(*out_char_info, static_cast<Age>(age), static_cast<Gender>(gender),
+                             static_cast<Race>(race));
 
         R_SUCCEED();
     }

@@ -20,23 +20,6 @@ namespace Tegra {
 // Ampere classes and the Turing+ macro ISA, which Eden's Maxwell engines don't implement.
 inline std::atomic<bool> g_nx2_ampere{false};
 
-// The running title, for the few places that must behave differently per game.
-inline std::atomic<u64> g_nx2_program_id{0};
-
-// Titles whose guest side reads GPU-written buffer data through a path the buffer cache does not
-// see, so their buffers must be copied back to guest memory at every fence
-// (BufferCache::AsyncBufferDownloads, EDEN_NX2_BUFFER_DOWNLOADS). 0400A3A01EE4C000 is Pokemon
-// Pokopia: with the copy-back off its sky is black or flickers. Open work: find what reads it,
-// then the list goes.
-inline bool Nx2NeedsBufferDownloads() {
-    switch (g_nx2_program_id.load(std::memory_order_relaxed)) {
-    case 0x0400A3A01EE4C000ULL:
-        return true;
-    default:
-        return false;
-    }
-}
-
 // Device pages the GPU has written through the buffer cache (shader stores, copies), ever. Title 1
 // runs command lists the GPU writes each frame (20-byte entries its culling fills in); read
 // without a flush they are stale and the draws behind them (trees) go missing. The bits never
@@ -51,14 +34,11 @@ inline void Nx2MarkGpuWritten(u64 device_address, u64 size) {
     }
     const u64 last = std::min<u64>((device_address + size - 1) >> Nx2WrittenPageBits,
                                    g_nx2_gpu_written_pages.size() * 64 - 1);
-    const u64 first = device_address >> Nx2WrittenPageBits;
-    for (u64 index = first / 64; first <= last && index <= last / 64; ++index) {
-        const u64 low = index == first / 64 ? first % 64 : 0;
-        const u64 high = index == last / 64 ? last % 64 : 63;
-        const u64 bits = (~u64{0} >> (63 - high)) & (~u64{0} << low);
-        auto& word = g_nx2_gpu_written_pages[index];
-        if ((word.load(std::memory_order_relaxed) & bits) != bits) {
-            word.fetch_or(bits, std::memory_order_relaxed);
+    for (u64 page = device_address >> Nx2WrittenPageBits; page <= last; ++page) {
+        auto& word = g_nx2_gpu_written_pages[page / 64];
+        const u64 bit = u64{1} << (page % 64);
+        if ((word.load(std::memory_order_relaxed) & bit) == 0) {
+            word.fetch_or(bit, std::memory_order_relaxed);
         }
     }
 }
@@ -110,38 +90,6 @@ inline void Nx2ClearGpuWrittenPages() {
     return (g_nx2_gpu_written_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1;
 }
 
-template <typename Translate>
-[[nodiscard]] bool Nx2HasGpuWrittenPage(GPUVAddr address, size_t size, Translate&& translate) {
-    if (size == 0) {
-        return false;
-    }
-    const GPUVAddr last = address + size - 1;
-    if (last < address) {
-        return true;
-    }
-    constexpr GPUVAddr mask = (GPUVAddr{1} << Nx2WrittenPageBits) - 1;
-    for (GPUVAddr page = address & ~mask;; page += mask + 1) {
-        if (const auto device = translate(page); device && Nx2IsGpuWritten(*device)) {
-            return true;
-        }
-        if (page == (last & ~mask)) {
-            return false;
-        }
-    }
-}
-
-template <typename Drain, typename Translate, typename Flush>
-void Nx2SynchronizeGpuWrittenCommands(GPUVAddr address, size_t size, Drain&& drain,
-                                     Translate&& translate, Flush&& flush) {
-    if (size == 0) return;
-    drain();
-    if (Nx2HasGpuWrittenPage(address, size, translate)) flush();
-}
-
-// NVN2 queues release their progress values into the second page of a two-page GPU-accessible
-// region and GPU acquires read the same offsets in the first page (the CPU polls the second).
-// Something on the console copies one into the other; until that is known, the puller mirrors
-// releases that land in a second page. Every queue has such a region, so keep a small table.
 inline constexpr size_t Nx2MaxSemaphoreRegions = 32;
 inline std::array<std::atomic<u64>, Nx2MaxSemaphoreRegions> g_nx2_semaphore_regions{}; // starts
 
@@ -191,8 +139,9 @@ inline u64 Nx2SemaphoreMirror(u64 address) {
 // Switch 2 sparse regions (nx2:gpu 214, word 7 bit 0x200: title 1's terrain texture arrays and
 // layer pools, 170 MB-5.8 GB each, of which the game fills a little) get memory per block when the
 // GPU first writes there, not in full. nx2:gpu installs the handler and the span its regions cover;
-// the GPU memory manager calls Nx2BackSparseWrite before each write.
-using Nx2SparseBackingHandler = std::function<void(u64 gpu_address, u64 size)>;
+// the GPU memory manager calls Nx2BackSparseWrite before each write, with the bytes it writes
+// (blocks nobody wrote that only get zeros need no memory: they read zero already).
+using Nx2SparseBackingHandler = std::function<void(u64 gpu_address, u64 size, const u8* data)>;
 inline std::recursive_mutex g_nx2_sparse_backing_mutex;
 inline Nx2SparseBackingHandler g_nx2_sparse_backing;
 inline std::atomic<u64> g_nx2_sparse_low{~u64{0}};
@@ -216,14 +165,14 @@ inline void Nx2AddSparseSpan(u64 gpu_address, u64 size) {
     }
 }
 
-inline void Nx2BackSparseWrite(u64 gpu_address, u64 size) {
+inline void Nx2BackSparseWrite(u64 gpu_address, u64 size, const void* data) {
     if (gpu_address + size <= g_nx2_sparse_low.load(std::memory_order_relaxed) ||
         gpu_address >= g_nx2_sparse_high.load(std::memory_order_relaxed)) [[likely]] {
         return;
     }
     std::scoped_lock lk{g_nx2_sparse_backing_mutex};
     if (g_nx2_sparse_backing) {
-        g_nx2_sparse_backing(gpu_address, size);
+        g_nx2_sparse_backing(gpu_address, size, static_cast<const u8*>(data));
     }
 }
 
@@ -266,6 +215,15 @@ inline void Nx2SparseBlockWritten(u64 region_address, u64 block) {
     if (const auto it = g_nx2_sparse_state.find(region_address); it != g_nx2_sparse_state.end()) {
         it->second.written[block] = true;
     }
+}
+
+/// True unless the block of the region at region_address is known to hold nothing (no write from
+/// the CPU or the GPU yet).
+inline bool Nx2SparseBlockIsWritten(u64 region_address, u64 block) {
+    std::scoped_lock lk{g_nx2_sparse_state_mutex};
+    const auto it = g_nx2_sparse_state.find(region_address);
+    return it == g_nx2_sparse_state.end() || block >= it->second.written.size() ||
+           it->second.written[block];
 }
 
 /// The game maps its own memory over [offset, +size) of the region at region_address (mapped), or

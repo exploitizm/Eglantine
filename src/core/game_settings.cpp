@@ -119,29 +119,12 @@ EnvironmentInfo DetectEnvironment(const VideoCore::RendererBase& renderer) {
     return env;
 }
 
-// A title default only where the user kept the global value; set as the per-game value, which
-// RestoreGlobalState drops again when emulation stops (the global config is never touched).
-template <typename T>
-static void OverrideIfGlobal(Settings::SwitchableSetting<T, true>& setting, T value) {
-    if (!setting.UsingGlobal()) {
-        return;
-    }
-    setting.SetGlobal(false);
-    setting.SetValue(value);
-}
-
 void LoadOverrides(std::uint64_t program_id, const VideoCore::RendererBase& renderer) {
     const auto env = DetectEnvironment(renderer);
 
     switch (static_cast<TitleID>(program_id)) {
         case TitleID::NinjaGaidenRagebound:
             Settings::values.use_squashed_iterated_blend = true;
-            break;
-        case TitleID::MarioTennisFever:
-            // Low accuracy lets the GPU thread split (30 -> 60 fps in a match); Balanced fences keep
-            // occlusion reports in the query cache, or its conditional rendering hides the characters.
-            OverrideIfGlobal(Settings::values.gpu_accuracy, Settings::GpuAccuracy::Low);
-            OverrideIfGlobal(Settings::values.gpu_fence_behavior, Settings::GpuFenceBehavior::Balanced);
             break;
         default:
             break;

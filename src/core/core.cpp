@@ -24,6 +24,7 @@
 #include "core/cpu_manager.h"
 #include "core/debugger/debugger.h"
 #include "core/device_memory.h"
+#include "core/file_sys/content_archive.h"
 #include "core/file_sys/fs_filesystem.h"
 #include "core/file_sys/nup_container.h"
 #include "core/file_sys/patch_manager.h"
@@ -31,6 +32,7 @@
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/romfs_factory.h"
 #include "core/file_sys/savedata_factory.h"
+#include "core/file_sys/submission_package.h"
 #include "core/file_sys/vfs/vfs_concat.h"
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/gpu_dirty_memory_manager.h"
@@ -115,8 +117,8 @@ FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
 
 namespace {
 
-// Switch 2 titles boot as a loose ExeFS, with main.npdm next to main.
-bool IsSwitch2Program(const FileSys::VirtualFile& file) {
+// Detect the platform before initializing the kernel memory layout and guest clock.
+bool IsSwitch2Program(const FileSys::VirtualFile& file, u64 program_id, std::size_t program_index) {
     FileSys::ProgramMetadata metadata;
     if (FileSys::NupContainer::IsNupFile(file)) {
         FileSys::NupContainer nup{file};
@@ -132,6 +134,22 @@ bool IsSwitch2Program(const FileSys::VirtualFile& file) {
             program = update;
         }
         const auto exefs = program ? nup.GetExeFSDir(*program) : nullptr;
+        const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
+        return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
+               metadata.IsSwitch2();
+    }
+    const auto type = file != nullptr ? Loader::IdentifyFile(file) : Loader::FileType::Unknown;
+    if (type == Loader::FileType::NSP || type == Loader::FileType::NSZ) {
+        const FileSys::NSP nsp{file, program_id, program_index};
+        if (nsp.GetStatus() != Loader::ResultStatus::Success) {
+            return false;
+        }
+        auto exefs = nsp.GetExeFS();
+        if (!nsp.IsExtractedType()) {
+            const auto program =
+                nsp.GetNCA(nsp.GetProgramTitleID(), FileSys::ContentRecordType::Program);
+            exefs = program != nullptr ? program->GetExeFS() : nullptr;
+        }
         const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
         return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
                metadata.IsSwitch2();
@@ -155,7 +173,7 @@ struct System::Impl {
         device_memory.emplace();
 
         is_multicore = Settings::values.use_multi_core.GetValue();
-        extended_memory_layout = Settings::values.memory_layout_mode.GetValue() != Settings::MemoryLayout::Memory_4Gb;
+        memory_layout = Settings::values.memory_layout_mode.GetValue();
 
         core_timing.SetMulticore(is_multicore);
         core_timing.Initialize([&system]() { system.RegisterHostThread(); });
@@ -182,8 +200,7 @@ struct System::Impl {
         const bool must_reinitialize =
             !device_memory.has_value() ||
             is_multicore != Settings::values.use_multi_core.GetValue() ||
-            extended_memory_layout != (Settings::values.memory_layout_mode.GetValue() !=
-                                       Settings::MemoryLayout::Memory_4Gb);
+            memory_layout != Settings::values.memory_layout_mode.GetValue();
 
         if (!must_reinitialize) {
             return;
@@ -192,8 +209,7 @@ struct System::Impl {
         LOG_DEBUG(Kernel, "Re-initializing");
 
         is_multicore = Settings::values.use_multi_core.GetValue();
-        extended_memory_layout =
-            Settings::values.memory_layout_mode.GetValue() != Settings::MemoryLayout::Memory_4Gb;
+        memory_layout = Settings::values.memory_layout_mode.GetValue();
 
         Initialize(system);
     }
@@ -336,7 +352,8 @@ struct System::Impl {
 
         const bool switch2_program =
             virtual_filesystem != nullptr &&
-            IsSwitch2Program(GetGameFileFromPath(virtual_filesystem, filepath));
+            IsSwitch2Program(GetGameFileFromPath(virtual_filesystem, filepath), params.program_id,
+                             params.program_index);
         Settings::SetCurrentProgramIsSwitch2(switch2_program);
         Settings::SetAstcRecompressionOverride(std::nullopt);
 
@@ -582,7 +599,7 @@ struct System::Impl {
     std::atomic_bool is_shutting_down{};
     std::atomic_bool is_powered_on{};
     bool is_multicore : 1 = false;
-    bool extended_memory_layout : 1 = false;
+    Settings::MemoryLayout memory_layout{Settings::MemoryLayout::Memory_4Gb};
     bool exit_locked : 1 = false;
     bool exit_requested : 1 = false;
     bool nvdec_active : 1 = false;

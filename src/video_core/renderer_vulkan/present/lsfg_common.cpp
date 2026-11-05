@@ -4,10 +4,6 @@
 // SPDX-FileCopyrightText: Copyright 2025 lsfg-vk
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-
 #include <algorithm>
 #include <cstring>
 
@@ -97,7 +93,7 @@ VkImageMemoryBarrier MakeBarrier(const LsfgImage& image, VkAccessFlags src_acces
 
 LsfgImage::LsfgImage(const Device& device, MemoryAllocator& memory_allocator, VkExtent2D extent_,
                      VkFormat format_)
-    : extent{std::max(1u, extent_.width), std::max(1u, extent_.height)}, format{format_} {
+    : extent{(std::max)(1u, extent_.width), (std::max)(1u, extent_.height)}, format{format_} {
     image = CreateChainImage(memory_allocator, extent, format);
     view = CreateWrappedImageView(device, image, format);
 }

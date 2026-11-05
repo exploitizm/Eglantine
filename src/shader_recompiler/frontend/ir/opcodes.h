@@ -26,7 +26,7 @@ namespace Detail {
 struct OpcodeMeta {
     std::string_view name;
     Type type;
-    std::array<Type, 8> arg_types;
+    std::array<Type, 5> arg_types;
 };
 
 // using enum Type;
@@ -57,12 +57,12 @@ static constexpr Type F64x2{Type::F64x2};
 static constexpr Type F64x3{Type::F64x3};
 static constexpr Type F64x4{Type::F64x4};
 
-extern OpcodeMeta META_TABLE[535];
+extern OpcodeMeta META_TABLE[540];
 constexpr size_t CalculateNumArgsOf(Opcode op) noexcept {
     const auto& arg_types = META_TABLE[size_t(op)].arg_types;
     return size_t(std::distance(arg_types.begin(), std::ranges::find(arg_types, Type::Void)));
 }
-extern u8 NUM_ARGS[535];
+extern u8 NUM_ARGS[540];
 } // namespace Detail
 
 /// Get return type of an opcode

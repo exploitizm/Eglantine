@@ -7,11 +7,13 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <optional>
 #include <span>
 #include <vector>
 #include <boost/container/small_vector.hpp>
+#include <deque>
 #include <queue>
 
 #include "common/bit_field.h"
@@ -117,22 +119,15 @@ struct CommandList final {
     boost::container::small_vector<CommandHeader, 512> prefetch_command_list;
     /// EDEN_NX2_PB_CHECK: hash of each entry's words when it was submitted.
     std::vector<u64> submit_hashes;
-    u64 capture_submit_id{};
-    u64 capture_enqueue_id{};
-    const char* capture_origin{"untracked"};
     /// The entries' words when they were submitted (NX2), each entry's at submitted_offsets[i]:
     /// executed instead of the memory, which the game may already be refilling for a later frame.
     std::vector<CommandHeader> submitted_words;
     std::vector<u32> submitted_offsets;
+    /// DmaPusher::suspensions when the words were copied. A list copied during a suspension, or
+    /// that waited behind one, reads memory instead: games write the commands it runs before they
+    /// release the acquire.
+    u64 snapshot_suspensions = 0;
 };
-
-namespace GpfifoCapture {
-bool Enabled() noexcept;
-u64 BeginSubmission(s32 fd, u32 ioctl, u32 variant, u64 session,
-                    std::span<const u8> input, std::size_t inline_size) noexcept;
-void RecordEnqueue(u64 submit_id, s32 channel, const char* origin, CommandList& entries) noexcept;
-void Flush(const char* reason) noexcept;
-}
 
 /// FNV-1a over pushbuffer words (EDEN_NX2_PB_CHECK).
 inline u64 HashPushbufferWords(std::span<const u32> words) {
@@ -150,11 +145,21 @@ inline u64 HashPushbufferWords(std::span<const u32> words) {
 /// details on this implementation.
 class DmaPusher final {
 public:
+    /// Counts suspensions on a semaphore acquire and the resumes after them, so it is odd while
+    /// the channel is suspended (see CommandList::snapshot_suspensions).
+    std::atomic<u64> suspensions{0};
+
     explicit DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Control::ChannelState& channel_state_);
     ~DmaPusher();
 
     void Push(CommandList&& entries) {
-        dma_pushbuffer.push(std::move(entries));
+        // Copied during a suspension, or behind one: copy again now, unless still suspended.
+        const u64 now = suspensions.load(std::memory_order_acquire);
+        if (ResnapshotEnabled() && !entries.submitted_offsets.empty() && (now & 1) == 0 &&
+            entries.snapshot_suspensions != now) {
+            RefreshSnapshot(entries, now);
+        }
+        dma_pushbuffer.push_back(std::move(entries));
     }
 
     void DispatchCalls();
@@ -190,8 +195,6 @@ private:
     [[nodiscard]] bool WantsSegment() const;
     void ReportUnboundSubchannel();
     void WatchArgument(u32 method, u32 argument) const;
-    void RecordCapture(const char* phase, std::span<const CommandHeader> commands = {},
-                       std::size_t word_offset = 0) const noexcept;
 
 public:
     /// Logs the GPFIFO entry being processed (and the one before it), read through the GPU MMU
@@ -199,22 +202,33 @@ public:
     void DumpCurrentEntry(const char* reason);
     void CheckSubmitHash(const CommandListHeader& header, u64 submit_hash);
     void RecordParsedEntry(const CommandListHeader& header, std::span<const CommandHeader> commands);
+    /// Whether the entry lies on device pages the GPU has written (NX2).
+    bool IsGpuWrittenCommands(GPUVAddr address, size_t size);
+    /// Copies the list's words from memory again, as of suspension count `now`.
+    void RefreshSnapshot(CommandList& list, u64 now);
+
+    /// EDEN_NX2_RESNAPSHOT=0 turns snapshot refreshes off.
+    static bool ResnapshotEnabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("EDEN_NX2_RESNAPSHOT");
+            return value == nullptr || value[0] != '0';
+        }();
+        return enabled;
+    }
     /// Reads a command list on pages the GPU wrote into command_headers, from the copies the
     /// buffer cache made after the work that wrote them or from guest memory for pages flushed
     /// since. False when not all are current (or the list isn't GPU-written): the caller drains,
     /// flushes and reads guest memory.
     bool ReadGpuWrittenCommands(GPUVAddr address, u32 count);
-    /// Whether the entry lies on device pages the GPU has written (NX2).
-    bool IsGpuWrittenCommands(GPUVAddr address, size_t size);
     /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
-    void FlushGpuWrittenCommands(GPUVAddr address, size_t size);
+    bool FlushGpuWrittenCommands(GPUVAddr address, size_t size);
 
 private:
 
 public:
     Common::ScratchBuffer<CommandHeader> command_headers; ///< Buffer for list of commands fetched at once
 
-    std::queue<CommandList> dma_pushbuffer; ///< Queue of command lists to be processed
+    std::deque<CommandList> dma_pushbuffer; ///< Queue of command lists to be processed
     std::size_t dma_pushbuffer_subindex{};  ///< Index within a command list within the pushbuffer
 
     struct DmaState {
@@ -270,7 +284,7 @@ public:
     const bool ib_enable : 1 = true; ///< IB mode enabled
     bool dma_increment_once : 1 = false;
     bool signal_sync : 1 = false;
-    bool synced = false;
+    bool synced : 1 = false;
 };
 
 } // namespace Tegra

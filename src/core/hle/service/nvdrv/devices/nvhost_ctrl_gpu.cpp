@@ -113,12 +113,22 @@ NvResult nvhost_ctrl_gpu::Ioctl3(DeviceFD fd, Ioctl command, std::span<const u8>
         case 0x6:
             return WrapFixedInlOut(this, &nvhost_ctrl_gpu::GetTPCMasks3, input, output,
                                    inline_output);
-        case 0x13:
-            LOG_DEBUG(Service_NVDRV, "(STUBBED) called.");
-
-            // TODO (jarrodnorwell)
-
-            return NvResult::NotImplemented;
+        case 0x13: {
+            // NVGPU_GPU_IOCTL_VSMS_MAPPING: an 8-byte argument struct plus a buffer of
+            // {gpc_index, tpc_index} byte pairs, one per virtual SM. The SDK treats a pair left at
+            // its 0xc0c0 sentinel as failure, so fill every pair: one GPC, two SMs per TPC.
+            if (command.raw != 0xc0084713 || input.size() != 8 || output.size() != 8 ||
+                inline_output.size() < 2) {
+                return NvResult::BadParameter;
+            }
+            std::memcpy(output.data(), input.data(), output.size());
+            for (size_t i = 0; i + 1 < inline_output.size(); i += 2) {
+                inline_output[i] = 0;                         // gpc_index
+                inline_output[i + 1] = static_cast<u8>(i / 4); // tpc_index
+            }
+            LOG_DEBUG(Service_NVDRV, "VSMS mapping for {} SMs", inline_output.size() / 2);
+            return NvResult::Success;
+        }
         default:
             break;
         }
@@ -208,7 +218,6 @@ void ApplyNx2Characteristics(GC& gc) {
     // Without the flag NvRm fails that call and the texture stays at GPU address 0 (title 1's
     // movie and the passes rendered into compressible pools never showed).
     gc.flags |= 1ULL << 34;
-    gc.flags |= (1ULL << 40) | (1ULL << 41) | (1ULL << 42) | (1ULL << 43);
     // NVGPU_GPU_FLAGS_SUPPORT_REMAP: without it NvRm fails every remap (nvnMemoryPoolMapVirtual)
     // before asking the server, so title 1 never maps or unmaps its sparse texture tiles (nx2:gpu
     // 216) and streams its terrain into unmapped sparse memory. EDEN_NX2_SPARSE_REMAP=0 leaves it out.
@@ -219,6 +228,11 @@ void ApplyNx2Characteristics(GC& gc) {
     if (remap) {
         gc.flags |= 1ULL << 35;
     }
+    // Engine support bits 40-44 (2D, 3D, compute, inline-to-memory, ZBC). The SDK filters its class
+    // enumeration by them, and NvRm's newer device path lists a class family in the device info
+    // only when its bit is set; without them Fire Emblem: Fortune's Weave aborts at boot and a
+    // device opened that way has no compute class (Fire Emblem's CUDA driver reports no device).
+    gc.flags |= 0x1FULL << 40;
 
     // The Switch 2 layout keeps nine s16 interface versions at 0x70..0x80 (like nvgpu's
     // *_ioctl_nr_last); its NvRm requires e.g. [0x78] >= 6 and enables features above 0xa, 0x1f
@@ -332,7 +346,6 @@ NvResult nvhost_ctrl_gpu::GetCharacteristics3(
         nx2_caller = true;
         g_nx2_driver = true;
         Tegra::g_nx2_ampere = true;
-        Tegra::g_nx2_program_id = system.GetApplicationProcessProgramID();
         ApplyNx2Characteristics(params.gc);
         params.gpu_characteristics_buf_size = Nx2CharacteristicsSize;
         LOG_WARNING(Service_NVDRV, "Switch 2 caller, reporting Ampere chip 0x17E");

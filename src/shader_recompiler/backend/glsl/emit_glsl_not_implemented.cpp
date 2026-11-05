@@ -97,9 +97,24 @@ void EmitGetInBoundsFromOp(EmitContext& ctx) {
     NotImplemented();
 }
 
-void EmitTensorMulAdd(EmitContext& ctx, IR::Inst& inst, std::string_view a0, std::string_view a1,
-                      std::string_view a2, std::string_view a3, std::string_view b0,
-                      std::string_view b1, std::string_view c0, std::string_view c1) {
+void EmitIsbeRead(EmitContext& ctx) {
+    NotImplemented();
+}
+
+void EmitIsbeWriteAttribute(EmitContext& ctx) {
+    NotImplemented();
+}
+
+void EmitIsbeWriteMapU8(EmitContext& ctx) {
+    NotImplemented();
+}
+
+void EmitIsbeWriteMapU32(EmitContext& ctx) {
+    NotImplemented();
+}
+
+void EmitTensorMulAdd(EmitContext& ctx, IR::Inst& inst, const IR::Value& a,
+                      const IR::Value& b, const IR::Value& c) {
     NotImplemented();
 }
 

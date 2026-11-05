@@ -5,89 +5,51 @@
 # SPDX-FileCopyrightText: 2018 yuzu Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 -->
-<!-- lang: en-GB -->
-
-<h1 align="center">
-  <br>
-  <a href="https://git.eden-emu.dev/eden-emu/eden"><img src="https://github.com/user-attachments/assets/35031845-4bfa-4916-8bf5-bc3bce67d5e2" alt="Eglantine" width="200"></a>
-  <br>
-  <b>Eglantine</b>
-  <br>
-</h1>
-
-<h4 align="center"><b>Eglantine</b> is a free and opensource (FOSS) Switch 2 emulator, derived from Eden, Yuzu and Sudachi - started by developer Camille LaVey.
-It's written in C++ with portability in mind, with builds for Windows, Linux and macOS
-</h4>
 
 <p align="center">
-    </a>
-    <a href="https://discord.gg/jCCZ58VExk">
-        <img src="https://img.shields.io/discord/1367654015269339267?color=5865F2&label=Eglantine&logo=discord&logoColor=white"
-            alt="Discord">
-    </a>
-  
+  <img src="dist/branding/lichii_icon_with_logo.png" alt="Lichii" width="600">
 </p>
 
-> [!NOTE]
-> **This is an unofficial fork of Eglantine maintained by Zortos.** It carries fixes that are not in the upstream [Eglantine](https://github.com/Djihads80/Eglantine) repository. Please report problems with this build here, not to the upstream developers.
+# Lichii
 
-## About this fork
+Lichii is an experimental, open-source Nintendo Switch and Switch 2 emulator written in C++. It builds on Eglantine, Eden, yuzu and Sudachi, preserving their contributions while developing this fork's game compatibility and renderer fixes.
 
-My priority is getting every game to boot and run. Performance comes second.
+This is an independent fork, not an official release of those upstream projects. Lichii is not affiliated with Nintendo.
 
-Changes in this fork compared to upstream:
+## Downloads and setup
 
-- **Memory leak fixed.** Memory use stays around 4-5 GB instead of climbing past 20 GB.
-- **More games boot**, including Welcome Tour.
-- **Games run at normal speed.** The slowdown is gone.
-- **Big performance boost.** Most games run at 60 FPS.
-- **Texture fixes** in several games.
-- **Color fix** for the HDR setting in docked mode.
-- **Graphics fixes.** Video codec fixes are coming soon.
+Published builds belong on this fork's [releases page](https://github.com/zortos293/Eglantine/releases). The repository still uses its historical Eglantine name; the desktop application is now Lichii.
 
-<p align="center">
-  <a href="#about-this-fork">About this fork</a> |
-  <a href="#compatibility">Compatibility</a> |
-  <a href="#development">Development</a> |
-  <a href="#building">Building</a> |
-  <a href="#download">Download</a> |
-  <a href="#support">Support</a> |
-  <a href="#license">License</a>
-</p>
+On Windows, extract the entire build archive and run **lichii.exe**. Only use games and system files you have legally obtained. Games, keys and firmware are not included.
 
-## Compatibility
+### Existing saves and settings
 
-The emulator is capable of running Mario Kart World at decent/full speed depending on specs and configurations, and Splatoon Raiders at variable performances
+The rebrand intentionally retains the existing Eden/Eglantine data directories and configuration keys. It does not move or delete saves, settings or shader caches. Back up your saves before testing experimental builds.
 
-A list of supported games will be available in future. Please be patient.
+## Compatibility and issue reports
 
-## Development
-For development discussions, please join us on [Discord](https://discord.gg/jCCZ58VExk)
+Compatibility and performance vary by game, hardware and driver. Rendering errors, stutters and crashes remain possible. Passing automated tests does not establish that a game renders correctly, and this project makes no universal frame-rate guarantee.
 
-If you would like to contribute, we are open to new developers and pull requests. Please ensure that your work is of a high standard and properly documented. You can also contact any of the developers on Discord or Stoat to learn more about the current state of the emulator.
+When [reporting an issue](https://github.com/zortos293/Eglantine/issues), include:
 
-## Documentation
+- The exact build, game version, CPU, GPU and driver version.
+- Relevant settings and steps to reproduce the problem.
+- A screenshot and the log from the affected session, after checking it for personal information.
 
-We have a user manual! See our [User Handbook](./docs/user/README.md).
+Do not upload game files, keys, firmware or private account information.
 
-## Building
+## Building and contributing
 
-See the [General Build Guide](docs/Build.md)
+See the [build guide](docs/Build.md), [user documentation](docs/user/README.md) and [coding guidelines](docs/Coding.md). Some inherited documentation and internal build target names still use upstream names. The GUI build target remains `yuzu`; its output is `lichii.exe` on Windows and `lichii` on other desktop platforms.
 
-For information on provided development tooling, see the [Tools directory](./tools)
+Keep changes focused and distinguish code-level checks from actual gameplay testing.
 
-## Download
+## Artwork
+Art created by YOB (yobslab)
+The supplied Lichii logo, icon and library artwork are in [dist/branding](dist/branding). Windows, Linux and macOS icon resources are generated from that artwork by [Generate-LichiiIcons.ps1](tools/Generate-LichiiIcons.ps1).
 
-Builds of this fork are on the [releases page](https://github.com/zortos293/eglantine/releases).
+## Credits and license
 
-Official upstream releases are [here](https://github.com/Djihads80/Eglantine/releases).
+Lichii inherits the work of the Eglantine, Eden, yuzu and Sudachi projects and their contributors, including Eglantine's original developer Camille LaVey. Original copyright notices and third-party licenses are retained.
 
-## Support
-
-We currently do not take in any donations for the time being
-
-If you would prefer to support us in a different way, please join our [Discord](https://discord.gg/jCCZ58VExk)
-
-## License
-
-Eglantine is licensed under the GPLv3 (or any later version). Refer to the [LICENSE.txt](https://github.com/Djihads80/Eglantine/blob/nx2/LICENSE.txt) file.
+See [LICENSE.txt](LICENSE.txt) and the source files for applicable license terms.

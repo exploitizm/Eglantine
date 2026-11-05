@@ -3,7 +3,6 @@
 
 #include "audio_core/renderer/memory/pool_mapper.h"
 #include "audio_core/renderer/sink/circular_buffer_sink_info.h"
-#include "audio_core/renderer/upsampler/upsampler_manager.h"
 
 namespace AudioCore::Renderer {
 
@@ -17,9 +16,9 @@ CircularBufferSinkInfo::CircularBufferSinkInfo() {
 }
 
 void CircularBufferSinkInfo::CleanUp() {
-    // The state holds a CircularBufferState, not a DeviceState: there is no upsampler here, and
-    // reading it as one turned current_pos into a pointer (Mario Tennis Fever crashed on it).
-    state.fill(0);
+    // Only device sinks own an upsampler. This sink's state is a CircularBufferState, whose
+    // first words are buffer positions: reading them as DeviceState::upsampler_info freed a
+    // garbage pointer when a game changed or removed its circular buffer sink.
     parameter.fill(0);
     type = Type::Invalid;
 }

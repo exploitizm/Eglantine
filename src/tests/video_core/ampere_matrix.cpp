@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
-// The software HMMA expansion (lower_to_maxwell.h case 0x23c) against RTX 4090 reference
-// fragments. Test, half conversion oracle and fragments from Lichii (zortos293/Lichii,
-// src/tests/video_core/ampere_matrix.cpp), which adapted them from Duck912/eden-fefw
+// Half conversion oracle and RTX 4090 reference fragments adapted from Duck912/eden-fefw
 // native_shader.cpp at 8c6f0522b6ee07caa47ab4363823d3dc00aa8ac1.
 #include <array>
 #include <bit>
@@ -109,6 +107,45 @@ void RunWarp(std::span<const u64> code, std::array<std::array<u32, 256>, 32>& re
     }
 }
 } // namespace
+
+TEST_CASE("Native matrix loads preserve uniform offsets and aliased row addresses",
+          "[video_core][ampere][fire_emblem]") {
+    const u32 mode = GENERATE(0U, 1U, 2U);
+    const u32 dest = GENERATE(8U, 96U);
+    const bool uniform = GENERATE(false, true);
+    const bool transpose = GENERATE(false, true);
+    const Native load{{0x0800783bU | (dest << 16), (32U << 8) | (uniform ? 5U : 0U),
+                       (mode << 8) | (transpose ? 0x4000U : 0U) | (uniform ? 0x08000000U : 0U), 0}};
+    const auto lowered = Shader::Ampere::LowerToMaxwell(std::array{load, Exit});
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    std::array<u16, 1024> shared;
+    for (u32 i = 0; i < shared.size(); ++i)
+        shared[i] = u16(i * 71 + 11);
+    std::array<std::array<u32, 256>, 32> regs{};
+    for (u32 lane = 0; lane < 32; ++lane) {
+        for (u32 r = 0; r < 255; ++r)
+            regs[lane][r] = r * 101 + lane;
+        regs[lane][8] = 128 + lane * 16;
+        regs[lane][221] = 64; // UR5
+    }
+    const auto before = regs;
+    RunWarp(lowered.instructions, regs, shared);
+    for (u32 lane = 0; lane < 32; ++lane) {
+        for (u32 matrix = 0; matrix < (1U << mode); ++matrix) {
+            const u32 row = transpose ? 2 * (lane % 4) : lane / 4;
+            const u32 column = transpose ? lane / 4 : 2 * (lane % 4);
+            const u32 address =
+                (128 + (matrix * 8 + row) * 16 + 32 + (uniform ? 64 : 0)) / 2 + column;
+            const u32 expected =
+                shared[address] | (u32{shared[address + (transpose ? 8 : 1)]} << 16);
+            REQUIRE(regs[lane][dest + matrix] == expected);
+        }
+        for (u32 r = 0; r < 244; ++r)
+            if (r < dest || r >= dest + (1U << mode))
+                REQUIRE(regs[lane][r] == before[lane][r]);
+    }
+}
 
 TEST_CASE("Native half matrix rounding matches measured hardware fragments",
           "[video_core][ampere][fire_emblem]") {

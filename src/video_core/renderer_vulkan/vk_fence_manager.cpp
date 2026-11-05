@@ -3,6 +3,8 @@
 
 #include <memory>
 
+#include "common/logging.h"
+#include "video_core/gpu_split.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_fence_manager.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
@@ -17,14 +19,13 @@ InnerFence::InnerFence(Scheduler& scheduler_, bool is_stubbed_)
 
 InnerFence::~InnerFence() = default;
 
-void InnerFence::Queue(VideoCore::RasterizerInterface& rasterizer) {
+void InnerFence::Queue() {
     if (is_stubbed) {
         return;
     }
     // Get the current tick so we can wait for it
     wait_tick = scheduler.CurrentTick();
-    rasterizer.FlushCommands();
-    if (scheduler.CurrentTick() == wait_tick) {
+    if (!scheduler.DeferFlush()) {
         scheduler.Flush();
     }
 }
@@ -38,6 +39,14 @@ bool InnerFence::IsSignaled() const {
 
 void InnerFence::Wait() {
     if (is_stubbed) {
+        return;
+    }
+    // A deferred fence flush (Scheduler::DeferFlush) may not be submitted yet. Only the
+    // split's back may submit; other threads (the fencing thread) ask it to and wait. If the back
+    // has stopped, nothing else uses the scheduler and Wait below submits it.
+    if (!scheduler.IsSubmitted(wait_tick) && VideoCommon::GpuSplit::Get().Active() &&
+        !VideoCommon::GpuSplit::OnBackThread() && scheduler.WaitSubmitted(wait_tick)) {
+        scheduler.GetMasterSemaphore().Wait(wait_tick);
         return;
     }
     scheduler.Wait(wait_tick);
@@ -54,7 +63,7 @@ Fence FenceManager::CreateFence(bool is_stubbed) {
 }
 
 void FenceManager::QueueFence(Fence& fence) {
-    fence->Queue(rasterizer);
+    fence->Queue();
 }
 
 bool FenceManager::IsFenceSignaled(Fence& fence) const {

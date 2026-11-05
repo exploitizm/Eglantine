@@ -48,12 +48,6 @@ public:
         : Exception{fmt::format(fmt::runtime(message), std::forward<Args>(args)...)} {}
 };
 
-class TensorRejected : public RuntimeError {
-public:
-    explicit TensorRejected(std::string_view reason)
-        : RuntimeError{"native matrix multiply rejected: {}", reason} {}
-};
-
 class NotImplementedException : public Exception {
 public:
     template <typename... Args>

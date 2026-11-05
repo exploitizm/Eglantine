@@ -1343,64 +1343,6 @@ static void Dump(u64 hash, std::span<const u32> code, bool decompiled = false) {
     macro_file.write(reinterpret_cast<const char*>(code.data()), code.size_bytes());
 }
 
-YUZU_NO_INLINE void MacroEngine::ReadNativeMemory(Engines::Maxwell3D& maxwell3d, u32 method,
-                                                u32 address, u32 value) {
-    constexpr u32 MemAddressA = 0x154, MemAddressB = 0x155, DataRamAddress = 0x156;
-    constexpr u32 DmaReadFifoed = 0x158;
-    auto& fifo = native_fifo;
-    const GPUVAddr source = (GPUVAddr{maxwell3d.GetRegisterValue(MemAddressA) & 0x1ffffff} << 32) |
-                            maxwell3d.GetRegisterValue(MemAddressB);
-    auto& memory = maxwell3d.GetMemoryManager();
-    const u32 ram = maxwell3d.GetRegisterValue(DataRamAddress);
-    // The words may have just been written by the GPU (e.g. indirect draw arguments
-    // from a culling dispatch) and still be only in host buffers: flush them first,
-    // or the macro draws with an older frame's arguments (objects pop in and out).
-    const size_t read_bytes = size_t{std::min<u32>(value, 0x1000)} * 4;
-    if (VideoCommon::Nx2Profile::Enabled()) {
-        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
-        for (GPUVAddr page = source & ~GPUVAddr{0xfff}; page < source + read_bytes; page += 0x1000) {
-            if (const auto device = memory.GpuToCpuAddress(page)) {
-                VideoCommon::Nx2Profile::DmaReadPages().insert(*device >> 12);
-            }
-        }
-    }
-    // Query reports count too: the driver implements conditional rendering by DMA-reading an
-    // occlusion query's report into a macro (Mario Tennis Fever's characters), and those results
-    // sit in the query cache until flushed (read as 0 samples, the draws are skipped).
-    constexpr auto flush_caches = VideoCommon::CacheType::BufferCache | VideoCommon::CacheType::QueryCache;
-    if (memory.IsMemoryDirty(source, read_bytes, flush_caches)) {
-        memory.FlushRegion(source, read_bytes, flush_caches);
-        static u64 flushes{};
-        if (++flushes % 2000 == 1) {
-            LOG_INFO(HW_GPU, "Native MME DMA read flushed GPU-written memory ({} times)", flushes);
-        }
-    }
-    static u32 dma_logs{};
-    if (dma_logs < 400) {
-        ++dma_logs;
-        std::array<u32, 8> words{};
-        for (u32 i = 0; i < std::min<u32>(value, 8); ++i) words[i] = memory.Read<u32>(source + u64{i} * 4);
-        LOG_INFO(HW_GPU, "Native MME DMA read{} start={:#x} source={:#x} count={} words={:08x}",
-                 address == DmaReadFifoed ? " fifoed" : "", method, source, value, fmt::join(words, ","));
-    }
-    const u32 word_count = std::min<u32>(value, 0x1000);
-    std::array<u32, 0x1000> dma_words;
-    memory.ReadWordsUnsafe(source, dma_words.data(), word_count);
-    for (u32 i = 0; i < word_count; ++i) {
-        const u32 word = dma_words[i];
-        if (address == DmaReadFifoed) {
-            fifo.push_back(word);
-        } else if (ram + i < native_interpreter.active_dram->size()) {
-            if (static const bool mme_dump = std::getenv("EDEN_NX2_MME_DUMP") != nullptr;
-                mme_dump && ram + i == 0x27 && (*native_interpreter.active_dram)[0x27] != word) {
-                LOG_INFO(HW_GPU, "MME data RAM[0x27] {:#x} -> {:#x} by 3D engine {} (DMA from {:#x})",
-                         (*native_interpreter.active_dram)[0x27], word, fmt::ptr(&maxwell3d), source);
-            }
-            (*native_interpreter.active_dram)[ram + i] = word;
-        }
-    }
-}
-
 void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u32 method,
                           std::span<const u32> parameters) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
@@ -1470,10 +1412,57 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                 // Turing MME memory reads (methods 0x550 SET_MME_MEM_ADDRESS_A/B, 0x558 data RAM
                 // address, 0x55c MME_DMA_READ into data RAM, 0x560 MME_DMA_READ_FIFOED into
                 // the load FIFO, which the macro then reads after a load barrier).
+                constexpr u32 MemAddressA = 0x154, MemAddressB = 0x155, DataRamAddress = 0x156;
                 constexpr u32 DmaRead = 0x157, DmaReadFifoed = 0x158;
                 if (address == DmaRead || address == DmaReadFifoed) {
                     read_memory = true;
-                    ReadNativeMemory(maxwell3d, method, address, value);
+                    const GPUVAddr source = (GPUVAddr{maxwell3d.GetRegisterValue(MemAddressA) & 0x1ffffff} << 32) |
+                                            maxwell3d.GetRegisterValue(MemAddressB);
+                    auto& memory = maxwell3d.GetMemoryManager();
+                    const u32 ram = maxwell3d.GetRegisterValue(DataRamAddress);
+                    // The words may have just been written by the GPU (e.g. indirect draw arguments
+                    // from a culling dispatch) and still be only in host buffers: flush them first,
+                    // or the macro draws with an older frame's arguments (objects pop in and out).
+                    const size_t read_bytes = size_t{std::min<u32>(value, 0x1000)} * 4;
+                    if (VideoCommon::Nx2Profile::Enabled()) {
+                        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
+                        for (GPUVAddr page = source & ~GPUVAddr{0xfff}; page < source + read_bytes; page += 0x1000) {
+                            if (const auto device = memory.GpuToCpuAddress(page)) {
+                                VideoCommon::Nx2Profile::DmaReadPages().insert(*device >> 12);
+                            }
+                        }
+                    }
+                    if (memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+                        memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+                        static u64 flushes{};
+                        if (++flushes % 2000 == 1) {
+                            LOG_INFO(HW_GPU, "Native MME DMA read flushed GPU-written memory ({} times)", flushes);
+                        }
+                    }
+                    static u32 dma_logs{};
+                    if (dma_logs < 400) {
+                        ++dma_logs;
+                        std::array<u32, 8> words{};
+                        for (u32 i = 0; i < std::min<u32>(value, 8); ++i) words[i] = memory.Read<u32>(source + u64{i} * 4);
+                        LOG_INFO(HW_GPU, "Native MME DMA read{} start={:#x} source={:#x} count={} words={:08x}",
+                                 address == DmaReadFifoed ? " fifoed" : "", method, source, value, fmt::join(words, ","));
+                    }
+                    const u32 word_count = std::min<u32>(value, 0x1000);
+                    std::array<u32, 0x1000> dma_words;
+                    memory.ReadWordsUnsafe(source, dma_words.data(), word_count);
+                    for (u32 i = 0; i < word_count; ++i) {
+                        const u32 word = dma_words[i];
+                        if (address == DmaReadFifoed) {
+                            fifo.push_back(word);
+                        } else if (ram + i < native_interpreter.active_dram->size()) {
+                            if (static const bool mme_dump = std::getenv("EDEN_NX2_MME_DUMP") != nullptr;
+                                mme_dump && ram + i == 0x27 && (*native_interpreter.active_dram)[0x27] != word) {
+                                LOG_INFO(HW_GPU, "MME data RAM[0x27] {:#x} -> {:#x} by 3D engine {} (DMA from {:#x})",
+                                         (*native_interpreter.active_dram)[0x27], word, fmt::ptr(&maxwell3d), source);
+                            }
+                            (*native_interpreter.active_dram)[ram + i] = word;
+                        }
+                    }
                 }
                 return true;
             };

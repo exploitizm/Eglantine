@@ -5,6 +5,7 @@
 
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <nlohmann/json.hpp>
 #include "common/common_types.h"
@@ -14,49 +15,41 @@ namespace Common::Net {
 struct Asset {
     std::string name;
     std::string url;
+    std::string path;
+    std::string filename;
 };
 
 struct Release {
     std::string title;
     std::string body;
     std::string tag;
+    std::string base_download_url;
     std::string html_url;
-    // Commit the release was built from.
-    std::string commit;
+    std::string host;
 
-    std::vector<Asset> assets;
+    std::vector<std::string> assets;
 
     u64 id;
     u64 published;
     bool prerelease;
 
-    // The release file built for the same platform and variant as this build, if it has one.
-    std::optional<Asset> GetPlatformAsset() const;
+    // Get the relevant list of assets for the current platform.
+    std::vector<Asset> GetPlatformAssets() const;
+    std::vector<Asset> GetPlatformAssets(std::string_view platform) const;
 
-    static std::optional<Release> FromJson(const nlohmann::json& json);
-    static std::vector<Release> ListFromJson(const nlohmann::json& json);
-    static std::vector<Release> ListFromJson(const std::string_view& json);
-};
-
-struct Commit {
-    std::string sha;
-    std::string summary;
-    std::string author;
+    static std::optional<Release> FromJson(const nlohmann::json& json, const std::string &host, const std::string& repo);
+    static std::optional<Release> FromJson(const std::string_view& json, const std::string &host, const std::string& repo);
+    static std::vector<Release> ListFromJson(const nlohmann::json &json, const std::string &host, const std::string &repo);
+    static std::vector<Release> ListFromJson(const std::string_view &json, const std::string &host, const std::string &repo);
 };
 
 // Make a request via httplib, and return the response body if applicable.
-std::optional<std::string> MakeRequest(const std::string& url, const std::string& path);
+std::optional<std::string> MakeRequest(const std::string &url, const std::string &path);
 
-// Get the newest releases of the update repository, or nullopt if GitHub could not be reached.
-std::optional<std::vector<Release>> GetReleases();
+// Get the latest releases, including prereleases.
+std::vector<Release> GetReleases();
 
-// Get the newest releases of the update repository as GitHub's JSON.
+// Get the latest releases as text.
 std::optional<std::string> GetReleasesBody();
-
-// Get up to `limit` commits of the update repository's history at `head`, newest first.
-std::optional<std::vector<Commit>> GetCommits(const std::string& head, u32 limit);
-
-// The update repository's web page comparing two commits.
-std::string GetCompareUrl(const std::string& base, const std::string& head);
 
 }

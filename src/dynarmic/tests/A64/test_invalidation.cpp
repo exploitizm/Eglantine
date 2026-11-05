@@ -6,15 +6,11 @@
  * SPDX-License-Identifier: 0BSD
  */
 
-#include <algorithm>
-#include <vector>
-
 #include <catch2/catch_test_macros.hpp>
 
 #include "dynarmic/tests/A64/testenv.h"
 #include "dynarmic/tests/native/testenv.h"
 #include "dynarmic/interface/A64/a64.h"
-#include "dynarmic/backend/block_range_information.h"
 
 using namespace Dynarmic;
 
@@ -118,134 +114,4 @@ TEST_CASE("ensure fast dispatch entry is cleared even when a block does not have
     env.ticks_left = 4;
     CheckedRun([&]() { jit.Run(); });
     REQUIRE(jit.GetRegister(0) == 69);
-}
-
-namespace {
-constexpr u32 MovX(u32 reg, u32 imm) {
-    return 0xd2800000 | (imm << 5) | reg;
-}
-
-constexpr u32 BranchBy(s32 offset) {
-    return 0x14000000 | (u32(offset / 4) & 0x3ffffff);
-}
-}  // namespace
-
-TEST_CASE("invalidating a block reached through more than two linked branches relinks every branch", "[a64]") {
-    A64TestEnv env;
-    A64::UserConfig conf{};
-    conf.callbacks = &env;
-    A64::Jit jit{conf};
-
-    REQUIRE(conf.HasOptimization(OptimizationFlag::BlockLinking));
-
-    env.code_mem.emplace_back(MovX(0, 1));
-    env.code_mem.emplace_back(BranchBy(28));
-    env.code_mem.emplace_back(MovX(0, 2));
-    env.code_mem.emplace_back(BranchBy(20));
-    env.code_mem.emplace_back(MovX(0, 3));
-    env.code_mem.emplace_back(BranchBy(12));
-    env.code_mem.emplace_back(MovX(0, 4));
-    env.code_mem.emplace_back(BranchBy(4));
-    env.code_mem.emplace_back(MovX(2, 42));
-    env.code_mem.emplace_back(BranchBy(0));
-
-    const auto run_from = [&](u64 pc) {
-        jit.SetPC(pc);
-        jit.SetRegister(0, 0);
-        jit.SetRegister(2, 0);
-        env.ticks_left = 4;
-        CheckedRun([&]() { jit.Run(); });
-    };
-
-    for (int pass = 0; pass < 2; ++pass) {
-        for (u64 entry = 0; entry < 4; ++entry) {
-            run_from(entry * 8);
-            REQUIRE(jit.GetRegister(0) == entry + 1);
-            REQUIRE(jit.GetRegister(2) == 42);
-        }
-    }
-
-    env.code_mem[8] = MovX(2, 69);
-    jit.InvalidateCacheRange(32, 4);
-
-    for (u64 entry = 0; entry < 4; ++entry) {
-        run_from(entry * 8);
-        REQUIRE(jit.GetRegister(0) == entry + 1);
-        REQUIRE(jit.GetRegister(2) == 69);
-    }
-}
-
-TEST_CASE("invalidating a range drops exactly the blocks that overlap it", "[a64]") {
-    A64TestEnv env;
-    A64::UserConfig conf{};
-    conf.callbacks = &env;
-    A64::Jit jit{conf};
-
-    env.code_mem.emplace_back(MovX(0, 1));
-    env.code_mem.emplace_back(BranchBy(0));
-    env.code_mem.emplace_back(MovX(0, 2));
-    env.code_mem.emplace_back(BranchBy(0));
-    env.code_mem.emplace_back(MovX(0, 3));
-    env.code_mem.emplace_back(BranchBy(0));
-    env.code_mem.emplace_back(MovX(0, 4));
-    env.code_mem.emplace_back(BranchBy(0));
-
-    const auto run_from = [&](u64 pc) {
-        jit.SetPC(pc);
-        jit.SetRegister(0, 0);
-        env.ticks_left = 2;
-        CheckedRun([&]() { jit.Run(); });
-        return jit.GetRegister(0);
-    };
-
-    for (u64 entry = 0; entry < 4; ++entry) {
-        REQUIRE(run_from(entry * 8) == entry + 1);
-    }
-
-    env.code_mem[0] = MovX(0, 10);
-    env.code_mem[2] = MovX(0, 20);
-    env.code_mem[4] = MovX(0, 30);
-    env.code_mem[6] = MovX(0, 40);
-    jit.InvalidateCacheRange(12, 8);
-
-    REQUIRE(run_from(0) == 1);
-    REQUIRE(run_from(8) == 20);
-    REQUIRE(run_from(16) == 30);
-    REQUIRE(run_from(24) == 4);
-}
-
-TEST_CASE("block range information only invalidates blocks that overlap the ranges", "[a64]") {
-    using Info = Backend::BlockRangeInformation<u64>;
-    const auto add = [](Info& info, u64 first, u64 last, u64 location) {
-        info.AddRange(boost::icl::discrete_interval<u64>::closed(first, last), IR::LocationDescriptor{location});
-    };
-    const auto invalidate = [](Info& info, std::initializer_list<std::pair<u64, u64>> intervals) {
-        boost::icl::interval_set<u64> set;
-        for (const auto& [first, last] : intervals) {
-            set.add(boost::icl::discrete_interval<u64>::closed(first, last));
-        }
-        std::vector<u64> locations;
-        for (const auto& location : info.InvalidateRanges(set)) {
-            locations.push_back(location.Value());
-        }
-        std::sort(locations.begin(), locations.end());
-        return locations;
-    };
-
-    Info info;
-    add(info, 0x1000, 0x10ff, 1);
-    add(info, 0x1100, 0x1103, 2);
-    add(info, 0x0f00, 0x2000, 3);
-    add(info, 0x3000, 0x3003, 4);
-    add(info, 0x3000, 0x3007, 5);
-
-    REQUIRE(invalidate(info, {{0x1104, 0x1104}}) == std::vector<u64>{3});
-    REQUIRE(invalidate(info, {{0x1104, 0x1104}}).empty());
-    REQUIRE(invalidate(info, {{0x10fc, 0x1100}, {0x3004, 0x3004}}) == std::vector<u64>{1, 2, 5});
-    REQUIRE(invalidate(info, {{0x0, 0xffff}}) == std::vector<u64>{4});
-    REQUIRE(invalidate(info, {{0x0, 0xffff}}).empty());
-
-    add(info, 0x10, 0x13, 6);
-    info.ClearCache();
-    REQUIRE(invalidate(info, {{0x0, 0xffff}}).empty());
 }

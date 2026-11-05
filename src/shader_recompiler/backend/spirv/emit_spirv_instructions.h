@@ -15,6 +15,7 @@ enum class Attribute : u64;
 enum class Patch : u64;
 class Inst;
 class Value;
+struct Program;
 } // namespace Shader::IR
 
 namespace Shader::Backend::SPIRV {
@@ -61,6 +62,12 @@ Id EmitGetAttributeIndexed(EmitContext& ctx, Id offset, Id vertex);
 void EmitSetAttributeIndexed(EmitContext& ctx, Id offset, Id value, Id vertex);
 Id EmitGetPatch(EmitContext& ctx, IR::Patch patch);
 void EmitSetPatch(EmitContext& ctx, IR::Patch patch, Id value);
+Id EmitIsbeRead(EmitContext& ctx, Id address);
+void EmitIsbeWriteAttribute(EmitContext& ctx, Id address, Id value);
+void EmitIsbeWriteMapU8(EmitContext& ctx, Id address, Id value);
+void EmitIsbeWriteMapU32(EmitContext& ctx, const IR::Value& address, Id value);
+void EmitMeshPrologue(EmitContext& ctx);
+void EmitMeshEpilogue(EmitContext& ctx);
 void EmitSetFragColor(EmitContext& ctx, u32 index, u32 component, Id value);
 void EmitSetSampleMask(EmitContext& ctx, Id value);
 void EmitSetFragDepth(EmitContext& ctx, Id value);
@@ -223,6 +230,7 @@ Id EmitFPNeg64(EmitContext& ctx, Id value);
 Id EmitFPSin(EmitContext& ctx, Id value);
 Id EmitFPCos(EmitContext& ctx, Id value);
 Id EmitFPExp2(EmitContext& ctx, Id value);
+Id EmitFPTanh(EmitContext& ctx, Id value);
 Id EmitFPLog2(EmitContext& ctx, Id value);
 Id EmitFPRecip32(EmitContext& ctx, Id value);
 Id EmitFPRecip64(EmitContext& ctx, Id value);
@@ -415,11 +423,11 @@ Id EmitStorageAtomicMaxF16x2(EmitContext& ctx, const IR::Value& binding, const I
                              Id value);
 Id EmitStorageAtomicMaxF32x2(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                              Id value);
-Id EmitGlobalAtomicIAdd32(EmitContext& ctx);
+Id EmitGlobalAtomicIAdd32(EmitContext& ctx, const IR::Value& address, Id value);
 Id EmitGlobalAtomicSMin32(EmitContext& ctx);
 Id EmitGlobalAtomicUMin32(EmitContext& ctx);
 Id EmitGlobalAtomicSMax32(EmitContext& ctx);
-Id EmitGlobalAtomicUMax32(EmitContext& ctx);
+Id EmitGlobalAtomicUMax32(EmitContext& ctx, const IR::Value& address, Id value);
 Id EmitGlobalAtomicInc32(EmitContext& ctx);
 Id EmitGlobalAtomicDec32(EmitContext& ctx);
 Id EmitGlobalAtomicAnd32(EmitContext& ctx);
@@ -630,8 +638,7 @@ Id EmitDPdyFine(EmitContext& ctx, Id op_a);
 Id EmitDPdxCoarse(EmitContext& ctx, Id op_a);
 Id EmitDPdyCoarse(EmitContext& ctx, Id op_a);
 
-// Cooperative matrix (tensor core) operations
-Id EmitTensorMulAdd(EmitContext& ctx, IR::Inst* inst, Id a0, Id a1, Id a2, Id a3, Id b0, Id b1,
-                    Id c0, Id c1);
+Id EmitTensorMulAdd(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c);
+void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program);
 
 } // namespace Shader::Backend::SPIRV

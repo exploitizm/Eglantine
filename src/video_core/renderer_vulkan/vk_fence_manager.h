@@ -28,7 +28,7 @@ public:
     explicit InnerFence(Scheduler& scheduler_, bool is_stubbed_);
     ~InnerFence();
 
-    void Queue(VideoCore::RasterizerInterface& rasterizer);
+    void Queue();
 
     bool IsSignaled() const;
 

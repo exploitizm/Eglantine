@@ -1,14 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#include <QDesktopServices>
-#include <QDir>
-#include <QFileInfo>
+#include <QRadioButton>
 #include <QSaveFile>
 #include <QStandardPaths>
-#include <QUrl>
+#include <qdesktopservices.h>
 #include "common/logging.h"
-#include "common/scm_rev.h"
 #include "qt_common/abstract/frontend.h"
 #include "qt_common/abstract/progress.h"
 #include "ui_update_dialog.h"
@@ -20,52 +17,56 @@
 #include <openssl/cert.h>
 #endif
 
+#include <QDesktopServices>
+
 #undef GetSaveFileName
 
-UpdateDialog::UpdateDialog(const UpdateChecker::Update& update, QWidget* parent)
+UpdateDialog::UpdateDialog(const Common::Net::Release& release, QWidget* parent)
     : QDialog(parent), ui(new Ui::UpdateDialog) {
     ui->setupUi(this);
 
-    const auto& release = update.release;
-    ui->version->setText(tr("%1 is available. You are running %2.")
-                             .arg(QString::fromStdString(release.title),
-                                  QString::fromUtf8(Common::g_build_version)));
+    ui->version->setText(
+        tr("%1 is available for download.").arg(QString::fromStdString(release.title)));
     ui->url->setText(
         tr("<a href=\"%1\">View on GitHub</a>").arg(QString::fromStdString(release.html_url)));
 
-    const auto count = static_cast<int>(update.changes.size());
-    QString changelog = QStringLiteral("### %1\n\n").arg(tr("What's new"));
-    if (update.changes_complete) {
-        changelog += tr("%n change(s) since your build:", "", count);
-    } else if (count > 0) {
-        changelog += tr("Your build is more than %n change(s) behind. The newest ones:", "", count);
-    } else {
-        changelog += tr("The list of changes could not be loaded.");
+    std::string text{release.body};
+    if (auto pos = text.find("# Packages"); pos != std::string::npos) {
+        text = text.substr(0, pos);
     }
-    changelog += QStringLiteral("\n\n");
-    for (const Common::Net::Commit& commit : update.changes) {
-        changelog += QStringLiteral("- %1 (%2, [%3](https://github.com/%4/commit/%5))\n")
-                         .arg(QString::fromStdString(commit.summary),
-                              QString::fromStdString(commit.author),
-                              QString::fromStdString(commit.sha.substr(0, 7)),
-                              QString::fromUtf8(Common::g_build_auto_update_repo),
-                              QString::fromStdString(commit.sha));
-    }
-    changelog += QStringLiteral("\n[%1](%2)\n\n---\n\n%3")
-                     .arg(tr("Compare your build with this release on GitHub"),
-                          QString::fromStdString(update.compare_url),
-                          QString::fromStdString(release.body));
-    ui->body->setMarkdown(changelog);
 
-    if (const auto asset = release.GetPlatformAsset()) {
-        m_asset = *asset;
-        ui->prompt->setText(tr("Download %1 now?").arg(QString::fromStdString(m_asset.name)));
+    ui->body->setMarkdown(QString::fromStdString(text));
+
+    // TODO(crueter): Find a way to set default
+    const auto assets = release.GetPlatformAssets();
+
+    if (assets.empty()) {
+        ui->groupBox->setHidden(true);
+        connect(this, &QDialog::accepted, this, [release]() {
+            QDesktopServices::openUrl(QUrl{QString::fromStdString(release.html_url)});
+        });
+    } else if (assets.size() == 1) {
+        ui->groupBox->setHidden(true);
+        m_asset = assets[0];
+
         connect(this, &QDialog::accepted, this, &UpdateDialog::Download);
     } else {
-        ui->prompt->setText(tr("Open the release page to download it?"));
-        connect(this, &QDialog::accepted, this, [url = release.html_url] {
-            QDesktopServices::openUrl(QUrl{QString::fromStdString(url)});
-        });
+        u32 i = 0;
+        for (const Common::Net::Asset& a : assets) {
+            QRadioButton* r = new QRadioButton(tr(a.name.c_str()), this);
+            connect(r, &QRadioButton::toggled, this, [a, this](bool checked) {
+                if (checked)
+                    m_asset = a;
+            });
+
+            if (i == 0)
+                r->setChecked(true);
+            ++i;
+
+            ui->radioButtons->addWidget(r);
+        }
+
+        connect(this, &QDialog::accepted, this, &UpdateDialog::Download);
     }
 }
 
@@ -77,8 +78,7 @@ UpdateDialog::~UpdateDialog() {
 void UpdateDialog::Download() {
     const auto filename = QtCommon::Frontend::GetSaveFileName(
         tr("New Version Location"),
-        QDir{QStandardPaths::writableLocation(QStandardPaths::DownloadLocation)}.filePath(
-            QString::fromStdString(m_asset.name)),
+        qApp->applicationDirPath() % QStringLiteral("/") % QString::fromStdString(m_asset.filename),
         tr("All Files (*.*)"));
 
     if (filename.isEmpty())
@@ -92,24 +92,23 @@ void UpdateDialog::Download() {
         return;
     }
 
-    // GitHub serves release files through a redirect to its file host.
-    const QUrl url{QString::fromStdString(m_asset.url)};
-    const auto host = QStringLiteral("%1://%2").arg(url.scheme(), url.host()).toStdString();
-    const auto path = url.path(QUrl::FullyEncoded).toStdString();
-
     // TODO(crueter): Move to net.cpp
     constexpr std::size_t timeout_seconds = 15;
 
-    std::unique_ptr<httplib::Client> client = std::make_unique<httplib::Client>(host);
+    std::unique_ptr<httplib::Client> client = std::make_unique<httplib::Client>(m_asset.url);
     client->set_connection_timeout(timeout_seconds);
     client->set_read_timeout(timeout_seconds);
     client->set_write_timeout(timeout_seconds);
     client->set_follow_location(true);
-    client->set_default_headers({{"User-Agent", "Eglantine"}});
 
 #ifdef YUZU_BUNDLED_OPENSSL
     client->load_ca_cert_store(kCert, sizeof(kCert));
 #endif
+
+    if (client == nullptr) {
+        LOG_ERROR(Frontend, "Invalid URL {}{}", m_asset.url, m_asset.path);
+        return;
+    }
 
     auto progress =
         QtCommon::Frontend::newProgressDialog(tr("Downloading..."), tr("Cancel"), 0, 100);
@@ -120,8 +119,9 @@ void UpdateDialog::Download() {
     // Progress dialog.
     auto progress_callback = [&](size_t processed_size, size_t total_size) {
         QGuiApplication::processEvents();
-        if (total_size != 0)
+        if (total_size != 0) {
             progress->setValue(static_cast<int>((processed_size * 100) / total_size));
+        }
         return !progress->wasCanceled();
     };
 
@@ -139,32 +139,27 @@ void UpdateDialog::Download() {
     };
 
     // Now send off request
-    auto result = client->Get(path, content_receiver, progress_callback);
-    const bool canceled = progress->wasCanceled();
+    auto result = client->Get(m_asset.path, content_receiver, progress_callback);
     progress->close();
 
-    if (canceled) {
-        file.cancelWriting();
-        return;
-    }
-
     if (!result) {
-        LOG_ERROR(Frontend, "GET to {}{} failed: {}", host, path, httplib::to_string(result.error()));
-        file.cancelWriting();
-        QtCommon::Frontend::Critical(tr("Failed to download file"),
-                                     tr("Could not download %1.").arg(url.toString()));
+        LOG_ERROR(Frontend, "GET to {}{} returned null", m_asset.url, m_asset.path);
         return;
     }
 
     const auto& response = result.value();
     if (response.status >= 400) {
-        LOG_ERROR(Frontend, "GET to {}{} returned error status code: {}", host, path,
+        LOG_ERROR(Frontend, "GET to {}{} returned error status code: {}", m_asset.url, m_asset.path,
                   response.status);
-        file.cancelWriting();
-        QtCommon::Frontend::Critical(
-            tr("Failed to download file"),
-            tr("Could not download %1\nError code: %2")
-                .arg(url.toString(), QString::number(response.status)));
+        QtCommon::Frontend::Critical(tr("Failed to download file"),
+                                     tr("Could not download from %1%2\nError code: %3")
+                                         .arg(QString::fromStdString(m_asset.url),
+                                              QString::fromStdString(m_asset.path),
+                                              QString::number(response.status)));
+        return;
+    }
+    if (!response.has_header("content-type")) {
+        LOG_ERROR(Frontend, "GET to {}{} returned no content", m_asset.url, m_asset.path);
         return;
     }
 
@@ -175,19 +170,14 @@ void UpdateDialog::Download() {
         return;
     }
 
-    if (filename.endsWith(QStringLiteral(".AppImage"))) {
-        QFile::setPermissions(filename, QFile::permissions(filename) | QFileDevice::ExeOwner |
-                                            QFileDevice::ExeGroup | QFileDevice::ExeOther);
-    }
-
-    // Download is complete. User may choose to open its folder in the file manager.
-    auto button = QtCommon::Frontend::Question(
-        tr("Download Complete"),
-        tr("Successfully downloaded %1. Would you like to open its folder?")
-            .arg(QFileInfo{filename}.fileName()),
-        QtCommon::Frontend::Yes | QtCommon::Frontend::No);
+    // Download is complete. User may choose to open in the file manager.
+    auto button =
+        QtCommon::Frontend::Question(tr("Download Complete"),
+                                     tr("Successfully downloaded %1. Would you like to open it?")
+                                         .arg(QString::fromStdString(m_asset.filename)),
+                                     QtCommon::Frontend::Yes | QtCommon::Frontend::No);
 
     if (button == QtCommon::Frontend::Yes) {
-        QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo{filename}.absolutePath()));
+        QDesktopServices::openUrl(QUrl::fromLocalFile(filename));
     }
 }

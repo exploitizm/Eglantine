@@ -99,7 +99,7 @@ void Invoke(EmitContext& ctx, IR::Inst* inst) {
     }
 }
 
-void EmitInst(EmitContext& ctx, IR::Inst* inst) {
+void EmitInst(EmitContext& ctx, IR::Inst* inst) try {
     switch (inst->GetOpcode()) {
 #define OPCODE(name, result_type, ...)                                                             \
     case IR::Opcode::name:                                                                         \
@@ -108,6 +108,10 @@ void EmitInst(EmitContext& ctx, IR::Inst* inst) {
 #undef OPCODE
     }
     throw LogicError("Invalid opcode {}", inst->GetOpcode());
+} catch (Shader::Exception& exception) {
+    exception.Prepend(fmt::format("SPIR-V emission failed at IR opcode {}: ",
+                                  IR::NameOf(inst->GetOpcode())));
+    throw;
 }
 
 Id TypeId(const EmitContext& ctx, IR::Type type) {
@@ -247,6 +251,20 @@ void DefineEntryPoint(const IR::Program& program, EmitContext& ctx, Id main) {
     }
     case Stage::VertexB:
         execution_model = spv::ExecutionModel::Vertex;
+        break;
+    case Stage::Task:
+        execution_model = spv::ExecutionModel::TaskEXT;
+        ctx.AddExecutionMode(main, spv::ExecutionMode::LocalSize, program.workgroup_size[0], 1U,
+                             1U);
+        break;
+    case Stage::Mesh:
+        execution_model = spv::ExecutionModel::MeshEXT;
+        ctx.AddExecutionMode(main, spv::ExecutionMode::LocalSize, program.workgroup_size[0], 1U,
+                             1U);
+        ctx.AddExecutionMode(main, spv::ExecutionMode::OutputVertices, program.mesh.max_vertices);
+        ctx.AddExecutionMode(main, spv::ExecutionMode::OutputPrimitivesEXT,
+                             program.mesh.max_primitives);
+        ctx.AddExecutionMode(main, spv::ExecutionMode::OutputTrianglesEXT);
         break;
     case Stage::TessellationControl:
         execution_model = spv::ExecutionModel::TessellationControl;
@@ -434,11 +452,6 @@ void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ct
             ctx.AddCapability(spv::Capability::ShaderViewportIndexLayerEXT);
         }
     }
-    if (!profile.support_vertex_instance_id &&
-        (info.loads[IR::Attribute::InstanceId] || info.loads[IR::Attribute::VertexId])) {
-        ctx.AddExtension("SPV_KHR_shader_draw_parameters");
-        ctx.AddCapability(spv::Capability::DrawParameters);
-    }
     if ((info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
          info.uses_subgroup_shuffles || info.uses_subgroup_mask) &&
         profile.support_vote && profile.SupportsSubgroupStage(ctx.stage)) {
@@ -548,10 +561,56 @@ void RewriteOpcodes(std::vector<u32>& code, std::span<const std::pair<u32, spv::
         offset += word_count;
     }
 }
+
+// Replaces the OpStore markers of the mesh instructions Sirit cannot emit: OpStore(vertices,
+// primitives) becomes OpSetMeshOutputsEXT, and OpStore(x, y), OpStore(z, payload), OpReturn
+// becomes the OpEmitMeshTasksEXT terminator.
+void PatchMeshInstructions(std::vector<u32>& code, const EmitContext& ctx) {
+    const bool set_outputs{Sirit::ValidId(ctx.mesh_outputs_marker[0])};
+    const bool emit_tasks{Sirit::ValidId(ctx.mesh_tasks_marker[0])};
+    if (!set_outputs && !emit_tasks) {
+        return;
+    }
+    const auto store_at = [&](size_t offset, Id pointer, Id object) {
+        return offset + 2 < code.size() &&
+               code[offset] == ((3U << 16) | static_cast<u32>(spv::Op::OpStore)) &&
+               code[offset + 1] == pointer.value && code[offset + 2] == object.value;
+    };
+    const auto& tasks{ctx.mesh_tasks_marker};
+    size_t offset = 5;
+    bool patched{};
+    while (offset < code.size()) {
+        const u32 word_count{code[offset] >> 16};
+        if (word_count == 0) {
+            break;
+        }
+        if (set_outputs &&
+            store_at(offset, ctx.mesh_outputs_marker[0], ctx.mesh_outputs_marker[1])) {
+            code[offset] = (3U << 16) | static_cast<u32>(spv::Op::OpSetMeshOutputsEXT);
+            patched = true;
+        } else if (emit_tasks && store_at(offset, tasks[0], tasks[1]) &&
+                   store_at(offset + 3, tasks[2], tasks[3]) && offset + 6 < code.size() &&
+                   code[offset + 6] == ((1U << 16) | static_cast<u32>(spv::Op::OpReturn))) {
+            const std::array<u32, 5> emit{(5U << 16) | static_cast<u32>(spv::Op::OpEmitMeshTasksEXT),
+                                          tasks[0].value, tasks[1].value, tasks[2].value,
+                                          tasks[3].value};
+            code.erase(code.begin() + offset, code.begin() + offset + 7);
+            code.insert(code.begin() + offset, emit.begin(), emit.end());
+            patched = true;
+            offset += emit.size();
+            continue;
+        }
+        offset += word_count;
+    }
+    if (!patched) {
+        throw LogicError("Mesh instruction markers not found");
+    }
+}
 } // Anonymous namespace
 
 std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings) {
     EmitContext ctx{profile, runtime_info, program, bindings};
+    DefineSoftwareMatrixFunctions(ctx, program);
     const Id main{DefineMain(ctx, program)};
     DefineEntryPoint(program, ctx, main);
     if (profile.support_float_controls) {
@@ -564,6 +623,7 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
     PatchPhiNodes(program, ctx);
     std::vector<u32> code{ctx.Assemble()};
     RewriteOpcodes(code, ctx.opcode_rewrites);
+    PatchMeshInstructions(code, ctx);
     return code;
 }
 

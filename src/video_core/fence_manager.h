@@ -18,7 +18,7 @@
 #include <queue>
 
 #include "common/common_types.h"
-#include "common/scope_exit.h"
+#include "common/logging.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "video_core/delayed_destruction_ring.h"
@@ -88,8 +88,6 @@ public:
         auto [should_flush, committed_flushes] = CommitCacheFlushes();
         if (!delay_fence && committed_flushes == 0 && SkipEmptyFence()) {
             Nx2Profile::Scope skipped_scope{Nx2Profile::Zone::FenceSkipped};
-            gpu.BeginAsyncGuestWrite();
-            SCOPE_EXIT { gpu.EndAsyncGuestWrite(); };
             func();
             rasterizer.InvalidateGPUCache();
             return;
@@ -112,8 +110,6 @@ public:
         pending_flushes.push_back(committed_flushes);
         QueueFence(new_fence);
         if (!delay_fence) {
-            gpu.BeginAsyncGuestWrite();
-            SCOPE_EXIT { gpu.EndAsyncGuestWrite(); };
             func();
         }
         fences.push(std::move(new_fence));
@@ -128,6 +124,13 @@ public:
     }
 
     void SignalSyncPoint(u32 value) {
+        // The id comes from a command list (the 3D engine's sync method, the puller's fence
+        // action). Past the syncpoint table, the increment would walk memory after it as an
+        // action list; command words read wrong carry any id (Splatoon Raiders on Linux).
+        if (value >= Tegra::Host1x::SyncpointManager::NUM_MAX_SYNCPOINTS) {
+            LOG_ERROR(HW_GPU, "Signal of syncpoint {} past the table, ignored", value);
+            return;
+        }
         syncpoint_manager.IncrementGuest(value);
         std::function<void()> func([this, value] { syncpoint_manager.IncrementHost(value); });
         SignalFence(std::move(func));
@@ -204,8 +207,6 @@ private:
                     return;
                 }
             }
-            gpu.BeginAsyncGuestWrite();
-            SCOPE_EXIT { gpu.EndAsyncGuestWrite(); };
             PopAsyncFlushes(pending_flushes.front());
             pending_flushes.pop_front();
             auto operations = std::move(pending_operations.front());
@@ -268,8 +269,6 @@ private:
                     take_front();
                 }
             }
-            gpu.BeginAsyncGuestWrite();
-            SCOPE_EXIT { gpu.EndAsyncGuestWrite(); };
             size_t texture_pops = 0;
             size_t buffer_pops = 0;
             for (const Released& released : batch) {

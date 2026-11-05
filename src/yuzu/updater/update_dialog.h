@@ -5,8 +5,8 @@
 
 #include <QDialog>
 #include "common/net/net.h"
-#include "frontend_common/update_checker.h"
 
+class QRadioButton;
 namespace Ui {
 class UpdateDialog;
 }
@@ -15,7 +15,7 @@ class UpdateDialog : public QDialog {
     Q_OBJECT
 
 public:
-    explicit UpdateDialog(const UpdateChecker::Update& update, QWidget* parent = nullptr);
+    explicit UpdateDialog(const Common::Net::Release& release, QWidget* parent = nullptr);
     ~UpdateDialog();
 
 private slots:
@@ -23,5 +23,6 @@ private slots:
 
 private:
     Ui::UpdateDialog* ui;
+    QList<QRadioButton*> m_buttons;
     Common::Net::Asset m_asset;
 };

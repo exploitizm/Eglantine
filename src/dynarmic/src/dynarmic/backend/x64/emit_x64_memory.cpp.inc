@@ -46,6 +46,8 @@ void AxxEmitX64::AddFastmemPatch(CodePtr location, CodePtr resume_location, void
     };
     info.inst_name = std::get<1>(marker);
     info.recompile = recompile ? 1 : 0;
+    // Code is emitted in address order; only a block's deferred fallbacks can come after a later
+    // access of the same block.
     auto it = fastmem_patch_info.end();
     if (!fastmem_patch_info.empty() && fastmem_patch_info.back().rip >= info.rip) {
         it = std::lower_bound(fastmem_patch_info.begin(), fastmem_patch_info.end(), info.rip,

@@ -231,7 +231,9 @@ struct ColorConsoleBackend final : public Backend {
             std::fwrite("\x1b[0m\n", 1, sizeof("\x1b[0m\n"), stdout);
         }
     }
-    void Flush() noexcept override {}
+    void Flush() noexcept override {
+        std::fflush(stdout);
+    }
     std::atomic_bool enabled = false;
 #endif
 };
@@ -421,6 +423,10 @@ void SetGlobalFilter(const Filter& filter) {
 void SetColorConsoleBackendEnabled(bool enabled) {
     if (logging_instance)
         logging_instance->color_console_backend.enabled = enabled;
+}
+
+bool IsLevelEnabled(Class log_class, Level log_level) {
+    return logging_instance && logging_instance->filter.CheckMessage(log_class, log_level);
 }
 
 void FmtLogMessageImpl(Class log_class, Level log_level, const char* filename, unsigned int line_num, const char* function, fmt::string_view format, const fmt::format_args& args) {

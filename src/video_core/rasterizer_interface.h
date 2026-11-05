@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <array>
 #include <functional>
 #include <optional>
 #include <span>
@@ -15,6 +16,7 @@
 #include "common/settings.h"
 #include "video_core/cache_types.h"
 #include "video_core/engines/fermi_2d.h"
+#include "video_core/game_dlss_status.h"
 #include "video_core/gpu.h"
 #include "video_core/query_cache/types.h"
 #include "video_core/rasterizer_download_area.h"
@@ -26,6 +28,9 @@ class AccelerateDMAInterface;
 }
 namespace Control {
 struct ChannelState;
+}
+namespace Texture {
+struct TICEntry;
 }
 } // namespace Tegra
 
@@ -98,9 +103,13 @@ public:
         Unknown, ///< Neither: the caller drains, flushes the page and notes it synced
         Copied,  ///< `out` (within one 4 KiB page) is filled from the copy made after its writer
         Synced,  ///< Guest memory holds the page: no GPU work wrote it since it was flushed
+        /// Draws write the page: ask again with `past_sync` once the split's back ran the work
+        /// before the last host-level wait (GpuSplit::WaitForSync)
+        NeedsSync,
     };
     virtual GpuWrittenList ReadGpuWrittenCommandList([[maybe_unused]] DAddr addr,
-                                                     [[maybe_unused]] std::span<u8> out) {
+                                                     [[maybe_unused]] std::span<u8> out,
+                                                     [[maybe_unused]] bool past_sync) {
         return GpuWrittenList::Unknown;
     }
 
@@ -127,17 +136,6 @@ public:
 
     /// Notify rasterizer that any caches of the specified region are desync with guest
     virtual void OnCacheInvalidation(PAddr addr, u64 size) = 0;
-
-    /// A guest CPU write to GPU-written memory, held back until now (InvalidateGPUCache, on the
-    /// GPU thread): only those bytes changed.
-    virtual void OnCachedWrite(DAddr addr, u64 size) {
-        OnCacheInvalidation(addr, size);
-    }
-
-    /// Value of a release the GPU already processed whose write may still be in flight on the host.
-    virtual std::optional<u32> PendingSemaphoreRelease(DAddr addr) {
-        return std::nullopt;
-    }
 
     virtual bool TryCacheInvalidation(DAddr addr, u64 size) {
         if (MustFlushRegion(addr, size, VideoCommon::CacheType::BufferCache)) return false;
@@ -185,6 +183,41 @@ public:
         const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
         const Tegra::Engines::Fermi2D::Config& copy_config) {
         return false;
+    }
+
+    /// Stand-in for a DLSS evaluation: temporal upscale of src into dst along motion_vectors
+    /// (jitter in src pixels; motion_scale turns a motion vector into a UV offset to the previous
+    /// frame), with depth for NVIDIA DLSS or FSR 3.1. With use_history=false, only de-jitter src.
+    /// False when unsupported; the caller retains its native dispatch.
+    [[nodiscard]] virtual bool AccelerateTemporalUpscale(
+        const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
+        const Tegra::Engines::Fermi2D::Surface& motion_vectors,
+        const Tegra::Texture::TICEntry* depth, std::array<f32, 2> jitter,
+        std::array<f32, 2> motion_scale, bool use_history = true) {
+        return false;
+    }
+
+    /// Whether a game's own DLSS network can run here: its matrix multiplies are emulated with
+    /// 32-wide shuffles, and its output must be checkable (ProbeGameDlssOutput).
+    [[nodiscard]] virtual bool SupportsGameDlssNetwork() const {
+        return false;
+    }
+
+    /// Whether NVIDIA DLSS (the "Use NVIDIA DLSS" setting) would draw a game's DLSS evaluation.
+    [[nodiscard]] virtual bool UsesNvidiaDlss() const {
+        return false;
+    }
+
+    /// Whether ProbeGameDlssOutput checks anything on this backend.
+    [[nodiscard]] virtual bool CanProbeGameDlssOutput() const {
+        return false;
+    }
+
+    /// Records a health check of a game's DLSS network output (dst) against its input (src) and
+    /// returns the result of an earlier check once the GPU has finished it.
+    [[nodiscard]] virtual std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(
+        const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst) {
+        return std::nullopt;
     }
 
     [[nodiscard]] virtual Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() = 0;

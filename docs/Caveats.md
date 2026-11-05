@@ -28,8 +28,6 @@ If you're having issues with building, always consult that ebuild.
 
 macOS is largely untested. Expect crashes, significant Vulkan issues, and other fun stuff.
 
-Apple Silicon builds use Dynarmic's ARM64 JIT, not NCE. Hosts with pages larger than 4 KiB use the backing-buffer and software-page-table fallback instead of fastmem. MoltenVK does not support Vulkan sparse residency, so large images require ordinary allocations and can exceed available memory. Successful builds and packaged-binary startup checks do not establish game compatibility.
-
 ## OpenIndiana
 
 Always consult [the OpenIndiana package list](https://pkg.openindiana.org/hipster/en/index.shtml) to cross-verify availability.

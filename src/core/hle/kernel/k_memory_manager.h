@@ -59,7 +59,7 @@ public:
     void FinalizeOptimizedMemory(u64 process_id, Pool pool);
 
     KPhysicalAddress AllocateAndOpenContinuous(size_t num_pages, size_t align_pages, u32 option);
-    Result AllocateAndOpen(KPageGroup* out, size_t num_pages, u32 option, bool random = true);
+    Result AllocateAndOpen(KPageGroup* out, size_t num_pages, u32 option);
     Result AllocateForProcess(KPageGroup* out, size_t num_pages, u32 option, u64 process_id,
                               u8 fill_pattern);
 

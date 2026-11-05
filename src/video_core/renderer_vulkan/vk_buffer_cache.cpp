@@ -6,15 +6,15 @@
 
 #include <algorithm>
 #include <array>
-#include <cstdlib>
 #include <cstring>
+#include <cstdlib>
 #include <span>
 #include <vector>
 
 #include "video_core/buffer_cache/buffer_cache_base.h"
-#include "video_core/host1x/gpu_device_memory_manager.h"
-#include "video_core/readback_diagnostics.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
+#include "video_core/renderer_vulkan/vertex_repack.h"
 
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -89,7 +89,8 @@ vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allo
     if (sparse_alignment > 1) {
         return memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal, sparse_alignment);
     }
-    return memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal);
+    return memory_allocator.CreateBuffer(
+        buffer_ci, device.IsMoltenVK() ? MemoryUsage::Stream : MemoryUsage::DeviceLocal);
 }
 } // Anonymous namespace
 
@@ -362,6 +363,18 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
                       compute_pass_descriptor_queue),
       multi_range_buffers(device_) {
     const VkDriverIdKHR driver_id = device.GetDriverID();
+    const bool enable_vertex_repack = VertexRepackEnabled();
+    LOG_INFO(Render_Vulkan, "69-byte vertex layout repacking {} ({})",
+             enable_vertex_repack ? "enabled" : "disabled",
+             "portable Vulkan layout fallback");
+    static_vertex_repack =
+        StaticVertexRepackEnabled(device.GetMinVertexInputBindingStrideAlignment());
+    LOG_INFO(Render_Vulkan, "Vertex repacking without dynamic vertex input {}",
+             static_vertex_repack ? "enabled" : "disabled");
+    if (enable_vertex_repack) {
+        vertex_repack_pass = std::make_unique<VertexRepackPass>(
+            device, scheduler, descriptor_pool, staging_pool, compute_pass_descriptor_queue);
+    }
     limit_dynamic_storage_buffers = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
                                     driver_id == VK_DRIVER_ID_ARM_PROPRIETARY;
     if (limit_dynamic_storage_buffers) {
@@ -377,17 +390,23 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
                                                                      scheduler_, staging_pool_);
 }
 
+u32 BufferCacheRuntime::SetVertexRepackLayout(const Tegra::Engines::Maxwell3D::Regs& regs,
+                                            bool dynamic_input) {
+    const u32 old_mask = vertex_repack_mask;
+    const bool input_supported = VertexRepackInputSupported(dynamic_input, static_vertex_repack);
+    vertex_repack_mask = vertex_repack_pass && input_supported ? VertexRepackMask(regs) : 0;
+    if (vertex_repack_mask != old_mask) {
+        LOG_DEBUG(Render_Vulkan, "Vertex repack selection: mask={:#x}, dynamic_input={}",
+                  vertex_repack_mask, dynamic_input);
+    }
+    return old_mask ^ vertex_repack_mask;
+}
+
 StagingBufferRef BufferCacheRuntime::UploadStagingBuffer(size_t size) {
-    VideoCommon::ReadbackDiagnostics::Scope diagnostic{
-        VideoCommon::ReadbackDiagnostics::Event::UploadStaging, size};
     return staging_pool.Request(size, MemoryUsage::Upload);
 }
 
 StagingBufferRef BufferCacheRuntime::DownloadStagingBuffer(size_t size, bool deferred) {
-    VideoCommon::ReadbackDiagnostics::Scope diagnostic{
-        deferred ? VideoCommon::ReadbackDiagnostics::Event::DeferredDownloadStaging
-                 : VideoCommon::ReadbackDiagnostics::Event::DownloadStaging,
-        size};
     return staging_pool.Request(size, MemoryUsage::Download, deferred);
 }
 
@@ -427,36 +446,6 @@ void BufferCacheRuntime::TickFrame(Common::SlotVector<Buffer>& slot_buffers) noe
     }
 }
 
-bool BufferCacheRuntime::BindSmallUniformReusing(
-    Tegra::MaxwellDeviceMemoryManager& device_memory, size_t stage, u32 index,
-    DAddr device_addr, u32 size) {
-    static const bool enabled = [] {
-        const char* value = std::getenv("EDEN_NX2_UBOREUSE");
-        return value != nullptr && value[0] == '1' && value[1] == '\0';
-    }();
-    if (!enabled || size == 0 || size > UniformStreamReuse::MaxBytes || stage >= 5 || index >= 18) {
-        return false;
-    }
-    if (!uniform_stream_reuse) {
-        uniform_stream_reuse = std::make_unique<UniformStreamReuse>();
-    }
-    auto& reuse = *uniform_stream_reuse;
-    auto& slot = reuse.slots[stage][index];
-    device_memory.ReadBlockUnsafe(device_addr, reuse.scratch.data(), size);
-    if (slot.size != size || slot.tick != scheduler.CurrentTick() ||
-        std::memcmp(slot.bytes.data(), reuse.scratch.data(), size) != 0) {
-        slot.ref = staging_pool.Request(size, MemoryUsage::Upload, true);
-        staging_pool.FreeDeferred(slot.ref);
-        std::memcpy(slot.ref.mapped_span.data(), reuse.scratch.data(), size);
-        std::memcpy(slot.bytes.data(), reuse.scratch.data(), size);
-        slot.size = size;
-        slot.tick = scheduler.CurrentTick();
-    }
-    guest_descriptor_queue.AddBuffer(slot.ref.buffer, slot.ref.device_address,
-                                    static_cast<u32>(slot.ref.offset), size);
-    return true;
-}
-
 u64 BufferCacheRuntime::CurrentTick() {
     return scheduler.CurrentTick();
 }
@@ -470,12 +459,26 @@ void BufferCacheRuntime::Wait(u64 tick) {
 }
 
 void BufferCacheRuntime::WaitSubmittedTick(u64 tick) {
-    scheduler.GetMasterSemaphore().Wait(tick);
+    auto& master = scheduler.GetMasterSemaphore();
+    if (master.IsFree(tick)) {
+        return;
+    }
+    // The copy's submission may be deferred (Scheduler::DeferFlush): the split's front asks the
+    // back for it rather than waiting for the back's next submission. If the back has stopped,
+    // nothing else uses the scheduler and Wait submits it.
+    if (!scheduler.IsSubmitted(tick) && VideoCommon::GpuSplit::Get().Active() &&
+        !VideoCommon::GpuSplit::OnBackThread()) {
+        VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::ListSubmitWait};
+        if (!scheduler.WaitSubmitted(tick)) {
+            scheduler.Wait(tick);
+            return;
+        }
+    }
+    VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::ListGpuWait};
+    master.Wait(tick);
 }
 
 void BufferCacheRuntime::Finish() {
-    VideoCommon::ReadbackDiagnostics::Scope diagnostic{
-        VideoCommon::ReadbackDiagnostics::Event::BufferFinish};
     scheduler.Finish();
 }
 
@@ -652,6 +655,15 @@ void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat
     });
 }
 
+void BufferCacheRuntime::BindHostUint8IndexBuffer(std::span<const u8> indices) {
+    const auto staging = staging_pool.Request(indices.size() * sizeof(u16), MemoryUsage::Upload);
+    u16* const widened = reinterpret_cast<u16*>(staging.mapped_span.data());
+    std::ranges::transform(indices, widened, [](u8 index) -> u16 { return index == 0xff ? 0xffff : index; });
+    scheduler.Record([buffer = staging.buffer, offset = staging.offset](vk::CommandBuffer cmdbuf) {
+        cmdbuf.BindIndexBuffer(buffer, offset, VK_INDEX_TYPE_UINT16);
+    });
+}
+
 void BufferCacheRuntime::BindQuadIndexBuffer(PrimitiveTopology topology, u32 first, u32 count) {
     if (count == 0) {
         ReserveNullBuffer();
@@ -673,6 +685,17 @@ void BufferCacheRuntime::BindQuadIndexBuffer(PrimitiveTopology topology, u32 fir
 void BufferCacheRuntime::BindVertexBuffer(u32 index, VkBuffer buffer, u32 offset, u32 size, u32 stride) {
     if (index >= device.GetMaxVertexInputBindings()) {
         return;
+    }
+    if (buffer != VK_NULL_HANDLE && size != 0 && IsVertexRepacked(index)) {
+        const auto repacked =
+            vertex_repack_pass->Assemble(buffer, offset, size, u64{offset} + size);
+        if (!repacked) {
+            return;
+        }
+        buffer = repacked->first;
+        offset = static_cast<u32>(repacked->second);
+        size = static_cast<u32>((u64{size} + 68) / 69 * 72);
+        stride = 72;
     }
     if (device.IsExtExtendedDynamicStateSupported()) {
         scheduler.Record([index, buffer, offset, size, stride](vk::CommandBuffer cmdbuf) {
@@ -706,6 +729,25 @@ void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bi
             }
         }
         buffer_handles[i] = handle;
+        const u32 binding = bindings.min_index + i;
+        if (handle != VK_NULL_HANDLE && IsVertexRepacked(binding) && bindings.strides[i] == 69 &&
+            bindings.sizes[i] > 0) {
+            const auto repacked = vertex_repack_pass->Assemble(
+                handle, static_cast<u32>(bindings.offsets[i]), static_cast<u32>(bindings.sizes[i]),
+                bindings.buffers[i]->SizeBytes());
+            if (!repacked) {
+                continue;
+            }
+            buffer_handles[i] = repacked->first;
+            bindings.offsets[i] = repacked->second;
+            bindings.sizes[i] = (bindings.sizes[i] + 68) / 69 * 72;
+            bindings.strides[i] = 72;
+            static bool reported = false;
+            if (!reported) {
+                LOG_INFO(Render_Vulkan, "GPU vertex repacking active: 69 -> 72 bytes");
+                reported = true;
+            }
+        }
     }
     const u32 device_max = device.GetMaxVertexInputBindings();
     const u32 min_binding = (std::min)(bindings.min_index, device_max);

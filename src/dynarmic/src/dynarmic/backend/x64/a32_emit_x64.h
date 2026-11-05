@@ -87,6 +87,7 @@ public:
 
     // Fastmem information
     using DoNotFastmemMarker = std::tuple<IR::LocationDescriptor, unsigned>;
+    /// Where a fastmem access that faults goes: code addresses are offsets in the code space.
     struct FastmemPatchInfo {
         u32 rip;
         u32 resume_rip;
@@ -130,7 +131,7 @@ public:
     RegAlloc reg_alloc; //reusable reg alloc
     BlockRangeInformation<u32> block_ranges;
     std::array<FastDispatchEntry, fast_dispatch_table_size> fast_dispatch_table;
-    std::vector<FastmemPatchInfo> fastmem_patch_info;
+    std::vector<FastmemPatchInfo> fastmem_patch_info;  // sorted by rip
     ::Common::unordered_map<std::tuple<bool, size_t, int, int>, void (*)()> read_fallbacks;
     ::Common::unordered_map<std::tuple<bool, size_t, int, int>, void (*)()> write_fallbacks;
     ::Common::unordered_map<std::tuple<bool, size_t, int, int>, void (*)()> exclusive_write_fallbacks;

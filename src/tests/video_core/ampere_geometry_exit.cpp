@@ -244,4 +244,46 @@ TEST_CASE("Ampere geometry exit lowering branches body exits to the handler",
                 return (word & 0xfff0000000000000ULL) == 0xe300000000000000ULL;
             }) == 1);
 }
+
+TEST_CASE("Kirby geometry calls return before the exit handler", "[video_core][ampere][kirby]") {
+    std::array<Instruction, 17> program{};
+    std::copy_n(Program.begin(), 10, program.begin());
+    program[1].words[1] = 0xe0;
+    program[10] = Instruction{{0x00087802, 0xc0, 0x00000f00, 0}};
+    program[11] = Instruction{{0x00007944, 0x10, 0x03c00000, 0}};
+    program[12] = Program[12];
+    program[13] = Instruction{{0x08007950, 0xffffff20, 0x03c3ffff, 0x000fea00}};
+    std::copy_n(Program.begin() + 13, 3, program.begin() + 14);
+
+    const auto lowered = Shader::Ampere::LowerToMaxwell(program, true);
+    INFO(lowered.error << " at " << lowered.error_offset);
+    REQUIRE(lowered);
+    REQUIRE(lowered.source_size == sizeof(program));
+    REQUIRE(lowered.source_instruction_offsets.size() == program.size());
+    const auto& offsets = lowered.source_instruction_offsets;
+    CHECK(lowered.instructions[offsets[13]] == 0xe32000000007000fULL);
+    CHECK((lowered.instructions[offsets[14]] & 0xfff8000000000000ULL) == 0xfbe0000000000000ULL);
+    CHECK(lowered.instructions.back() == 0xe30000000007000fULL);
+    const auto address = [](u32 i) { return 0x50U + i * 8 + ((i + 1) / 3) * 8; };
+    for (const auto [source, target] : {std::pair{11U, 13U}, std::pair{12U, 14U}}) {
+        const u64 instruction = lowered.instructions[offsets[source]];
+        const s64 relative = static_cast<s64>((instruction >> 20) & 0xffffff) << 40 >> 40;
+        CHECK(s64{address(offsets[source])} + 8 + relative == address(offsets[target]));
+    }
+
+    auto invalid = program;
+    invalid[13].words[0] = 0x08000950;
+    CHECK_FALSE(Shader::Ampere::LowerToMaxwell(invalid, true));
+    invalid = program;
+    invalid[13].words[1] += 16;
+    CHECK_FALSE(Shader::Ampere::LowerToMaxwell(invalid, true));
+    invalid = program;
+    invalid[13].words[0] = 0x09007950;
+    const auto unlinked = Shader::Ampere::LowerToMaxwell(invalid, true);
+    CHECK_FALSE(unlinked);
+    CHECK(unlinked.error == "native return linkage mode");
+    invalid = program;
+    invalid[10].words[1] += 16;
+    CHECK_FALSE(Shader::Ampere::LowerToMaxwell(invalid, true));
+}
 } // namespace

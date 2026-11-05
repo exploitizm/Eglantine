@@ -106,10 +106,6 @@ struct Profile {
     bool has_broken_spirv_subgroup_shuffle{};
     u32 max_subgroup_size{};
 
-    bool support_cooperative_matrix{};
-    u32 max_compute_shared_memory_size{};
-    u32 max_tensor_workgroup_size{};
-
     u32 gl_max_compute_smem_size{};
 
     /// Maxwell and earlier nVidia architectures have broken robust support

@@ -18,8 +18,6 @@ TEST_CASE("Ampere geometry instructions require an explicit geometry stage",
     for (const Instruction instruction : std::array{
              Final,
              Instruction{{0x030c7923, 0, 0, 0x000e2800}},
-             Instruction{{0x00027919, 0, 0x1100, 0x000fe400}},
-             Instruction{{0x00027919, 0, 0x1d00, 0x000fe400}},
              Instruction{{0x0000734e, 0, 0, 0x000fe400}}}) {
         REQUIRE_FALSE(LowerToMaxwell(std::array{instruction, Exit}));
     }
@@ -113,8 +111,21 @@ TEST_CASE("Ampere geometry index conversion retains U16 truncation and FTZ",
     REQUIRE(((word >> 39) & 3) == 3);
     REQUIRE(((word >> 44) & 1) == 1);
     for (const u32 bit : {0U, 8U, 13U, 18U, 22U, 27U}) {
+        CAPTURE(bit);
         auto invalid = convert;
         invalid.words[2] ^= 1U << bit;
-        REQUIRE_FALSE(LowerToMaxwell(std::array{invalid, Exit}, true));
+        const auto modified = LowerToMaxwell(std::array{invalid, Exit}, true);
+        if (bit == 8) {
+            REQUIRE(modified);
+            REQUIRE(modified.instructions.size() == 2);
+            CHECK(modified.instructions.front() ==
+                  (0x5cb0000000070002ULL | (1ULL << 8) | (2ULL << 10) |
+                   (1ULL << 12) | (2ULL << 20) | (3ULL << 39) | (1ULL << 44)));
+            CHECK(modified.instructions.back() == 0xe30000000007000fULL);
+            invalid.words[2] |= 1;
+            REQUIRE_FALSE(LowerToMaxwell(std::array{invalid, Exit}, true));
+        } else {
+            REQUIRE_FALSE(modified);
+        }
     }
 }

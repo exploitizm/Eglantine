@@ -286,7 +286,7 @@ std::string FormatBody(std::string body, const std::string_view &title) {
             body.pop_back();
         }
 
-        body += "\n\n... View more on GitHub";
+        body += "\n\n... View more on Forgejo";
     }
 
     return body;
@@ -311,7 +311,7 @@ void ImportReleases(const std::vector<Common::Net::Release> &releases) {
         const u64 pickup_limit = published + 600000000;
         const u32 priority = rel.prerelease ? 1500 : 2500;
 
-        std::string author = "Eglantine";
+        std::string author = "Eden";
 
         auto payload = BuildMsgpack(title, FormatBody(body, title), title, published,
                                     pickup_limit, priority, {"en"}, author, {},
@@ -423,7 +423,7 @@ std::vector<u8> BuildMsgpack(std::string_view title, std::string_view body,
     w.WriteString("");
 
     w.WriteKey("allow_domains");
-    w.WriteString("^https?://github.com(/|$)");
+    w.WriteString("^https?://git.eden-emu.dev(/|$)");
 
     // More link
     w.WriteKey("more");
@@ -433,7 +433,7 @@ std::vector<u8> BuildMsgpack(std::string_view title, std::string_view body,
     w.WriteKey("url");
     w.WriteString(html_url);
     w.WriteKey("text");
-    w.WriteString("Open GitHub");
+    w.WriteString("Open Forgejo");
 
     // Body
     w.WriteKey("body");
@@ -463,7 +463,7 @@ void EnsureBuiltinNewsLoaded() {
 
         if (const auto cached = ReadCachedJson()) {
             const std::string_view body = cached.value();
-            const auto releases = Common::Net::Release::ListFromJson(body);
+            const auto releases = Common::Net::Release::ListFromJson(body, Common::g_build_auto_update_stable_api, Common::g_build_auto_update_stable_repo);
             ImportReleases(releases);
 
             LOG_INFO(Service_BCAT, "news: {} entries loaded from cache", NewsStorage::Instance().ListAll().size());
@@ -473,10 +473,10 @@ void EnsureBuiltinNewsLoaded() {
             if (const auto fresh = Common::Net::GetReleasesBody()) {
                 const std::string_view body = fresh.value();
                 WriteCachedJson(body);
-                const auto releases = Common::Net::Release::ListFromJson(body);
+                const auto releases = Common::Net::Release::ListFromJson(body, Common::g_build_auto_update_stable_api, Common::g_build_auto_update_stable_repo);
                 ImportReleases(releases);
 
-                LOG_INFO(Service_BCAT, "news: {} entries updated from GitHub", NewsStorage::Instance().ListAll().size());
+                LOG_INFO(Service_BCAT, "news: {} entries updated from Forgejo", NewsStorage::Instance().ListAll().size());
             }
         }).detach();
     });

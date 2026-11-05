@@ -5,13 +5,38 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstring>
+#include <set>
+#include <tuple>
 
 #include "common/settings.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/render_trace.h"
 
 namespace Tegra::Engines {
+namespace {
+
+void TraceSuppressedDraw(const Maxwell3D& maxwell3d, bool indirect) {
+    if (!VideoCommon::RenderTrace::Enabled()) {
+        return;
+    }
+    const auto& regs = maxwell3d.regs;
+    const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
+    const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
+    static thread_local std::set<std::tuple<u64, u64, u64, bool, bool>> seen;
+    if (seen.size() < 256 &&
+        seen.emplace(vs, ps, regs.render_enable.Address(), Settings::IsDockedMode(), indirect).second) {
+        LOG_DEBUG(HW_GPU,
+                  "Render trace suppressed: docked={} indirect={} vs={:#x} ps={:#x} "
+                  "condition_address={:#x} mode={} override={}",
+                  Settings::IsDockedMode(), indirect, vs, ps, regs.render_enable.Address(),
+                  static_cast<u32>(regs.render_enable.mode),
+                  static_cast<u32>(regs.render_enable_override));
+    }
+}
+
+} // namespace
 
 void Maxwell3D::DrawManager::ProcessMethodCall(Maxwell3D& maxwell3d, u32 method, u32 argument) {
     switch (method) {
@@ -31,13 +56,11 @@ void Maxwell3D::DrawManager::ProcessMethodCall(Maxwell3D& maxwell3d, u32 method,
     case MAXWELL3D_REG_INDEX(index_buffer32_subsequent):
     case MAXWELL3D_REG_INDEX(index_buffer16_subsequent):
     case MAXWELL3D_REG_INDEX(index_buffer8_subsequent):
-        instance_index++;
         draw_state.instance_count++;
-        return DrawIndexSmall(maxwell3d, argument);
+        [[fallthrough]];
     case MAXWELL3D_REG_INDEX(index_buffer32_first):
     case MAXWELL3D_REG_INDEX(index_buffer16_first):
     case MAXWELL3D_REG_INDEX(index_buffer8_first):
-        instance_index = 0;
         return DrawIndexSmall(maxwell3d, argument);
     case MAXWELL3D_REG_INDEX(draw_inline_index):
         SetInlineIndexBuffer(maxwell3d, argument);
@@ -81,8 +104,8 @@ void Maxwell3D::DrawManager::DrawDeferred(Maxwell3D& maxwell3d, bool loop_contin
         }
         return;
     }
-    // Only the first batch includes the loop's initial instance. Later batches resume
-    // after the instances already submitted before an intervening register write.
+    // The first draw of a batch also covers the loop's first instance; a batch that continues a
+    // loop split by a register write draws only the instances after the ones already drawn.
     const bool continued = draw_state.drawn_instances != 0;
     DrawEnd(maxwell3d, draw_state.instance_count + (continued ? 0 : 1), true);
     draw_state.drawn_instances =
@@ -126,14 +149,16 @@ void Maxwell3D::DrawManager::DrawArray(Maxwell3D& maxwell3d, Maxwell3D::Regs::Pr
 }
 
 void Maxwell3D::DrawManager::DrawArrayInstanced(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 vertex_first, u32 vertex_count, bool subsequent) {
-    DrawDeferred(maxwell3d);
-    draw_state.instance_count = 0;
-    instance_index = subsequent ? instance_index + 1 : 0;
     draw_state.topology = topology;
     draw_state.vertex_buffer.first = vertex_first;
     draw_state.vertex_buffer.count = vertex_count;
-    draw_state.base_instance = instance_index;
-    draw_state.draw_mode = DrawMode::General;
+    if (!subsequent) {
+        draw_state.instance_count = 1;
+        draw_state.drawn_instances = 0;
+    }
+    draw_state.base_instance = draw_state.instance_count - 1;
+    draw_state.draw_mode = DrawMode::Instance;
+    draw_state.instance_count++;
     ProcessDraw(maxwell3d, false, 1);
 }
 
@@ -211,11 +236,9 @@ void Maxwell3D::DrawManager::DrawBegin(Maxwell3D& maxwell3d) {
     auto increment_instance_count = maxwell3d.regs.draw.instance_id == Maxwell3D::Regs::Draw::InstanceId::Subsequent;
     if (reset_instance_count) {
         DrawDeferred(maxwell3d);
-        instance_index = 0;
         draw_state.instance_count = 0;
         draw_state.draw_mode = DrawMode::General;
     } else if (increment_instance_count) {
-        instance_index++;
         draw_state.instance_count++;
         draw_state.draw_mode = DrawMode::Instance;
     }
@@ -321,6 +344,8 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
     UpdateTopology(maxwell3d);
     if (maxwell3d.ShouldExecute()) {
         maxwell3d.rasterizer->Draw(draw_indexed, instance_count);
+    } else {
+        TraceSuppressedDraw(maxwell3d, false);
     }
 }
 
@@ -330,6 +355,8 @@ void Maxwell3D::DrawManager::ProcessDrawIndirect(Maxwell3D& maxwell3d) {
     UpdateTopology(maxwell3d);
     if (maxwell3d.ShouldExecute()) {
         maxwell3d.rasterizer->DrawIndirect();
+    } else {
+        TraceSuppressedDraw(maxwell3d, true);
     }
 }
 } // namespace Tegra::Engines

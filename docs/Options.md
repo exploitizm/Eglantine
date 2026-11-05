@@ -59,9 +59,8 @@ These options control executables and build flavors.
   - Not supported on Linux
   - Automatically set if `YUZU_USE_BUNDLED_QT` is on for non-Linux
 - `ENABLE_UPDATE_CHECKER` (OFF) Enable update checking functionality
-  - `EGLANTINE_UPDATE_REPO` (Djihads80/Eglantine) GitHub repository whose releases the update checker and the news applet read
-  - `EGLANTINE_BUILD_TAG` (empty) Release tag CI publishes this build under, `<channel>-build-<number>`. The update checker offers newer releases of the same channel; builds without a tag never report updates
-  - `EGLANTINE_BUILD_PLATFORM` (empty) Platform suffix of this build's release file, such as `linux-x86_64-pgo`, so the updater downloads the same variant
+  - `LICHII_BUILD_TAG` (empty) Published `build-N` tag. Builds without it never check for updates.
+  - `LICHII_BUILD_PLATFORM` (empty) Release asset platform and variant, such as `linux-x86_64-pgo`. CI sets this from its build matrix.
 - `YUZU_DISABLE_LLVM` (OFF) Do not attempt to link to the LLVM demangler
   - Really only useful for CI or distribution builds
 

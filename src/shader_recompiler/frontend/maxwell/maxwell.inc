@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+INST(TENSOR_MUL_ADD, "TENSOR_MUL_ADD", "0101 1101 0011 0---")
 INST(CCTLT,        "CCTLT",          "1110 1011 1111 0--0")
 INST(AL2P,         "AL2P",           "1110 1111 1010 0---")
 INST(ALD,          "ALD",            "1110 1111 1101 1---")
@@ -42,7 +43,6 @@ INST(HFMA2_reg,    "HFMA2 (reg)",    "0101 1101 0000 0---")
 INST(HMUL2_reg,    "HMUL2 (reg)",    "0101 1101 0000 1---")
 INST(HSET2_reg,    "HSET2 (reg)",    "0101 1101 0001 1---")
 INST(HSETP2_reg,   "HSETP2 (reg)",   "0101 1101 0010 0---")
-INST(TENSOR_MUL_ADD, "TENSOR_MUL_ADD", "0101 1101 0011 0---")
 INST(I2F_cbuf,     "I2F (cbuf)",     "0100 1100 1011 1---")
 INST(I2F_reg,      "I2F (reg)",      "0101 1100 1011 1---")
 INST(I2I_cbuf,     "I2I (cbuf)",     "0100 1100 1110 0---")
@@ -56,6 +56,7 @@ INST(IMNMX_reg,    "IMNMX (reg)",    "0101 1100 0010 0---")
 INST(IMUL_cbuf,    "IMUL (cbuf)",    "0100 1100 0011 1---")
 INST(IMUL_reg,     "IMUL (reg)",     "0101 1100 0011 1---")
 INST(ISBERD,       "ISBERD",         "1110 1111 1101 0---")
+INST(ISBE_nx2,     "ISBE (nx2)",     "1110 1111 1100 0---")
 INST(ISCADD_cbuf,  "ISCADD (cbuf)",  "0100 1100 0001 1---")
 INST(ISCADD_reg,   "ISCADD (reg)",   "0101 1100 0001 1---")
 INST(LDC,          "LDC",            "1110 1111 1001 0---")

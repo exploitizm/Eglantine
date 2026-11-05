@@ -412,7 +412,9 @@ void PresentManager::CopyToSwapchain(Frame* frame) {
             // Draw to swapchain.
             return CopyToSwapchainImpl(frame);
         } catch (const vk::Exception& except) {
-            if (except.GetResult() != VK_ERROR_SURFACE_LOST_KHR) {
+            const VkResult result = except.GetResult();
+            if (result != VK_ERROR_SURFACE_LOST_KHR && result != VK_INCOMPLETE &&
+                result != VK_ERROR_OUT_OF_DATE_KHR && result != VK_ERROR_NATIVE_WINDOW_IN_USE_KHR) {
                 throw;
             }
 
@@ -432,6 +434,10 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         swapchain.GetWidth() != frame->width || swapchain.GetHeight() != frame->height;
     if (is_suboptimal || size_changed) {
         RecreateSwapchain(frame);
+    }
+    if (!swapchain.IsCreated()) {
+        DiscardFrame(frame);
+        return;
     }
 
     while (swapchain.AcquireNextImage(!use_present_thread)) {

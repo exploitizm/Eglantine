@@ -21,8 +21,8 @@
 #include "common/polyfill_thread.h"
 #include "common/unique_function.h"
 #include "shader_recompiler/environment.h"
+#include "shader_recompiler/frontend/ampere/instruction.h"
 #include "video_core/engines/maxwell_3d.h"
-#include "video_core/host1x/gpu_device_memory_manager.h"
 
 namespace Tegra {
 class Memorymanager;
@@ -33,29 +33,27 @@ namespace VideoCommon {
 /// A native (Switch 2) program after capture and lowering to Maxwell code. The shader cache keeps
 /// it so the environments built for the program's pipelines don't capture and lower it again.
 struct LoweredNativeCode {
+    u64 native_program_key{};
     /// Shader header, lowered instructions with Maxwell scheduling words, then the native
     /// address map (what the environment's `code` used to be filled with).
     std::vector<u64> code;
+    std::vector<Shader::Ampere::Instruction> trap_prefix;
     /// Bytes of the native program that were read, header included.
     size_t source_size{};
     /// Constant buffer holding the texture handles if the program requires one, otherwise ~0U
     /// (the engine's register value is used).
     u32 texture_bound = ~0U;
-    /// Constant buffer for surface descriptors, when the program needs another than texture_bound.
-    u32 surface_bound = ~0U;
 };
 
 class GenericEnvironment : public Shader::Environment {
 public:
     explicit GenericEnvironment() = default;
     explicit GenericEnvironment(Tegra::MemoryManager& gpu_memory_, GPUVAddr program_base_,
-                                u32 start_address_, bool support_cooperative_matrix_ = false);
+                                u32 start_address_);
 
     ~GenericEnvironment() override;
 
     [[nodiscard]] u32 TextureBoundBuffer() const final;
-
-    [[nodiscard]] u32 SurfaceBoundBuffer() const final;
 
     [[nodiscard]] u32 LocalMemorySize() const final;
 
@@ -66,6 +64,10 @@ public:
     [[nodiscard]] u64 ReadInstruction(u32 address) final;
 
     [[nodiscard]] u32 TranslateProgramAddress(u32 address) const override;
+
+    [[nodiscard]] bool IsNativeProgram() const override;
+
+    [[nodiscard]] bool IsCbufStorageBufferPointer(u32 index, u32 offset) override;
 
     [[nodiscard]] std::optional<u64> Analyze();
 
@@ -96,14 +98,17 @@ public:
     bool HasHLEMacroState() const override {
         return has_hle_engine_state;
     }
+    bool HasNativeInstructions() const override;
 
 protected:
     std::optional<u64> TryFindSize();
+    virtual std::optional<u32> ReadTrapGuardConstant(u32, u32) { return std::nullopt; }
 
     /// Adopts an already lowered native program, or captures and lowers it when there is none.
     void InitializeNativeCode(std::shared_ptr<const LoweredNativeCode> lowered,
-                              u32 source_header_size = 128);
-    std::shared_ptr<const LoweredNativeCode> LowerNativeCode(u32 source_header_size);
+                              u32 source_header_size = 128, bool geometry_stage = false);
+    std::shared_ptr<const LoweredNativeCode> LowerNativeCode(u32 source_header_size,
+                                                          bool geometry_stage);
     size_t native_source_size{};
     std::shared_ptr<const LoweredNativeCode> lowered_native;
 
@@ -117,11 +122,11 @@ protected:
     ::Common::unordered_map<u32, Shader::TextureType> texture_types;
     ::Common::unordered_map<u32, Shader::TexturePixelFormat> texture_pixel_formats;
     ::Common::unordered_map<u64, u32> cbuf_values;
+    ::Common::unordered_map<u64, u8> storage_pointer_types; ///< IsCbufStorageBufferPointer answers
     ::Common::unordered_map<u64, Shader::ReplaceConstant> cbuf_replacements;
 
     u32 local_memory_size{};
     u32 texture_bound{};
-    u32 surface_bound = ~0U; ///< ~0U: unset, surfaces use texture_bound
     u32 shared_memory_size{};
     std::array<u32, 3> workgroup_size{};
 
@@ -136,7 +141,6 @@ protected:
 
     bool has_unbound_instructions = false;
     bool has_hle_engine_state = false;
-    bool support_cooperative_matrix = false;
 };
 
 class GraphicsEnvironment final : public GenericEnvironment {
@@ -146,8 +150,7 @@ public:
                                  Tegra::MemoryManager& gpu_memory_,
                                  Tegra::Engines::Maxwell3D::Regs::ShaderType program,
                                  GPUVAddr program_base_, u32 start_address_,
-                                 std::shared_ptr<const LoweredNativeCode> lowered_native_ = {},
-                                 bool support_cooperative_matrix_ = false);
+                                 std::shared_ptr<const LoweredNativeCode> lowered_native_ = {});
 
     ~GraphicsEnvironment() override = default;
 
@@ -163,44 +166,9 @@ public:
 
     std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32 bank, u32 offset) override;
 
-    /// Copies what translation reads from the 3D engine and stops using the engine, so the
-    /// program can be translated on a worker thread while the GPU thread moves on. Returns
-    /// false, leaving the environment unchanged, when the texture pool is larger than the copy
-    /// bound or not fully mapped.
-    [[nodiscard]] bool Detach();
-
-    /// Bytes of constant buffer and texture descriptor contents copied by Detach (0 if not
-    /// detached).
-    [[nodiscard]] size_t SnapshotSizeBytes() const noexcept;
-
 private:
-    /// The 3D engine state a detached environment reads instead of the engine.
-    struct EngineSnapshot {
-        struct ConstBuffer {
-            bool enabled{};
-            u32 size{};
-            /// Contents when the environment was detached, one word longer than `size` so a
-            /// read at any offset below `size` stays inside the copy.
-            std::vector<u8> bytes;
-        };
-        std::array<ConstBuffer, Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers> const_buffers;
-
-        /// Texture descriptors (TIC entries 0 to the pool limit) when the environment was
-        /// detached.
-        std::vector<Tegra::Texture::TICEntry> texture_pool;
-        bool via_header_index{};
-
-        u32 viewport_scale_offset_enabled{};
-        ::Common::unordered_map<u64, Tegra::Engines::Maxwell3D::HLEReplacementAttributeType>
-            replace_table;
-    };
-
-    /// Texture descriptor (TIC entry) of a texture handle, from the engine or the snapshot.
-    Tegra::Texture::TICEntry ReadTextureDescriptor(u32 handle);
-
     Tegra::Engines::Maxwell3D* maxwell3d{};
     size_t stage_index{};
-    std::optional<EngineSnapshot> snapshot;
 };
 
 class ComputeEnvironment final : public GenericEnvironment {
@@ -209,8 +177,7 @@ public:
     explicit ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_compute_,
                                 Tegra::MemoryManager& gpu_memory_, GPUVAddr program_base_,
                                 u32 start_address_,
-                                std::shared_ptr<const LoweredNativeCode> lowered_native_ = {},
-                                bool support_cooperative_matrix_ = false);
+                                std::shared_ptr<const LoweredNativeCode> lowered_native_ = {});
 
     ~ComputeEnvironment() override = default;
 
@@ -230,8 +197,12 @@ public:
     }
 
 private:
+    std::optional<u32> ReadTrapGuardConstant(u32 bank, u32 offset) override;
     Tegra::Engines::KeplerCompute* kepler_compute{};
 };
+
+std::optional<u32> ReadNativeGuardConstant(Tegra::Engines::KeplerCompute& compute,
+                                         Tegra::MemoryManager& memory, u32 bank, u32 offset);
 
 class FileEnvironment final : public Shader::Environment {
 public:
@@ -250,6 +221,10 @@ public:
 
     [[nodiscard]] u32 TranslateProgramAddress(u32 address) const override;
 
+    [[nodiscard]] bool IsNativeProgram() const override;
+
+    [[nodiscard]] bool IsCbufStorageBufferPointer(u32 index, u32 offset) override;
+
     [[nodiscard]] u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) override;
 
     [[nodiscard]] Shader::TextureType ReadTextureType(u32 handle) override;
@@ -266,8 +241,6 @@ public:
 
     [[nodiscard]] u32 TextureBoundBuffer() const override;
 
-    [[nodiscard]] u32 SurfaceBoundBuffer() const override;
-
     [[nodiscard]] std::array<u32, 3> WorkgroupSize() const override;
 
     [[nodiscard]] std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32 bank,
@@ -276,6 +249,7 @@ public:
     [[nodiscard]] bool HasHLEMacroState() const override {
         return cbuf_replacements.size() != 0;
     }
+    bool HasNativeInstructions() const override;
 
     void Dump(u64 pipeline_hash, u64 shader_hash) override;
 
@@ -284,12 +258,12 @@ private:
     ::Common::unordered_map<u32, Shader::TextureType> texture_types;
     ::Common::unordered_map<u32, Shader::TexturePixelFormat> texture_pixel_formats;
     ::Common::unordered_map<u64, u32> cbuf_values;
+    ::Common::unordered_map<u64, u8> storage_pointer_types;
     ::Common::unordered_map<u64, Shader::ReplaceConstant> cbuf_replacements;
     std::array<u32, 3> workgroup_size{};
     u32 local_memory_size{};
     u32 shared_memory_size{};
     u32 texture_bound{};
-    u32 surface_bound = ~0U; ///< ~0U: unset, surfaces use texture_bound
     u32 read_lowest{};
     u32 read_highest{};
     u32 initial_offset{};

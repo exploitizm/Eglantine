@@ -8,7 +8,6 @@
 
 #include "core/core.h"
 #include "core/core_timing.h"
-#include "core/hardware_properties.h"
 #include "core/hle/kernel/k_memory_manager.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_resource_limit.h"
@@ -202,7 +201,7 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle 
         }
     }
     case InfoType::ThreadTickCount: {
-        constexpr u64 num_cpus = Core::Hardware::NUM_CPU_CORES;
+        constexpr u64 num_cpus = 4;
         if (info_sub_id != 0xFFFFFFFFFFFFFFFF && info_sub_id >= num_cpus) {
             LOG_ERROR(Kernel_SVC, "Core count is out of range, expected {} but got {}", num_cpus, info_sub_id);
             R_THROW(ResultInvalidCombination);

@@ -19,15 +19,27 @@ public:
         // clang-format off
         static const FunctionInfo functions[] = {
             {10, D<&IGraphicsScaleController::GetCurrentGraphicsScale>, "GetCurrentGraphicsScale"},
+            {1050, D<&IGraphicsScaleController::SetGraphicsScaleChangedNotificationEnabled>, "SetGraphicsScaleChangedNotificationEnabled"},
         };
         // clang-format on
         RegisterHandlers(functions);
     }
 
 private:
-    Result GetCurrentGraphicsScale(Out<u32> out_scale) {
+    // The reply is 12 bytes; only the first word (the scale) is known. The other two used to be
+    // left to the message buffer's leftovers.
+    Result GetCurrentGraphicsScale(Out<u32> out_scale, Out<u32> out_unknown1, Out<u32> out_unknown2) {
         LOG_WARNING(Service_AM, "(STUBBED) called, returning 10");
         *out_scale = 10;
+        *out_unknown1 = 0;
+        *out_unknown2 = 0;
+        R_SUCCEED();
+    }
+
+    // nn::oe::SetGraphicsScaleChangedNotificationEnabled(bool). The scale never changes here, so
+    // there is nothing to notify.
+    Result SetGraphicsScaleChangedNotificationEnabled(bool enabled) {
+        LOG_INFO(Service_AM, "called, enabled={}", enabled);
         R_SUCCEED();
     }
 };

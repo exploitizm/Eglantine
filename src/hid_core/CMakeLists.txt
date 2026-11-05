@@ -5,6 +5,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_library(hid_core STATIC
+    resources/six_axis/sensor_info.h
     frontend/emulated_console.cpp
     frontend/emulated_console.h
     frontend/emulated_controller.cpp
@@ -154,7 +155,7 @@ else()
         $<$<COMPILE_LANGUAGE:C,CXX>:-Wconversion>
         $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-sign-conversion>
         $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-cast-function-type>
-        $<$<CXX_COMPILER_ID:AppleClang,Clang>:-fsized-deallocation>)
+        $<$<CXX_COMPILER_ID:Clang>:-fsized-deallocation>)
 endif()
 
 create_target_directory_groups(hid_core)

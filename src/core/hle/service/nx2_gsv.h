@@ -15,23 +15,24 @@
 #include <cstdlib>
 #include <cstdio>
 #include <initializer_list>
+#include <limits>
 #include <atomic>
 #include <deque>
 #include <map>
-#include <limits>
 #include <optional>
 #include <memory>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #include "common/alignment.h"
 #include "common/div_ceil.h"
+#include "common/dkb_frame_trace.h"
+#include "common/game_presets.h"
 #include "common/settings.h"
-#include "common/swap.h"
 #include "common/thread.h"
 #include "core/core.h"
-#include "core/hle/service/nx2_present.h"
-#include "core/hle/service/nx2_sparse_region.h"
+#include "core/arm/dynarmic/window_trace.h"
 #include "core/device_memory.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
@@ -49,9 +50,12 @@
 #include "core/hle/kernel/k_resource_limit.h"
 #include "core/hle/kernel/k_server_session.h"
 #include "core/hle/kernel/k_event.h"
+#include "core/hle/kernel/k_hardware_timer.h"
 #include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/kernel/k_session.h"
+#include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/k_transfer_memory.h"
+#include "core/hle/kernel/svc_results.h"
 #include "core/memory.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/nx2_video_decoder.h"
@@ -66,7 +70,10 @@
 #include "core/hle/service/nvdrv/nvdrv.h"
 #include "core/hle/service/nvdrv/nvdrv_interface.h"
 #include "core/hle/service/nx2_stub_interface.h"
-#include "core/hle/service/nx2_decoder_image.h"
+#include "core/hle/service/nx2_image_layout.h"
+#include "core/hle/service/nx2_video_input_queue.h"
+#include "core/hle/service/nx2_present_pacer.h"
+#include "core/hle/service/nx2_video_ready.h"
 #include "core/hle/service/sm/sm.h"
 #include "core/hle/service/server_manager.h"
 #include "core/hle/service/service.h"
@@ -108,6 +115,14 @@ inline void TipcReplyWords(HLERequestContext& ctx, std::initializer_list<u32> wo
     TipcReplyWords(ctx, std::span<const u32>{words.begin(), words.size()});
 }
 
+// TIPC 0(u64 token) on the Switch 2 sessions: a handshake newer SDKs send first; the reply echoes
+// the token. (The auto stub's reply only echoed it by leaving the request's words in place.)
+inline void TipcHandshake(HLERequestContext& ctx, std::string_view session) {
+    const auto* w = ctx.CommandBuffer();
+    LOG_INFO(Service, "{} TIPC 0 handshake {:#x}", session, u64{w[2]} | (u64{w[3]} << 32));
+    TipcReplyWords(ctx, {w[2], w[3]});
+}
+
 // Replies with success and a copied handle to a new session served by `iface`.
 template <class T>
 inline void ReturnRawSession(Core::System& system, HLERequestContext& ctx, std::shared_ptr<T> iface) {
@@ -124,21 +139,21 @@ public:
     explicit INx2NvsrvSession(Core::System& system_) : ServiceFramework{system_, "nx2:nvsrv"} {}
 };
 
+// GPU time session handed out by gsv 1121. Welcome Tour opens it during graphics setup and
+// terminated with InvalidHandle (0xe401) when the zeroed reply carried no session handle.
 class INx2GpuTimeSession final : public ServiceFramework<INx2GpuTimeSession> {
 public:
     explicit INx2GpuTimeSession(Core::System& system_)
         : ServiceFramework{system_, "nx2:gpu_time"} {
         RegisterHandlersTipc({
             {0, &INx2GpuTimeSession::Handshake, "Handshake"},
-            {11, &INx2GpuTimeSession::QueryApplicationGpuTimeSpan,
-             "QueryApplicationGpuTimeSpan"},
+            {11, &INx2GpuTimeSession::QueryApplicationGpuTimeSpan, "QueryApplicationGpuTimeSpan"},
         });
     }
 
 private:
     void Handshake(HLERequestContext& ctx) {
-        const auto* words = ctx.CommandBuffer();
-        TipcReplyWords(ctx, {words[2], words[3]});
+        TipcHandshake(ctx, "nx2:gpu_time");
     }
 
     void QueryApplicationGpuTimeSpan(HLERequestContext& ctx) {
@@ -168,6 +183,8 @@ public:
             {103, &INx2SyncptSession::QueryCounter, "QueryCounter"},
             {201, &INx2SyncptSession::RequestSlotEvent, "RequestSlotEvent (guessed)"},
             {202, &INx2SyncptSession::CancelSlotEvent, "CancelSlotEvent (guessed)"},
+            // Firmware commands without a known meaning: zeroed replies.
+            {21, &INx2SyncptSession::StubReplyZeroed, "Unknown21"},
         });
     }
 
@@ -189,9 +206,7 @@ public:
 private:
     // Newer SDKs (title 1) open with TIPC 0(u64 token) and abort unless the reply echoes it.
     void Handshake(HLERequestContext& ctx) {
-        const auto* w = ctx.CommandBuffer();
-        LOG_INFO(Service, "nx2:syncpt TIPC 0 handshake {:#x}", u64{w[2]} | (u64{w[3]} << 32));
-        TipcReplyWords(ctx, {w[2], w[3]});
+        TipcHandshake(ctx, "nx2:syncpt");
     }
 
     void GetCount(HLERequestContext& ctx) {
@@ -272,8 +287,8 @@ private:
                 if (!shared->alive) {
                     return;
                 }
-                event->Signal(kernel);
                 request.pending = false;
+                event->Signal(kernel);
             });
         TipcReplyWords(ctx, {});
     }
@@ -328,6 +343,7 @@ public:
     explicit INx2GpuSession(Core::System& system_)
         : ServiceFramework{system_, "nx2:gpu"}, m_context{system_, "nx2:gpu"} {
         RegisterHandlersTipc({
+            {0, &INx2GpuSession::Handshake, "Handshake"},
             {11, &INx2GpuSession::GetIdRange, "GetIdRange (guessed)"},
             {12, &INx2GpuSession::GetIdEvent, "GetIdEvent (guessed)"},
             {21, &INx2GpuSession::Start, "Start (guessed)"},
@@ -347,10 +363,22 @@ public:
             {214, &INx2GpuSession::SubCreateGpuOnlyRegion, "CreateSparseRegion"},
             {215, &INx2GpuSession::SubDestroySparseRegion, "DestroySparseRegion"},
             {216, &INx2GpuSession::SubSparseMap, "ExecuteSparseMapRequests"},
+            // Firmware commands without a known meaning: zeroed replies.
+            {23, &INx2GpuSession::StubReplyZeroed, "Unknown23"},
+            {24, &INx2GpuSession::StubReplyZeroed, "Unknown24"},
+            {25, &INx2GpuSession::StubReplyZeroed, "Unknown25"},
+            {34, &INx2GpuSession::StubReplyZeroed, "Unknown34"},
+            {51, &INx2GpuSession::StubReplyZeroed, "Unknown51"},
+            {8001, &INx2GpuSession::StubReplyZeroed, "Unknown8001"},
+            {8002, &INx2GpuSession::StubReplyZeroed, "Unknown8002"},
+            {8003, &INx2GpuSession::StubReplyZeroed, "Unknown8003"},
+            {8004, &INx2GpuSession::StubReplyZeroed, "Unknown8004"},
         });
         if (LazySparseRegions()) {
             Tegra::Nx2SetSparseBacking(
-                [this](u64 gpu_address, u64 size) { BackSparseWrite(gpu_address, size); });
+                [this](u64 gpu_address, u64 size, const u8* data) {
+                    BackSparseWrite(gpu_address, size, data);
+                });
         }
     }
 
@@ -365,6 +393,10 @@ public:
     }
 
 private:
+    void Handshake(HLERequestContext& ctx) {
+        TipcHandshake(ctx, "nx2:gpu");
+    }
+
     static constexpr u32 NumIds = 32;
 
     Kernel::KEvent* EventFor(u32 id) {
@@ -392,19 +424,6 @@ private:
         const u32 id = ctx.CommandBuffer()[2];
         LOG_WARNING(Service, "(STUBBED) nx2:gpu TIPC 21 id={}, signalling completion", id);
         EventFor(id)->Signal(system.Kernel());
-        IPC::ResponseBuilder rb{ctx, 2};
-        rb.Push(ResultSuccess);
-    }
-
-    // 41(u64 name "NvRmGpu", u64 flags, u64 label): u32 device id. Id 0 is invalid to the SDK.
-    // ponytail: ids only count up; track and reuse them if a title creates devices in a loop.
-    void CreateGraphicsDevice(HLERequestContext& ctx) {
-        LOG_INFO(Service, "nx2:gpu 41 CreateGraphicsDevice flags={:#x} -> {}", ctx.CommandBuffer()[4],
-                 m_next_device);
-        TipcReplyWords(ctx, {m_next_device++});
-    }
-
-    void DestroyGraphicsDevice(HLERequestContext& ctx) {
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
@@ -439,9 +458,39 @@ private:
                              static_cast<u32>(second), static_cast<u32>(second >> 32)});
     }
 
+    // An empty partition is min = ~0, max = 0 (min > max). Fire Emblem: Fortune's Weave's SDK
+    // reads (0, 0) as a one-byte partition at address 0 and aborts in nn::gpu::sdk.
     void GetGsvPartition(HLERequestContext& ctx) {
         LOG_WARNING(Service, "(STUBBED) nx2:gpu TIPC 202 [2]={:#x}, empty", ctx.CommandBuffer()[2]);
-        TipcReplyWords(ctx, {0, 0, 0, 0});
+        TipcReplyWords(ctx, {~0U, ~0U, 0, 0});
+    }
+
+    // Fire Emblem: Fortune's Weave: 41(name u64, flags u64, debug label u64) returns a device id
+    // that later NvRm calls name; 0 is not a valid id. Only flags 0 has been seen.
+    void CreateGraphicsDevice(HLERequestContext& ctx) {
+        const auto* b = ctx.CommandBuffer();
+        const u64 name = u64{b[2]} | (u64{b[3]} << 32);
+        const u64 flags = u64{b[4]} | (u64{b[5]} << 32);
+        u32 id = 0;
+        for (u32 candidate = 1; candidate < m_devices.size(); ++candidate) {
+            if (!m_devices[candidate]) {
+                m_devices[candidate] = true;
+                id = candidate;
+                break;
+            }
+        }
+        LOG_INFO(Service, "nx2:gpu 41 create graphics device name={:#x} flags={:#x} -> id {}", name,
+                 flags, id);
+        IPC::ResponseBuilder rb{ctx, 3};
+        rb.Push(id != 0 ? ResultSuccess : Kernel::ResultOutOfResource);
+        rb.Push(id);
+    }
+
+    void DestroyGraphicsDevice(HLERequestContext& ctx) {
+        const u32 id = ctx.CommandBuffer()[2] & 0xff;
+        const bool existed = id < m_devices.size() && std::exchange(m_devices[id], false);
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(existed ? ResultSuccess : Kernel::ResultNotFound);
     }
 
     void OpenSubSession(HLERequestContext& ctx) {
@@ -471,10 +520,6 @@ private:
         // GpuMemoryHandle that later map jobs (211) name.
         const u32 handle = m_next_memory_handle++;
         m_memory[handle] = {start, last - start + 1};
-        if (std::getenv("EDEN_NX2_IMAGE_TRACE") != nullptr) {
-            LOG_INFO(Service, "nx2:gpu mapping register handle={} cpu={:#x} size={:#x}",
-                     handle, start, last - start + 1);
-        }
         TipcReplyWords(ctx, {handle});
     }
 
@@ -506,11 +551,7 @@ private:
             // Also at the memory's own address: an earlier 213 may have unmapped the mapping 101
             // made there.
             const u64 cpu = it->second.address + c;
-            if (std::getenv("EDEN_NX2_IMAGE_TRACE") != nullptr) {
-                LOG_INFO(Service, "nx2:gpu mapping job handle={} gpu={:#x} cpu={:#x} size={:#x}",
-                         handle, a, cpu, b - a + 1);
-            }
-            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapAt(a, cpu, b - a + 1);
+            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapAt(handle, c, a, cpu, b - a + 1);
         } else {
             LOG_WARNING(Service, "nx2:gpu 211 map of unknown handle {}", handle);
         }
@@ -563,14 +604,10 @@ private:
         const u32 handle = w[2];
         if (const auto it = m_memory.find(handle); it != m_memory.end()) {
             const auto [address, size] = it->second;
-            if (std::getenv("EDEN_NX2_IMAGE_TRACE") != nullptr) {
-                LOG_INFO(Service, "nx2:gpu mapping destroy handle={} cpu={:#x} size={:#x}",
-                         handle, address, size);
-            }
             LOG_DEBUG(Service, "nx2:gpu 102 destroy handle={} [{:#x}, +{:#x}] slot={}", handle,
                       address, size, w[3]);
             if (size != 0) {
-                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unregister(address, size);
+                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(address, size);
             }
             if (size == 0x2000) {
                 Tegra::Nx2RemoveSemaphoreRegion(address);
@@ -588,12 +625,6 @@ private:
     // server backs it itself: the client never maps anything there but renders into it (title 4
     // keeps its render targets in six 300 MB regions at 0x81_0000_0000). Back each region with
     // kernel memory placed in the process's alias code region and map that for the GPU.
-    //
-    // 214 and 215 change the service's state under m_region_mutex and call the registry and the GPU
-    // queue after it: the registry's listeners queue work for the GPU thread, which waits for room
-    // in a full queue, and the GPU thread takes m_region_mutex in BackSparseWrite. Holding it across
-    // them stopped Mario Kart World at its first load screen. Freeing, allocating and mapping memory
-    // wait on the guest page table lock, so they are not under it either (see AllocateGpuOnlyBacking).
     void SubCreateGpuOnlyRegion(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         const u64 start = u64{w[3]} | (u64{w[4]} << 32);
@@ -603,6 +634,7 @@ private:
                  w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12]);
         if (last > start && ((last + 1 - start) % Core::Memory::YUZU_PAGESIZE) == 0) {
             const u64 size = last + 1 - start;
+            std::scoped_lock lk{m_region_mutex};
             FreeReleasedRegions();
             if ((w[7] & SparseRegionFlag) == 0) {
                 m_gpu_only_ranges[start] = size; // kept out of 216, however it is backed
@@ -611,27 +643,35 @@ private:
                 // Title 1's terrain texture arrays and layer pools (170 MB-5.8 GB, mostly empty):
                 // backed whole, they ran the pool dry and the later ones got no memory at all.
                 // The region gets a device range of its own, unbacked pages read zero, and
-                // BackSparseWrite gives a block memory before the GPU writes into it. The registry
-                // knows the region before the service records it, so no block is backed for a
-                // region the registry lacks.
-                if (Nvidia::Devices::Nx2GpuMemoryRegistry::Get().CreateSparse(start, size)) {
-                    std::scoped_lock lk{m_region_mutex};
-                    m_sparse_regions.emplace(start, SparseRegion{size, ++m_sparse_generation});
-                    Tegra::Nx2SparseRegionCreated(start, size, SparseBlockSize);
-                    Tegra::Nx2AddSparseSpan(start, size);
-                    LOG_INFO(Service, "nx2:gpu 214 sparse region [{:#x}, {:#x}] backed as the GPU writes it",
-                             start, last);
-                }
-            } else if (auto backing = AllocateGpuOnlyBacking(size, true, false)) {
-                const u64 address = backing->address;
-                {
-                    std::scoped_lock lk{m_region_mutex};
-                    RegisterGpuOnlyBacking(start, std::move(*backing));
-                    LOG_INFO(Service, "nx2:gpu 214 GPU-only region [{:#x}, {:#x}] backed at {:#x} "
-                                      "({} MiB of GPU-only memory in use, peak {} MiB)",
-                             start, last, address, m_gpu_only_bytes >> 20, m_gpu_only_peak >> 20);
-                }
-                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapAt(start, address, size);
+                // BackSparseWrite gives a block memory before the GPU writes into it.
+                m_sparse_regions[start] = {
+                    .size = size,
+                    .blocks = std::vector<u8>(Common::DivCeil(size, SparseBlockSize)),
+                };
+                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().CreateSparse(start, size);
+                Tegra::Nx2SparseRegionCreated(start, size, SparseBlockSize);
+                Tegra::Nx2AddSparseSpan(start, size);
+                LOG_INFO(Service, "nx2:gpu 214 sparse region [{:#x}, {:#x}] backed as the GPU writes it",
+                         start, last);
+            } else if (LazyGpuOnlyRegions()) {
+                // The rest is written by the host GPU, not through guest memory (title 1's and
+                // title 4's render targets, 285-300 MB regions): like a sparse region it gets a
+                // device range of its own and memory per block only when something writes guest
+                // memory there (downloads, copies). The texture cache sees ordinary memory.
+                m_sparse_regions[start] = {
+                    .gpu_only = true,
+                    .size = size,
+                    .blocks = std::vector<u8>(Common::DivCeil(size, SparseBlockSize)),
+                };
+                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().CreateSparse(start, size);
+                Tegra::Nx2AddSparseSpan(start, size);
+                LOG_INFO(Service, "nx2:gpu 214 GPU-only region [{:#x}, {:#x}] backed as it is written",
+                         start, last);
+            } else if (const auto address = BackGpuOnlyRegion(start, size)) {
+                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapAt(start, *address, size);
+                LOG_INFO(Service, "nx2:gpu 214 GPU-only region [{:#x}, {:#x}] backed at {:#x} "
+                                  "({} MiB of GPU-only memory in use, peak {} MiB)",
+                         start, last, *address, m_gpu_only_bytes >> 20, m_gpu_only_peak >> 20);
             }
         } else {
             LOG_WARNING(Service, "nx2:gpu 214 unexpected region [{:#x}, {:#x}]", start, last);
@@ -651,73 +691,40 @@ private:
         const u64 last = u64{w[5]} | (u64{w[6]} << 32);
         LOG_DEBUG(Service, "nx2:gpu 215 destroy sparse region [{:#x}, {:#x}] words {:#x} {:#x} {:#x} {:#x}",
                  first, last, w[1], w[2], w[7], w[8]);
+        std::scoped_lock lk{m_region_mutex};
         FreeReleasedRegions();
-        {
-            std::scoped_lock lk{m_region_mutex};
-            if (m_gpu_only_ranges.erase(first) != 0 && last > first) {
-                std::vector<std::function<void()>> changes;
-                DropGpuOnlyTiles(first, last - first + 1, false, changes);
-                m_shared_regions.erase(first);
-                std::erase_if(m_shared_memory, [first](const auto& entry) {
-                    return entry.second == first;
-                });
-            }
+        if (m_gpu_only_ranges.erase(first) != 0 && last > first) {
+            DropGpuOnlyTiles(first, last - first + 1, false);
+            m_shared_regions.erase(first);
+            std::erase_if(m_shared_memory, [first](const auto& entry) { return entry.second == first; });
         }
         if (last > first) {
-            const u64 size = last - first + 1;
-            bool sparse_region = false;
-            bool released = true;
-            struct Backing {
-                u64 cpu_address;
-                u64 size;
-                std::shared_ptr<std::atomic<bool>> done;
-            };
-            std::vector<Backing> backings;
-            {
-                // Only the service's own state here; the registry and the GPU queue after it.
-                std::scoped_lock lk{m_region_mutex};
-                if (const auto sparse = m_sparse_regions.find(first); sparse != m_sparse_regions.end()) {
-                    if (sparse->second.size == size) {
-                        sparse_region = true;
-                        m_tile_bytes -= Core::Memory::YUZU_PAGESIZE *
-                            static_cast<u64>(std::count(sparse->second.tile_pages.begin(),
-                                                       sparse->second.tile_pages.end(), true));
-                        m_sparse_regions.erase(sparse);
-                        m_region_cv.notify_all();
-                        Tegra::Nx2SparseRegionDestroyed(first);
-                    } else {
-                        LOG_ERROR(Service, "nx2:gpu 215 range [{:#x}, {:#x}] does not match its sparse region",
-                                  first, last);
-                        released = false;
-                    }
-                }
-                // The region's backing: all of it, or the blocks a sparse region got as it was written.
-                for (auto region = m_gpu_only_regions.lower_bound(first);
-                     released && region != m_gpu_only_regions.end() && region->first <= last;) {
-                    if (region->first + region->second.size - 1 > last) {
-                        ++region;
-                        continue;
-                    }
-                    auto done = std::make_shared<std::atomic<bool>>(false);
-                    backings.push_back({region->second.cpu_address, region->second.size, done});
-                    m_released_regions.push_back({std::move(region->second), done});
-                    region = m_gpu_only_regions.erase(region);
-                }
+            if (const auto region = m_sparse_regions.find(first); region != m_sparse_regions.end()) {
+                m_tile_bytes -= Core::Memory::YUZU_PAGESIZE *
+                                static_cast<u64>(std::count(region->second.tile_pages.begin(),
+                                                            region->second.tile_pages.end(), true));
+                m_sparse_regions.erase(region);
+                Tegra::Nx2SparseRegionDestroyed(first);
+                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DestroySparse(first, last - first + 1);
+            } else {
+                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(first, last - first + 1);
             }
-                auto& registry = Nvidia::Devices::Nx2GpuMemoryRegistry::Get();
-            if (released) {
-                if (!sparse_region) {
-                    registry.Unmap(first, size);
-                } else if (!registry.DestroySparse(first, size)) {
-                    LOG_ERROR(Service, "nx2:gpu 215 sparse region [{:#x}, {:#x}] unknown to the registry",
-                              first, last);
+            // The region's backing: all of it, or the blocks a sparse region got as it was written.
+            std::shared_ptr<std::atomic<bool>> done;
+            for (auto region = m_gpu_only_regions.lower_bound(first);
+                 region != m_gpu_only_regions.end() && region->first <= last;) {
+                if (region->first + region->second.size - 1 > last) {
+                    ++region;
+                    continue;
                 }
-            }
-            for (const auto& backing : backings) {
-                registry.ReleaseBacking(backing.cpu_address, backing.size,
-                                        [&sys = system, done = backing.done] {
-                    sys.GPU().RunInOrder([done] { done->store(true, std::memory_order_release); });
-                });
+                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().ReleaseBacking(
+                    region->second.cpu_address, region->second.size);
+                if (!done) {
+                    done = std::make_shared<std::atomic<bool>>(false);
+                    system.GPU().RunInOrder([done] { done->store(true, std::memory_order_release); });
+                }
+                m_released_regions.push_back({std::move(region->second), done});
+                region = m_gpu_only_regions.erase(region);
             }
         }
         SignalAfterGpu(w[8]);
@@ -737,16 +744,15 @@ private:
         const auto data = ctx.BufferDescriptorA().empty() ? std::span<const u8>{} : ctx.ReadBufferA(0);
         const size_t count = data.size() / sizeof(SparseMapRequest);
         std::vector<u8> kinds(count);
-        std::vector<std::function<void()>> changes;
-        FreeReleasedRegions();
         {
             std::scoped_lock lk{m_region_mutex};
+            FreeReleasedRegions();
             ++m_tile_calls;
             for (size_t i = 0; i < count; ++i) {
                 SparseMapRequest request;
                 std::memcpy(&request, data.data() + i * sizeof(SparseMapRequest), sizeof(request));
                 kinds[i] = request.kind;
-                ApplySparseMapRequest(request, changes);
+                ApplySparseMapRequest(request);
             }
             // The first request, then at most every 30 s.
             const auto now = std::chrono::steady_clock::now();
@@ -762,7 +768,6 @@ private:
                          m_sparse_released_bytes >> 20);
             }
         }
-        for (auto& change : changes) change();
         if (!ctx.BufferDescriptorB().empty() && count != 0) {
             ctx.WriteBufferB(kinds.data(), kinds.size(), 0);
         }
@@ -770,38 +775,42 @@ private:
         TipcReplyWords(ctx, {static_cast<u32>(count), static_cast<u32>(u64{count} >> 32)});
     }
 
-    // Returns the pages of destroyed regions the GPU thread is done with to the kernel. Call it
-    // without m_region_mutex: the lock only covers taking them off the list, because unmapping
-    // waits on the guest page table lock (see AllocateGpuOnlyBacking).
-    void FreeReleasedRegions() {
-        std::vector<GpuOnlyRegion> done;
-        {
-            std::scoped_lock lk{m_region_mutex};
-            std::erase_if(m_released_regions, [&](ReleasedRegion& released) {
-                if (!released.done->load(std::memory_order_acquire)) {
-                    return false;
-                }
-                done.push_back(std::move(released.region));
-                return true;
-            });
+    static bool IsAllZero(const u8* data, size_t size) {
+        size_t i = 0;
+        for (; i + sizeof(u64) <= size; i += sizeof(u64)) {
+            u64 word;
+            std::memcpy(&word, data + i, sizeof(word));
+            if (word != 0) {
+                return false;
+            }
         }
+        for (; i < size; ++i) {
+            if (data[i] != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Returns the pages of destroyed regions the GPU thread is done with to the kernel.
+    void FreeReleasedRegions() {
         auto* const process = system.ApplicationProcess();
-        u64 freed = 0;
-        for (auto& region : done) {
+        std::erase_if(m_released_regions, [&](ReleasedRegion& released) {
+            if (!released.done->load(std::memory_order_acquire)) {
+                return false;
+            }
+            auto& region = released.region;
             if (process != nullptr &&
                 R_FAILED(process->GetPageTable().UnmapPageGroup(
                     region.cpu_address, *region.pages, Kernel::KMemoryState::IoMemory))) {
                 LOG_ERROR(Service, "nx2:gpu could not unmap GPU-only backing {:#x}+{:#x}",
                           region.cpu_address, region.size);
-                continue; // still mapped: keep its pages
+                return true; // still mapped: keep its pages
             }
             region.pages->Close(system.Kernel());
-            freed += region.size;
-        }
-        if (freed != 0) {
-            std::scoped_lock lk{m_region_mutex};
-            m_gpu_only_bytes -= freed;
-        }
+            m_gpu_only_bytes -= region.size;
+            return true;
+        });
     }
 
     struct MappedBacking {
@@ -830,8 +839,7 @@ private:
         if (R_FAILED(kernel_core.MemoryManager().AllocateAndOpen(
                 pg.get(), size / YUZU_PAGESIZE,
                 Kernel::KMemoryManager::EncodeOption(Kernel::KMemoryManager::Pool::SystemNonSecure,
-                                                     Kernel::KMemoryManager::Direction::FromBack),
-                false))) {
+                                                     Kernel::KMemoryManager::Direction::FromBack)))) {
             if (log_failure) {
                 LOG_ERROR(Service, "nx2:gpu 214 could not allocate {:#x} bytes", size);
             }
@@ -871,19 +879,46 @@ private:
 
     // Records a mapped backing for the region at gpu_address. Needs m_region_mutex.
     void RegisterGpuOnlyBacking(u64 gpu_address, MappedBacking&& backing) {
+        // A title may create the same region again from the same start with a different size
+        // (Mario Kart World walks 300 MB -> 600 MB -> 1 GB on the same address). Overwriting the
+        // entry used to drop the previous mapping without undoing it: the backing stayed mapped
+        // in the alias code region and its pages never went back to the pool, so the GPU-only
+        // total grew without bound (250 MiB -> 6.5 GiB in one session) until the process died.
+        // Release the old backing the same way 215 does, i.e. only once the GPU thread is past it.
+        if (const auto it = m_gpu_only_regions.find(gpu_address); it != m_gpu_only_regions.end()) {
+            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(gpu_address, it->second.size);
+            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().ReleaseBacking(it->second.cpu_address,
+                                                                        it->second.size);
+            auto done = std::make_shared<std::atomic<bool>>(false);
+            system.GPU().RunInOrder([done] { done->store(true, std::memory_order_release); });
+            m_gpu_only_bytes -= it->second.size;
+            m_released_regions.push_back({std::move(it->second), done});
+            m_gpu_only_regions.erase(it);
+        }
         m_gpu_only_regions[gpu_address] = {backing.address, backing.size, std::move(backing.pages)};
         m_gpu_only_bytes += backing.size;
         m_gpu_only_peak = (std::max)(m_gpu_only_peak, m_gpu_only_bytes);
+    }
+
+    // Needs m_region_mutex.
+    std::optional<u64> BackGpuOnlyRegion(u64 gpu_address, u64 size) {
+        auto backing = AllocateGpuOnlyBacking(size, true, false);
+        if (!backing) {
+            return std::nullopt;
+        }
+        const u64 address = backing->address;
+        RegisterGpuOnlyBacking(gpu_address, std::move(*backing));
+        return address;
     }
 
     // Runs before a GPU-side write that may land in a sparse region (Tegra::Nx2BackSparseWrite,
     // usually on the GPU thread): the blocks the write touches get memory, cleared, behind the
     // region's device pages. The GPU mapping stays as it is, so the images over the region keep
     // their storage and only see the write.
-    void BackSparseWrite(u64 gpu_address, u64 size) {
+    void BackSparseWrite(u64 gpu_address, u64 size, const u8* data) {
         struct Pending {
             u64 region;
-            SparseRegion::PendingBlock block;
+            u64 block;
         };
         std::vector<Pending> todo;
         const u64 end = gpu_address + size;
@@ -903,37 +938,72 @@ private:
             }
         };
         bool waits_for_other = false;
+        u64 zero_bytes = 0;
         {
             std::unique_lock lk{m_region_mutex};
             for_regions([&](u64 start, SparseRegion& region, u64 first, u64 last) {
                 for (u64 block = first; block <= last; ++block) {
-                    if (region.tiles && region.blocks[block] == SparseRegion::Block::Empty) {
-                        region.blocks[block] = SparseRegion::Block::Written;
+                    if (region.blocks[block] == BlockEmpty && region.tiles) {
+                        // The write lands in the game's own memory (a tile it mapped) or nowhere;
+                        // the texture cache only learns that the block has contents now.
+                        region.blocks[block] = BlockWritten;
                         Tegra::Nx2SparseBlockWritten(start, block);
-                    } else if (const auto pending = region.BeginBacking(block)) {
-                        todo.push_back({start, *pending});
-                    } else if (region.blocks[block] == SparseRegion::Block::Pending) {
+                    } else if (region.blocks[block] == BlockEmpty) {
+                        // Zeros over a block nobody wrote change nothing: it reads zero without
+                        // memory. Title 1 clears ~1 GB of them at boot.
+                        const u64 block_begin = start + block * SparseBlockSize;
+                        const u64 write_begin = (std::max)(gpu_address, block_begin);
+                        const u64 write_end = (std::min)(
+                            {end, block_begin + SparseBlockSize, start + region.size});
+                        if (data != nullptr &&
+                            IsAllZero(data + (write_begin - gpu_address), write_end - write_begin) &&
+                            !Tegra::Nx2SparseBlockIsWritten(start, block)) {
+                            zero_bytes += write_end - write_begin;
+                            continue;
+                        }
+                        region.blocks[block] = BlockPending;
+                        todo.push_back({start, block});
+                    } else if (region.blocks[block] == BlockPending) {
                         waits_for_other = true;
                     }
                 }
             });
         }
+        if (zero_bytes != 0) {
+            std::scoped_lock lk{m_region_mutex};
+            const u64 before = m_sparse_zero_bytes;
+            m_sparse_zero_bytes += zero_bytes;
+            if (before == 0 || (before >> 28) != (m_sparse_zero_bytes >> 28)) {
+                LOG_INFO(Service, "nx2:gpu {} MiB of zeros over unwritten sparse blocks left out "
+                                  "(they read zero without memory)",
+                         m_sparse_zero_bytes >> 20);
+            }
+        }
         // Allocating and mapping happens outside the lock (see AllocateGpuOnlyBacking).
         for (const auto& [start, block] : todo) {
-            auto backing = AllocateGpuOnlyBacking(block.size, false, true);
+            u64 block_size = SparseBlockSize;
+            {
+                std::scoped_lock lk{m_region_mutex};
+                const auto it = m_sparse_regions.find(start);
+                if (it != m_sparse_regions.end()) {
+                    block_size = (std::min)(SparseBlockSize, it->second.size - block * SparseBlockSize);
+                }
+            }
+            auto backing = AllocateGpuOnlyBacking(block_size, false, true);
             bool stale = false;
             {
                 std::scoped_lock lk{m_region_mutex};
                 const auto it = m_sparse_regions.find(start);
-                if (it == m_sparse_regions.end() || !it->second.IsPending(block)) {
+                if (it == m_sparse_regions.end() || block >= it->second.blocks.size()) {
                     stale = true; // the region was destroyed while its block was being backed
                 } else if (it->second.tiles) {
+                    // The game started mapping its tiles there meanwhile (216): no block.
                     stale = true;
-                    it->second.blocks[block.index] = SparseRegion::Block::Written;
-                    Tegra::Nx2SparseBlockWritten(start, block.index);
+                    it->second.blocks[block] = BlockWritten;
+                    Tegra::Nx2SparseBlockWritten(start, block);
                 } else if (!backing) {
                     auto& region = it->second;
-                    region.FinishBacking(block, false);
+                    region.blocks[block] = BlockFailed; // out of memory: not again for every write
                     if (!region.warned) {
                         region.warned = true;
                         LOG_WARNING(Service, "nx2:gpu sparse region at {:#x}: pool exhausted, GPU writes "
@@ -941,14 +1011,14 @@ private:
                                     start);
                     }
                 } else {
-                    const u64 block_address = start + block.index * SparseBlockSize;
+                    const u64 block_address = start + block * SparseBlockSize;
                     const u64 address = backing->address;
-                    it->second.FinishBacking(block, true);
+                    it->second.blocks[block] = BlockBacked;
                     RegisterGpuOnlyBacking(block_address, std::move(*backing));
                     Nvidia::Devices::Nx2GpuMemoryRegistry::Get().BackSparse(block_address, address,
-                                                                            block.size);
-                    Tegra::Nx2SparseBlockWritten(start, block.index);
-                    m_sparse_backed_bytes += block.size;
+                                                                            block_size);
+                    Tegra::Nx2SparseBlockWritten(start, block);
+                    m_sparse_backed_bytes += block_size;
                     if (++m_sparse_blocks == 1 || (m_sparse_blocks % 64) == 0) {
                         LOG_INFO(Service, "nx2:gpu {} sparse blocks backed ({} MiB); {} MiB of GPU-only "
                                           "memory in use, peak {} MiB",
@@ -975,7 +1045,7 @@ private:
                 bool pending = false;
                 for_regions([&](u64, SparseRegion& region, u64 first, u64 last) {
                     for (u64 block = first; block <= last; ++block) {
-                        pending |= region.blocks[block] == SparseRegion::Block::Pending;
+                        pending |= region.blocks[block] == BlockPending;
                     }
                 });
                 return !pending;
@@ -992,13 +1062,34 @@ private:
         return lazy;
     }
 
+    // EDEN_NX2_GPU_ONLY_LAZY=0 backs GPU-only regions whole, as before.
+    static bool LazyGpuOnlyRegions() {
+        static const bool lazy = [] {
+            const char* value = std::getenv("EDEN_NX2_GPU_ONLY_LAZY");
+            return value == nullptr || value[0] != '0';
+        }();
+        return lazy;
+    }
+
     static constexpr u32 SparseRegionFlag = 0x200; ///< Word 7 of 214 (0x60c arrays, 0xa0c pools)
-    using SparseRegion = Nx2SparseRegion;
-    static constexpr u64 SparseBlockSize = SparseRegion::BlockSize;
+    static constexpr u64 SparseBlockSize = 4ULL << 20;
+    static constexpr u8 BlockEmpty = 0;
+    static constexpr u8 BlockBacked = 1;
+    static constexpr u8 BlockFailed = 2;
+    static constexpr u8 BlockPending = 3; ///< Being allocated and mapped by BackSparseWrite
+    static constexpr u8 BlockWritten = 4; ///< Written in a region the game maps tiles into
+    struct SparseRegion {
+        bool gpu_only{};        ///< A GPU-only region (no sparse flag), backed lazily as well
+        u64 size;
+        std::vector<u8> blocks; ///< BlockEmpty / Backed / Failed / Pending / Written per block
+        bool warned{};          ///< Logged that the pool ran out for its blocks
+        bool tiles{};           ///< The game maps its own memory into it (216): no blocks
+        std::vector<bool> tile_pages; ///< Pages a tile maps, once `tiles`
+    };
     std::map<u64, SparseRegion> m_sparse_regions; ///< By GPU address
-    u64 m_sparse_generation{};
     u64 m_sparse_blocks{};       ///< Sparse blocks backed so far
     u64 m_sparse_backed_bytes{}; ///< Sparse region memory given out so far
+    u64 m_sparse_zero_bytes{};   ///< Zeros written over unwritten sparse blocks, left out
     u64 m_sparse_released_bytes{}; ///< Blocks given back once the game mapped tiles there
 
     // nn::gpu::sdk::SparseMapRequest (216), filled from NvRm's nvgpu_as_remap_op.
@@ -1025,26 +1116,31 @@ private:
     u64 m_tile_kept{}; ///< Maps into GPU-only regions that keep their own memory, left out
     u64 m_tile_bytes{}; ///< Sparse region pages a tile maps right now
 
-    void ApplySparseMapRequest(const SparseMapRequest& request,
-                             std::vector<std::function<void()>>& changes) {
+    void ApplySparseMapRequest(const SparseMapRequest& request) {
         ++m_tile_requests;
-        if (!Nvidia::Devices::Nx2GpuMappingTable::Valid(request.gpu_address, request.size)) {
+        if (request.size == 0) {
             return;
         }
         const u64 gpu_address = request.gpu_address;
         const u64 size = request.size;
+        if (size > std::numeric_limits<u64>::max() - gpu_address) {
+            LOG_WARNING(Service, "nx2:gpu 216 [{:#x}, +{:#x}] wraps the address space", gpu_address,
+                        size);
+            return;
+        }
+        auto& registry = Nvidia::Devices::Nx2GpuMemoryRegistry::Get();
         auto it = m_sparse_regions.upper_bound(gpu_address);
         SparseRegion* region = nullptr;
         u64 start = 0;
         if (it != m_sparse_regions.begin()) {
             --it;
-            if (gpu_address + size <= it->first + it->second.size) {
+            if (size <= it->second.size && gpu_address - it->first <= it->second.size - size) {
                 start = it->first;
                 region = &it->second;
             }
         }
         if (const auto gpu_only = GpuOnlyRegionOf(gpu_address, size)) {
-            ApplyGpuOnlyRequest(*gpu_only, request, changes);
+            ApplyGpuOnlyRequest(*gpu_only, request);
             return;
         }
         if (request.memory_handle == 0) {
@@ -1052,14 +1148,10 @@ private:
             LOG_DEBUG(Service, "nx2:gpu 216 unmap [{:#x}, +{:#x}]", gpu_address, size);
             if (region != nullptr) {
                 Tegra::Nx2SparseTilesMapped(start, gpu_address - start, size, false);
-                changes.push_back([gpu_address, size] {
-                    Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapSparseTile(gpu_address, 0, size);
-                });
+                registry.MapSparseTile(gpu_address, 0, size);
                 MarkTiles(*region, gpu_address - start, size, false);
             } else {
-                changes.push_back([gpu_address, size] {
-                    Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(gpu_address, size);
-                });
+                registry.Unmap(gpu_address, size);
             }
             return;
         }
@@ -1074,13 +1166,11 @@ private:
         LOG_DEBUG(Service, "nx2:gpu 216 map [{:#x}, +{:#x}] -> memory {} offset {:#x} kind {:#x}",
                   gpu_address, size, request.memory_handle, request.offset, request.kind);
         if (region == nullptr) {
-            changes.push_back([gpu_address, cpu_address, size] {
-                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapAt(gpu_address, cpu_address, size);
-            });
+            registry.MapAt(gpu_address, cpu_address, size);
             return;
         }
         if (!region->tiles) {
-            StartTiles(start, *region, changes);
+            StartTiles(start, *region);
         }
         // The game's memory already holds what the tile shows (title 1 fills nine world-sized
         // masks, R8/RG16/R16 at 8192-16384 texels, in its own memory before mapping them): the
@@ -1089,15 +1179,13 @@ private:
         const u64 first_block = (gpu_address - start) / SparseBlockSize;
         const u64 last_block = (gpu_address + size - 1 - start) / SparseBlockSize;
         for (u64 block = first_block; block <= last_block; ++block) {
-            if (region->blocks[block] == SparseRegion::Block::Empty) {
-                region->blocks[block] = SparseRegion::Block::Written;
+            if (region->blocks[block] == BlockEmpty) {
+                region->blocks[block] = BlockWritten;
             }
             Tegra::Nx2SparseBlockWritten(start, block);
         }
         Tegra::Nx2SparseTilesMapped(start, gpu_address - start, size, true);
-        changes.push_back([gpu_address, cpu_address, size] {
-            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapSparseTile(gpu_address, cpu_address, size);
-        });
+        registry.MapSparseTile(gpu_address, cpu_address, size);
         MarkTiles(*region, gpu_address - start, size, true);
     }
 
@@ -1109,7 +1197,7 @@ private:
             return std::nullopt;
         }
         --it;
-        if (gpu_address + size > it->first + it->second) {
+        if (size > it->second || gpu_address - it->first > it->second - size) {
             return std::nullopt;
         }
         return it->first;
@@ -1127,13 +1215,13 @@ private:
     // - Regions 214 backs as they are written: the texture cache reads an image's memory in full
     //   when it uploads it, which makes the game's pages behind it resident on the host, while
     //   unwritten blocks read as zero for free (title 1: ~1 GB less resident at 150 s).
-    void ApplyGpuOnlyRequest(u64 region, const SparseMapRequest& request,
-                             std::vector<std::function<void()>>& changes) {
+    void ApplyGpuOnlyRequest(u64 region, const SparseMapRequest& request) {
+        auto& registry = Nvidia::Devices::Nx2GpuMemoryRegistry::Get();
         const u64 gpu_address = request.gpu_address;
         const u64 size = request.size;
         if (request.memory_handle == 0) {
             ++m_tile_unmaps;
-            DropGpuOnlyTiles(gpu_address, size, true, changes);
+            DropGpuOnlyTiles(gpu_address, size, true);
             return;
         }
         ++m_tile_maps;
@@ -1158,7 +1246,7 @@ private:
                 if (m_shared_regions.insert(shared).second) {
                     const auto range = m_gpu_only_ranges.find(shared);
                     if (range != m_gpu_only_ranges.end()) {
-                        DropGpuOnlyTiles(shared, range->second, true, changes);
+                        DropGpuOnlyTiles(shared, range->second, true);
                     }
                     LOG_INFO(Service, "nx2:gpu GPU-only region at {:#x} shares memory with another: "
                                       "it keeps its own",
@@ -1167,10 +1255,8 @@ private:
             }
             return;
         }
-        DropGpuOnlyTiles(gpu_address, size, false, changes);
-        changes.push_back([gpu_address, cpu = memory->second.address + request.offset, size] {
-            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapAt(gpu_address, cpu, size);
-        });
+        DropGpuOnlyTiles(gpu_address, size, false);
+        registry.MapAt(gpu_address, memory->second.address + request.offset, size);
         m_gpu_only_tiles[gpu_address] = {size, region, request.memory_handle, request.offset};
         m_gpu_only_memory[{request.memory_handle, request.offset}] = {request.offset + size, region};
         m_gpu_only_tile_max = (std::max)(m_gpu_only_tile_max, size);
@@ -1206,7 +1292,7 @@ private:
             return std::nullopt;
         }
         --it;
-        if (gpu_address + size > it->first + it->second.size) {
+        if (size > it->second.size || gpu_address - it->first > it->second.size - size) {
             return std::nullopt;
         }
         return it->second.cpu_address + (gpu_address - it->first);
@@ -1214,8 +1300,8 @@ private:
 
     // Forgets the game's tiles in [gpu_address, +size) of GPU-only regions; with `restore` (an
     // unmap) those ranges show the region's own memory again, or nothing where it has none.
-    void DropGpuOnlyTiles(u64 gpu_address, u64 size, bool restore,
-                             std::vector<std::function<void()>>& changes) {
+    void DropGpuOnlyTiles(u64 gpu_address, u64 size, bool restore) {
+        auto& registry = Nvidia::Devices::Nx2GpuMemoryRegistry::Get();
         auto it = m_gpu_only_tiles.upper_bound(gpu_address);
         if (it != m_gpu_only_tiles.begin()) {
             const auto previous = std::prev(it);
@@ -1227,13 +1313,9 @@ private:
             const auto& [tile_address, tile] = *it;
             if (restore) {
                 if (const auto backing = OwnBackingOf(tile_address, tile.size)) {
-                    changes.push_back([tile_address, cpu = *backing, bytes = tile.size] {
-                        Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapAt(tile_address, cpu, bytes);
-                    });
+                    registry.MapAt(tile_address, *backing, tile.size);
                 } else {
-                    changes.push_back([tile_address, bytes = tile.size] {
-                        Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(tile_address, bytes);
-                    });
+                    registry.Unmap(tile_address, tile.size);
                 }
             }
             if (const auto owner = m_gpu_only_memory.find({tile.memory_handle, tile.offset});
@@ -1251,38 +1333,31 @@ private:
     // The game maps tiles into this region itself (216): writes outside its tiles are dropped, as
     // on the console, so it gets no more blocks, and the blocks it got before (written while no
     // tile was mapped, which the console would have dropped) go back.
-    void StartTiles(u64 start, SparseRegion& region,
-                             std::vector<std::function<void()>>& changes) {
+    void StartTiles(u64 start, SparseRegion& region) {
         using Core::Memory::YUZU_PAGESIZE;
-        region.UseTiles();
+        region.tiles = true;
         region.tile_pages.assign(Common::DivCeil(region.size, YUZU_PAGESIZE), false);
         std::shared_ptr<std::atomic<bool>> done;
         u64 released = 0;
         for (u64 block = 0; block < region.blocks.size(); ++block) {
-            if (region.blocks[block] != SparseRegion::Block::Backed) {
+            if (region.blocks[block] != BlockBacked) {
                 continue;
             }
-            region.blocks[block] = SparseRegion::Block::Written;
+            region.blocks[block] = BlockWritten;
             const u64 block_address = start + block * SparseBlockSize;
             const auto backing = m_gpu_only_regions.find(block_address);
             if (backing == m_gpu_only_regions.end()) {
                 continue;
             }
-            changes.push_back([block_address, bytes = backing->second.size] {
-                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapSparseTile(block_address, 0, bytes);
-            });
+            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapSparseTile(block_address, 0,
+                                                                        backing->second.size);
             if (!done) {
                 done = std::make_shared<std::atomic<bool>>(false);
+                system.GPU().RunInOrder([done] { done->store(true, std::memory_order_release); });
             }
             released += backing->second.size;
             m_released_regions.push_back({std::move(backing->second), done});
             m_gpu_only_regions.erase(backing);
-        }
-        if (done) {
-            // Retire only after every old block's device mapping has been removed.
-            changes.push_back([this, done] {
-                system.GPU().RunInOrder([done] { done->store(true, std::memory_order_release); });
-            });
         }
         m_sparse_released_bytes += released;
         LOG_INFO(Service, "nx2:gpu sparse region at {:#x}: the game maps its tiles, {} MiB of blocks "
@@ -1353,17 +1428,72 @@ private:
     std::array<Kernel::KEvent*, NumIds> m_events{};
     std::map<u32, GpuMemory> m_memory;
     u32 m_next_memory_handle{1};
-    u32 m_next_device{1};
+    std::array<bool, 64> m_devices{}; // gpu 41 graphics device ids (0 unused)
+
+    // Every 30 s: the backing of sparse blocks and GPU-only regions is marked cold. The game
+    // writes it once (texture uploads by 2D blits: title 1 fills 2-4 GB of texture pools) and it
+    // is read again only when the texture cache builds an image over it, so the OS may compress or
+    // page it out before anything else. Last member: stops before the regions are destroyed.
+    void HintColdBacking() {
+        struct Range {
+            u64 physical_offset;
+            u64 virtual_address;
+            u64 size;
+        };
+        std::vector<Range> ranges;
+        {
+            std::scoped_lock lk{m_region_mutex};
+            for (const auto& [gpu_address, region] : m_gpu_only_regions) {
+                u64 virtual_address = region.cpu_address;
+                for (const auto& block : *region.pages) {
+                    ranges.push_back({GetInteger(block.GetAddress()) - Core::DramMemoryMap::Base,
+                                      virtual_address, block.GetSize()});
+                    virtual_address += block.GetSize();
+                }
+            }
+        }
+        auto& buffer = system.DeviceMemory().buffer;
+        for (const Range& range : ranges) {
+            buffer.HintCold(range.physical_offset, range.size, range.virtual_address);
+        }
+    }
+    std::jthread m_cold_hint_thread{[this](std::stop_token stop) {
+        Common::SetCurrentThreadName("nx2:ColdHint");
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+        while (!stop.stop_requested()) {
+            for (int i = 0; i < 30 && !stop.stop_requested(); ++i) {
+                std::this_thread::sleep_for(std::chrono::seconds{1});
+            }
+            if (!stop.stop_requested()) {
+                HintColdBacking();
+            }
+        }
+    }};
 };
+
+inline bool Nx2VideoTraceEnabled() {
+    static const bool enabled = std::getenv("EDEN_NX2_VDEC_TRACE") != nullptr;
+    return enabled;
+}
 
 // Native memory and images handed out by the Switch 2 graphics server (gsv 111/114/423/429/315),
 // shared with the vi2 session so presents can find an image's memory. Command meanings follow
 // the shared changes.patch (IGraphicsSupervisor), re-checked against title 4's SDK.
 struct Nx2NativeObjects {
+    struct VideoTrace {
+        u32 syncpoint{};
+        u64 decoded_frames{};
+        u32 image{};
+        u64 gpu_address{};
+        u64 device_address{};
+        u64 pts{};
+        std::string codec;
+    };
     struct Memory {
         u64 size{};
         u64 address{}; // CPU (== GPU) address once bound by 114/423
-        u64 bound_size{};
+        u32 parent{};
+        u64 parent_offset{};
     };
     struct Image {
         u32 memory{};
@@ -1373,71 +1503,18 @@ struct Nx2NativeObjects {
         u64 offset{}; // into its memory (images of a decoder pool share one)
         bool window_pool{};
         bool decoder{}; // a video decoder output image (gsv 911)
+        // A decoder image the client reads on the GPU (gsv 428/426): written block-linear.
+        bool gpu_read{};
+        u32 gpu_maps{};     // outstanding 426 maps
+        bool mapped_here{}; // 426 added its GPU mapping (no other mapping covered it)
     };
-    struct Mapping {
-        u32 memory;
-        u32 image;
-        u32 address_space;
-        u64 first;
-        u64 last;
-        u64 lease;
-    };
-
-    template <class Predicate>
-    void ReleaseMappings(Predicate predicate) {
-        std::erase_if(mappings, [&](const Mapping& mapping) {
-            if (!predicate(mapping)) {
-                return false;
-            }
-            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().ReleaseNative(mapping.lease);
-            return true;
-        });
-    }
-
-    ~Nx2NativeObjects() {
-        ReleaseMappings([](const Mapping&) { return true; });
-    }
-
     std::mutex mutex;
-    std::vector<Mapping> mappings;
     std::map<u32, Memory> memories;
     std::map<u32, Image> images;
+    std::optional<VideoTrace> last_video_write;
     u32 next_memory{1};
     u32 next_image{1};
 };
-
-// Block-linear layout of an InterModuleUserImagePreference (16 words): word 2 holds
-// (width - 1) | (height - 1) << 16, word 4 the block height (log2 of GOB rows), word 5 the row
-// pitch in 64-byte GOBs. Formula from changes.patch (native_image_layout.h); preferences outside
-// it fall back to 4 bytes per pixel and 128-row blocks.
-struct Nx2ImageLayout {
-    u32 width;
-    u32 height;
-    u64 pitch;
-    u32 block_height_log2;
-    u64 size;
-    u64 alignment;
-};
-
-inline Nx2ImageLayout Nx2CalculateImageLayout(const u32* preference) {
-    Nx2ImageLayout layout{};
-    layout.width = (preference[2] & 0xFFFF) + 1;
-    layout.height = (preference[2] >> 16) + 1;
-    const u64 pitch_gobs = preference[5];
-    const u32 block_height_log2 = preference[4];
-    if (block_height_log2 <= 8 && pitch_gobs >= (u64{layout.width} * 4 + 63) / 64 &&
-        pitch_gobs <= 4096) {
-        layout.pitch = pitch_gobs * 64;
-        layout.block_height_log2 = block_height_log2;
-    } else {
-        layout.pitch = Common::AlignUp(u64{layout.width} * 4, 64);
-        layout.block_height_log2 = 7;
-    }
-    const u64 block_rows = u64{1} << layout.block_height_log2;
-    layout.size = layout.pitch * Common::AlignUp(u64{layout.height}, block_rows);
-    layout.alignment = std::max<u64>(64 * block_rows, 0x1000);
-    return layout;
-}
 
 // GameChat's graphics side (nn::chat::gsv), handed out by gsv 1202. Read from the SDK's
 // nn::chat::gsv::Initialize: TIPC 1() returns a u32 id at word 3 (it aborts with 2162-0001 if
@@ -1481,6 +1558,78 @@ private:
     std::map<u32, Kernel::KEvent*> m_events;
 };
 
+// nn::camera::sdk camera context (gsv 602). GameChat builds its local camera video storage from it
+// and polls it every frame. Nothing about the commands is known beyond the arguments seen (3 and
+// 21 take the camera name "Default", 29 a u32 0x180 = 384, the width of the 384x216 camera images),
+// and the game runs on an empty success, so they answer that without a log line per call.
+class INx2CameraSession final : public ServiceFramework<INx2CameraSession> {
+public:
+    explicit INx2CameraSession(Core::System& system_) : ServiceFramework{system_, "nx2:camera"} {
+        RegisterHandlersTipc({
+            {3, &INx2CameraSession::Stub, "Unknown3 (camera name \"Default\")"},
+            {21, &INx2CameraSession::Stub, "Unknown21 (camera name \"Default\")"},
+            {29, &INx2CameraSession::Stub, "Unknown29 (u32 0x180, polled every frame)"},
+        });
+    }
+
+private:
+    void Stub(HLERequestContext& ctx) {
+        const u32 command = ctx.GetCommand();
+        if (m_logged.insert(command).second) {
+            LOG_WARNING(Service, "(STUBBED) nx2:camera TIPC {} [2]={:#x} [3]={:#x}, returning success",
+                        command, ctx.CommandBuffer()[2], ctx.CommandBuffer()[3]);
+        }
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    std::set<u32> m_logged;
+};
+
+// Video decoder output images (nn::codec image pools, gsv 991/911/961). The preference
+// (MakeDecodeImagePreference) holds an output layout code at word 1 and (width - 1) |
+// (height - 1) << 16 at word 2. Codes come in pairs, one per CodecMode: 1/4 NV12 (format 3, what
+// the movie players use), 2/5 BGRA, 3/6 RGBA; the HDR codes (10-13) are written as RGBA. The
+// server picks the layout and describes it to the client with gsv 961: here pitch-linear rows,
+// NV12's half-height chroma plane below the luma plane, each plane padded to 128 rows.
+struct Nx2DecoderImageLayout {
+    u32 code;
+    u32 width;
+    u32 height;
+    Tegra::Host1x::Nx2PictureFormat format;
+    u64 pitch;
+    u64 chroma_offset;
+    u64 size;
+};
+
+inline Nx2DecoderImageLayout Nx2CalculateDecoderImageLayout(const u32* preference) {
+    using Tegra::Host1x::Nx2PictureFormat;
+    Nx2DecoderImageLayout layout{};
+    layout.code = preference[1];
+    layout.width = (preference[2] & 0xFFFF) + 1;
+    layout.height = (preference[2] >> 16) + 1;
+    switch (layout.code) {
+    case 1:
+    case 4:
+        layout.format = Nx2PictureFormat::Nv12;
+        break;
+    case 2:
+    case 5:
+        layout.format = Nx2PictureFormat::Bgra8;
+        break;
+    default:
+        layout.format = Nx2PictureFormat::Rgba8;
+        break;
+    }
+    const bool nv12 = layout.format == Nx2PictureFormat::Nv12;
+    constexpr u64 BlockRows = 128;
+    layout.pitch = Common::AlignUp(u64{layout.width} * (nv12 ? 1 : 4), 64);
+    layout.chroma_offset = layout.pitch * Common::AlignUp(u64{layout.height}, BlockRows);
+    layout.size = layout.chroma_offset +
+                  (nv12 ? layout.pitch * Common::AlignUp((u64{layout.height} + 1) / 2, BlockRows) : 0);
+    return layout;
+}
+
 // Placeholder for the Switch 2 display session (nn::vi2::sdk), handed out by gsv 305. Reply
 // shapes read from the SDK: TIPC 1 -> u32 < 0x400, TIPC 3 -> u32 < 8, TIPC 11/31(u32) and
 // 32(handle, u32) -> one handle at word 3 then the result. Handles returned here are events (a
@@ -1491,32 +1640,73 @@ public:
         : ServiceFramework{system_, "nx2:vi2"}, m_context{system_, "nx2:vi2"},
           m_objects{std::move(objects_)} {
         RegisterHandlersTipc({
+            {0, &INx2Vi2Session::Handshake, "Handshake"},
             {1, &INx2Vi2Session::ReturnOne, "Unknown1"},
             {3, &INx2Vi2Session::ReturnOne, "GetDisplayCount (guessed)"},
             {5, &INx2Vi2Session::GetTimestampRecorderCount, "GetTimestampRecorderCount (guessed)"},
-            {11, &INx2Vi2Session::GetNotificationEvent, "GetNotificationEvent"},
-            {13, &INx2Vi2Session::SucceedQuietly, "ReleaseNotificationEvent"},
-            {21, &INx2Vi2Session::GetNotifications, "GetNotifications"},
-            {31, &INx2Vi2Session::GetVsyncEvent, "GetVsyncEvent (guessed)"},
-            {32, &INx2Vi2Session::GetVsyncEvent, "GetDisplayVsyncEvent (guessed)"},
-            // Title 1 calls these ~75 times a second with the display name "default"; the
-            // auto stub's empty success reply works, but logged two lines per call (a 50 MB log
-            // in an 18 minute session).
-            {104, &INx2Vi2Session::SucceedQuietly, "Unknown104 (display \"default\")"},
-            {105, &INx2Vi2Session::SucceedQuietly, "Unknown105 (display \"default\")"},
-            // Display/client setup (title 2): nothing to track while presents composite directly.
-            {51, &INx2Vi2Session::SucceedQuietly, "ConfigureRequestGroups"},
-            {101, &INx2Vi2Session::OpenDisplay, "OpenDisplay"},
-            {102, &INx2Vi2Session::CloseDisplay, "CloseDisplay"},
-            {111, &INx2Vi2Session::SucceedQuietly, "OpenEndpoint"},
-            {112, &INx2Vi2Session::SucceedQuietly, "CloseEndpoint"},
-            {201, &INx2Vi2Session::RegisterClientState, "RegisterClientState"},
-            {202, &INx2Vi2Session::UnregisterClientState, "UnregisterClientState"},
-            {212, &INx2Vi2Session::GetClientAvailability, "GetClientAvailability"},
-            {251, &INx2Vi2Session::SucceedQuietly, "BindClientDisplay"},
-            {252, &INx2Vi2Session::SucceedQuietly, "UnbindClientDisplay"},
+            {11, &INx2Vi2Session::ReturnEvent, "Unknown11"},
+            {31, &INx2Vi2Session::AcquireNativeEvent, "AcquireNativeEvent"},
+            {32, &INx2Vi2Session::DuplicateNativeEvent, "DuplicateNativeEvent"},
+            {261, &INx2Vi2Session::BindVsync, "BindDisplayVsyncEvent"},
+            {262, &INx2Vi2Session::UnbindNativeEvent, "UnbindDisplayVsyncEvent"},
+            {263, &INx2Vi2Session::BindChange, "BindDisplayRefreshRateEvent"},
+            {264, &INx2Vi2Session::UnbindNativeEvent, "UnbindDisplayRefreshRateEvent"},
+            {265, &INx2Vi2Session::BindChange, "BindDisplayHdrStatusEvent"},
+            {266, &INx2Vi2Session::UnbindNativeEvent, "UnbindDisplayHdrStatusEvent"},
+            {267, &INx2Vi2Session::BindChange, "BindDisplayHdrPaperWhiteEvent"},
+            {268, &INx2Vi2Session::UnbindNativeEvent, "UnbindDisplayHdrPaperWhiteEvent"},
+            {269, &INx2Vi2Session::BindChange, "BindDisplayBufferMaxResolutionEvent"},
+            {270, &INx2Vi2Session::UnbindNativeEvent, "UnbindDisplayBufferMaxResolutionEvent"},
+            {271, &INx2Vi2Session::BindChange, "BindDisplayModeCapabilityEvent"},
+            {272, &INx2Vi2Session::UnbindNativeEvent, "UnbindDisplayModeCapabilityEvent"},
+            // Title 1 calls these ~75 times a second with the display name "default"; quiet
+            // handlers (the auto stub logged two lines per call: a 50 MB log in an 18 minute
+            // session).
+            {103, &INx2Vi2Session::QueryDisplayRefreshRate, "QueryDisplayRefreshRate"},
+            {104, &INx2Vi2Session::QueryDisplayHdrStatus, "QueryDisplayHdrStatus"},
+            {105, &INx2Vi2Session::QueryDisplayHdrPaperWhite, "QueryDisplayHdrPaperWhite"},
+            {212, &INx2Vi2Session::GetLayerBufferBits, "GetLayerBufferBits"},
+            {106, &INx2Vi2Session::GetBufferMaxResolution, "GetBufferMaxResolution"},
             {228, &INx2Vi2Session::CancelClientBuffer, "CancelClientBuffer"},
             {229, &INx2Vi2Session::PresentClientBuffer, "PresentClientBuffer"},
+            // Firmware commands without a known meaning: zeroed replies.
+            {13, &INx2Vi2Session::StubReplyZeroed, "Unknown13"},
+            {51, &INx2Vi2Session::StubReplyZeroed, "Unknown51"},
+            {101, &INx2Vi2Session::StubReplyZeroed, "Unknown101"},
+            {102, &INx2Vi2Session::StubReplyZeroed, "Unknown102"},
+            {107, &INx2Vi2Session::StubReplyZeroed, "Unknown107"},
+            {108, &INx2Vi2Session::StubReplyZeroed, "Unknown108"},
+            {111, &INx2Vi2Session::StubReplyZeroed, "Unknown111"},
+            {112, &INx2Vi2Session::StubReplyZeroed, "Unknown112"},
+            {113, &INx2Vi2Session::StubReplyZeroed, "Unknown113"},
+            {202, &INx2Vi2Session::StubReplyZeroed, "Unknown202"},
+            {230, &INx2Vi2Session::StubReplyZeroed, "Unknown230"},
+            {231, &INx2Vi2Session::StubReplyZeroed, "Unknown231"},
+            {232, &INx2Vi2Session::StubReplyZeroed, "Unknown232"},
+            {251, &INx2Vi2Session::StubReplyZeroed, "Unknown251"},
+            {252, &INx2Vi2Session::StubReplyZeroed, "Unknown252"},
+            {261, &INx2Vi2Session::StubReplyZeroed, "Unknown261"},
+            {262, &INx2Vi2Session::StubReplyZeroed, "Unknown262"},
+            {263, &INx2Vi2Session::StubReplyZeroed, "Unknown263"},
+            {264, &INx2Vi2Session::StubReplyZeroed, "Unknown264"},
+            {265, &INx2Vi2Session::StubReplyZeroed, "Unknown265"},
+            {266, &INx2Vi2Session::StubReplyZeroed, "Unknown266"},
+            {267, &INx2Vi2Session::StubReplyZeroed, "Unknown267"},
+            {268, &INx2Vi2Session::StubReplyZeroed, "Unknown268"},
+            {269, &INx2Vi2Session::StubReplyZeroed, "Unknown269"},
+            {270, &INx2Vi2Session::StubReplyZeroed, "Unknown270"},
+            {271, &INx2Vi2Session::StubReplyZeroed, "Unknown271"},
+            {272, &INx2Vi2Session::StubReplyZeroed, "Unknown272"},
+            {301, &INx2Vi2Session::StubReplyZeroed, "Unknown301"},
+            {302, &INx2Vi2Session::StubReplyZeroed, "Unknown302"},
+            {351, &INx2Vi2Session::StubReplyZeroed, "Unknown351"},
+            {352, &INx2Vi2Session::StubReplyZeroed, "Unknown352"},
+            {353, &INx2Vi2Session::StubReplyZeroed, "Unknown353"},
+            {354, &INx2Vi2Session::StubReplyZeroed, "Unknown354"},
+            {355, &INx2Vi2Session::StubReplyZeroed, "Unknown355"},
+            {356, &INx2Vi2Session::StubReplyZeroed, "Unknown356"},
+            {358, &INx2Vi2Session::StubReplyZeroed, "Unknown358"},
+            {359, &INx2Vi2Session::StubReplyZeroed, "Unknown359"},
         });
     }
 
@@ -1536,41 +1726,91 @@ public:
     }
 
 private:
+    void Handshake(HLERequestContext& ctx) {
+        TipcHandshake(ctx, "nx2:vi2");
+    }
+
     // 229(u64 client token, u32 slot, u32 image, ...fences): result, u64 mask of buffer slots the
     // client may acquire next, four zero words. Nothing is shown yet; every slot is handed back
     // at once (changes.patch's default mask is 0x7fff).
     void PresentClientBuffer(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         ++m_presents;
+        if (Common::DkbFrameTrace::Enabled()) {
+            m_vsync->trace_present.store(m_presents, std::memory_order_relaxed);
+        }
         Core::g_nx2_present_count.fetch_add(1, std::memory_order_relaxed);
         if (m_presents <= 4 || (m_presents % 600) == 0) {
             LOG_INFO(Service, "nx2:vi2 229 present #{} token={:#x} slot={} image={}", m_presents,
                      u64{w[2]} | (u64{w[3]} << 32), w[4], w[5]);
         }
-        // Wait for the previous frame's fence instead of this one, so the game prepares frame N+1
-        // while the GPU thread runs frame N (the console keeps several frames in flight). Waiting
-        // for this frame serialized the two: 8-56 ms of every 34-105 ms frame on title 1.
-        // EDEN_NX2_FRAMES_AHEAD=0 restores the wait for the current frame.
-        static const bool frames_ahead = [] {
+        // Wait for this frame's fence, so the game doesn't write the next frame's data (constant
+        // buffers holding texture handles, vertex data, Pokopia's glyph atlas) while the GPU
+        // thread still reads this frame's. But title 1's GPU waits on semaphores its CPU releases
+        // only after this present returns: while a channel stays suspended on one, wait for the
+        // previous frame's fence instead and let the game prepare frame N+1 meanwhile (waiting
+        // for this frame there cost 8-56 ms of every 34-105 ms frame, or never finished).
+        // EDEN_NX2_FRAMES_AHEAD=1 always waits for the previous frame, =0 always for this one.
+        static const int frames_ahead = [] {
             const char* value = std::getenv("EDEN_NX2_FRAMES_AHEAD");
-            return value == nullptr || value[0] != '0';
+            return value == nullptr ? -1 : value[0] == '1' ? 1 : 0;
         }();
         const auto entered = std::chrono::steady_clock::now();
-        if (frames_ahead) {
+        if (frames_ahead == 1 || (frames_ahead == -1 && !WaitForFrame(~w[22], w[24], true))) {
             LOG_DEBUG(Service, "nx2:vi2 present #{} fence ({}, {:#x}), waiting for ({}, {:#x}); now {:#x}",
                       m_presents, ~w[22], w[24], m_previous_fence_id, m_previous_fence_value,
                       ~w[22] < 192 ? system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(~w[22]) : 0U);
+            // With EDEN_NX2_FRAMES_AHEAD=1, only run a frame ahead while the GPU keeps up. With
+            // the previous frame still on the GPU here, the GPU is the limit and running ahead
+            // gains nothing; and Splatoon Raiders, which reuses its command memory as if the GPU
+            // were at most a frame behind, rewrote command lists Eden had not read yet (misread
+            // commands, then crashes, with a slow GPU). Wait for this frame too then. Not when a
+            // suspended channel brought us here: this frame can't finish before the present
+            // returns.
+            const bool gpu_behind = frames_ahead == 1 && m_previous_fence_id < 192 &&
+                                    !system.Host1x().GetSyncpointManager().IsReadyGuest(
+                                        m_previous_fence_id, m_previous_fence_value);
             WaitForFrame(m_previous_fence_id, m_previous_fence_value);
-            m_previous_fence_id = ~w[22];
-            m_previous_fence_value = w[24];
-        } else {
+            if (gpu_behind) {
+                WaitForFrame(~w[22], w[24]);
+            }
+        } else if (frames_ahead == 0) {
             WaitForFrame(~w[22], w[24]);
         }
+        m_previous_fence_id = ~w[22];
+        m_previous_fence_value = w[24];
         const auto waited = std::chrono::steady_clock::now();
-        Composite(w[5], ~w[22], w[24], w[6], w[7], w[8]);
+        Composite(w[5], ~w[22], w[24], w[7]);
         const auto composited = std::chrono::steady_clock::now();
-        PaceToVblank();
+        PaceToVblank(w[12]);
         const auto paced = std::chrono::steady_clock::now();
+        if (Common::DkbFrameTrace::Enabled()) {
+            const auto ms = [](auto duration) {
+                return std::chrono::duration<double, std::milli>(duration).count();
+            };
+            if (m_frame_trace.rate.Ready(paced)) {
+                LOG_INFO(Service,
+                         "DKB frame present={} word12={:#x} requested_interval={} "
+                         "requested_hz={} effective_interval={} effective_hz={} forced_interval={} "
+                         "speed_limit={} speed_percent={} switches={} last_switch={:#x}->{:#x} "
+                         "cpu_frame_wall_ms={:.3f} cpu_present_wall_ms={:.3f} fence_wall_ms={:.3f} "
+                         "composite_wall_ms={:.3f} target_ms={:.3f} sleep_requested_ms={:.3f} "
+                         "sleep_actual_wall_ms={:.3f} pace_wall_ms={:.3f} deadline_reset={}",
+                         m_presents, w[12], w[12] >> 16, w[12] & 0xffff,
+                         m_frame_trace.interval, m_frame_trace.refresh, m_frame_trace.forced,
+                         Settings::values.use_speed_limit.GetValue(), Settings::SpeedLimit(),
+                         m_frame_trace.switches, m_frame_trace.switch_from,
+                         m_frame_trace.switch_to,
+                         m_frame_trace.last_present == std::chrono::steady_clock::time_point{}
+                             ? -1.0 : ms(entered - m_frame_trace.last_present),
+                         ms(paced - entered), ms(waited - entered), ms(composited - waited),
+                         m_frame_trace.target_ms, m_frame_trace.sleep_requested_ms,
+                         m_frame_trace.sleep_actual_ms, ms(paced - composited),
+                         m_frame_trace.deadline_reset);
+                m_frame_trace.switches = 0;
+            }
+            m_frame_trace.last_present = entered;
+        }
         // Where each frame's time goes on the present thread, averaged per 600 presents: the
         // game is blocked here while Eden's GPU thread catches up (fence) and composites.
         {
@@ -1624,33 +1864,106 @@ private:
     // The console flips one frame per 60 Hz vblank and keeps the rest queued, so a game can't
     // present faster than that. Every slot is reported free here: hold each present until the
     // next vblank instead (title 4 ran at up to 160 fps, its timing and audio with it).
-    std::chrono::steady_clock::time_point m_next_vblank{};
+    Nx2PresentPacer m_present_pacer;
+    u32 m_swap_word{};
 
-    void PaceToVblank() {
+    struct FrameTrace {
+        Common::DkbFrameTrace::RateLimit rate;
+        std::chrono::steady_clock::time_point last_present{};
+        std::optional<u32> previous_word;
+        u64 switches{};
+        u32 switch_from{}, switch_to{}, interval{}, refresh{}, forced{};
+        double target_ms{}, sleep_requested_ms{}, sleep_actual_ms{};
+        bool deadline_reset{};
+    } m_frame_trace;
+
+    // timing: present word 12, (swap interval << 16) | refresh rate. Fire Emblem: Fortune's Weave
+    // sends 0x1003c during its boot logos and 0x2003c (two vblanks per frame, 30 fps) after; paced
+    // at every vblank it ran at double speed. EDEN_NX2_SWAP_INTERVAL=<n> forces the interval.
+    void PaceToVblank(u32 timing) {
+        const bool trace = Common::DkbFrameTrace::Enabled();
+        if (trace) {
+            if (m_frame_trace.previous_word && *m_frame_trace.previous_word != timing) {
+                ++m_frame_trace.switches;
+                m_frame_trace.switch_from = *m_frame_trace.previous_word;
+                m_frame_trace.switch_to = timing;
+            }
+            m_frame_trace.previous_word = timing;
+            m_frame_trace.target_ms = 0;
+            m_frame_trace.sleep_requested_ms = 0;
+            m_frame_trace.sleep_actual_ms = 0;
+            m_frame_trace.deadline_reset = false;
+        }
+        static const u32 forced_interval = [] {
+            const char* value = std::getenv("EDEN_NX2_SWAP_INTERVAL");
+            return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
+        }();
+        const auto& process = Kernel::GetCurrentProcess(kernel);
+        const bool mkw_dynamic =
+            process.GetProgramId() == Settings::MarioKartWorldProgramId &&
+            process.IsMkwDynamicFpsPatchApplied() && Settings::values.mkw_dynamic_fps.GetValue();
+        u32 swap_interval = std::clamp<u32>(timing >> 16, 1, 4);
+        if (mkw_dynamic) {
+            swap_interval = 1;
+        }
+        if (forced_interval != 0) {
+            swap_interval = forced_interval;
+        }
+        u32 refresh_rate = (timing & 0xffff) >= 30 && (timing & 0xffff) <= 240 ? timing & 0xffff : 60;
+        // EDEN_NX2_PRESENT_HZ=<rate>: hold presents to this rate instead (from
+        // sylvieistaken/selevet-eglantine e8d94946c1; Mario Kart World keeps its full game speed at 30).
+        // Read at each present: the PS5 launcher sets it per game, and one app run starts many games.
+        if (const char* const present_text = std::getenv("EDEN_NX2_PRESENT_HZ")) {
+            refresh_rate = static_cast<u32>(std::clamp(std::strtoll(present_text, nullptr, 10), 1LL, 1000LL));
+            swap_interval = 1;
+        }
+        if (trace) {
+            m_frame_trace.interval = swap_interval;
+            m_frame_trace.refresh = refresh_rate;
+            m_frame_trace.forced = forced_interval;
+        }
         if (!Settings::values.use_speed_limit.GetValue() || Settings::SpeedLimit() == 0) {
             return;
         }
-        // EDEN_NX2_PRESENT_HZ=<rate>: hold presents to this rate instead of 60 (from
-        // sylvieistaken/selevet-eglantine e8d94946c1; Mario Kart World keeps its full game speed at 30).
-        // Read at each present: the PS5 launcher sets it per game, and one app run starts many games.
-        const char* const present_text = std::getenv("EDEN_NX2_PRESENT_HZ");
-        const long long present_hz =
-            present_text ? (std::max)(std::strtoll(present_text, nullptr, 10), 1LL) : 60LL;
-        const auto interval =
-            std::chrono::nanoseconds{100'000'000'000LL / present_hz / Settings::SpeedLimit()};
-        const auto now = std::chrono::steady_clock::now();
-        if (now > m_next_vblank + interval) {
-            // Running slower than 60 fps: show at once and don't bank the lost time.
-            m_next_vblank = now;
-        } else if (now < m_next_vblank) {
-            std::this_thread::sleep_until(m_next_vblank);
+        if (timing != std::exchange(m_swap_word, timing)) {
+            LOG_INFO(Service, "nx2:vi2 present #{} swap interval {} at {} Hz (word 12 = {:#x})",
+                     m_presents, swap_interval, refresh_rate, timing);
         }
-        m_next_vblank += interval;
+        const auto interval = std::chrono::nanoseconds{
+            100'000'000'000LL * swap_interval / refresh_rate / Settings::SpeedLimit()};
+        if (trace) {
+            m_frame_trace.target_ms = std::chrono::duration<double, std::milli>(interval).count();
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const auto pacing = m_present_pacer.Advance(now, interval);
+        if (trace) {
+            m_frame_trace.deadline_reset = pacing.reset;
+        }
+        if (now < pacing.deadline) {
+            // Sleep this service thread in the guest kernel. It runs on guest core 3, and a host
+            // sleep held that core for the whole wait: game threads scheduled there ran only
+            // between presents (Fortune's Weave's loader read one RomFS block per frame).
+            const auto wait =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(pacing.deadline - now);
+            const auto sleep_start = trace ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
+            static_cast<void>(Kernel::GetCurrentThread(kernel).Sleep(
+                kernel, kernel.HardwareTimer().GetTick() + wait.count() + 2));
+            if (trace) {
+                m_frame_trace.sleep_requested_ms =
+                    std::chrono::duration<double, std::milli>(wait).count();
+                m_frame_trace.sleep_actual_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - sleep_start).count();
+            }
+        }
     }
 
-    void WaitForFrame(u32 fence_id, u32 fence_value) {
+    /// Waits until the fence is reached. With `unless_gpu_waits`, gives up after a few ms once a
+    /// GPU channel was seen suspended on a semaphore (it may be one this thread releases later).
+    /// Returns whether the fence was reached.
+    bool WaitForFrame(u32 fence_id, u32 fence_value, bool unless_gpu_waits = false) {
         if (fence_id >= 192) {
-            return;
+            return true;
         }
         auto& syncpoints = system.Host1x().GetSyncpointManager();
         const auto start = std::chrono::steady_clock::now();
@@ -1675,10 +1988,23 @@ private:
                 wake->cv.notify_all();
             });
             std::unique_lock lk{wake->mutex};
+            // Title 1's channels resume and suspend again while they wait on this thread, so any
+            // suspension counts, not only an unbroken one.
+            bool gpu_waited = false;
             while (!wake->done && system.IsPoweredOn() &&
                    std::chrono::steady_clock::now() < deadline) {
-                wake->cv.wait_for(lk, std::chrono::milliseconds{50});
+                if (unless_gpu_waits) {
+                    gpu_waited |= system.GPU().HasSuspendedChannels();
+                    if (gpu_waited &&
+                        std::chrono::steady_clock::now() - start > std::chrono::milliseconds{3}) {
+                        return false;
+                    }
+                }
+                wake->cv.wait_for(lk, std::chrono::milliseconds{unless_gpu_waits ? 1 : 50});
             }
+        }
+        if (unless_gpu_waits && !syncpoints.IsReadyGuest(fence_id, fence_value)) {
+            return false;
         }
         if (!syncpoints.IsReadyGuest(fence_id, fence_value) && m_wait_timeouts++ < 64) {
             LOG_WARNING(Service, "nx2:vi2 present #{} fence ({}, {}) not reached in 4 s (now {})",
@@ -1691,15 +2017,21 @@ private:
                          std::chrono::steady_clock::now() - start)
                          .count());
         }
+        return syncpoints.IsReadyGuest(fence_id, fence_value);
     }
 
     // Shows a presented native image: word 5 is the image id, ~word 22 / word 24 the GPU fence
     // (syncpoint, value) to wait for (layout from changes.patch). The image is a block-linear
     // RGBA8 surface in the console's native GOB layout at GPU address == CPU address.
-    void Composite(u32 image_id, u32 fence_id, u32 fence_value, u32 crop_origin, u32 crop_end,
-                   u32 flags) {
+    // shown_size: the present's word 7, ((height - 1) << 16) | (width - 1) of the area the game drew
+    // into from the image's top-left corner (0 when it gives none).
+    void Composite(u32 image_id, u32 fence_id, u32 fence_value, u32 shown_size) {
         u64 address{};
+        u32 parent{};
+        u64 parent_offset{};
+        std::optional<Nx2NativeObjects::VideoTrace> video_trace;
         Nx2ImageLayout layout{};
+        u32 image_format{};
         {
             std::scoped_lock lk{m_objects->mutex};
             const auto image = m_objects->images.find(image_id);
@@ -1710,16 +2042,68 @@ private:
             if (memory == m_objects->memories.end() || memory->second.address == 0) {
                 return;
             }
-            address = memory->second.address;
+            address = memory->second.address + image->second.offset;
+            parent = memory->second.parent;
+            parent_offset = memory->second.parent_offset + image->second.offset;
             layout = Nx2CalculateImageLayout(image->second.preference.data());
+            image_format = image->second.preference[6];
+            if (Nx2VideoTraceEnabled()) {
+                video_trace = m_objects->last_video_write;
+            }
         }
-        const auto device = Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(address);
+        auto& registry = Nvidia::Devices::Nx2GpuMemoryRegistry::Get();
+        auto gpu_address = registry.GpuAddressOf(parent, parent_offset);
+        auto device = gpu_address ? registry.DeviceAddressOfGpu(*gpu_address) : std::nullopt;
+        if (!device) {
+            device = registry.DeviceAddressOf(address);
+        }
+        if (video_trace) {
+            if (!gpu_address && device && registry.DeviceAddressOfGpu(address) == device) {
+                gpu_address = address;
+            }
+            LOG_INFO(Service,
+                     "nx2:vdec trace present={} image={} cpu={:#x} gpu={:#x} device={:#x} "
+                     "gpu_known={} mapped={} latest_decode_syncpoint={} decoded_frames={} codec={} "
+                     "decoded_image={} decoded_gpu={:#x} decoded_device={:#x} pts={} "
+                     "same_image={} same_device={}",
+                     m_presents, image_id, address, gpu_address.value_or(0),
+                     device.value_or(0), gpu_address.has_value(), device.has_value(), video_trace->syncpoint,
+                     video_trace->decoded_frames, video_trace->codec, video_trace->image,
+                     video_trace->gpu_address, video_trace->device_address, video_trace->pts,
+                     image_id == video_trace->image,
+                     device && *device == video_trace->device_address);
+        }
         if (!device) {
             LOG_WARNING(Service, "nx2:vi2 present: image {} at {:#x} has no device mapping",
                         image_id, address);
             return;
         }
-        auto crop = Nx2PresentCrop(crop_origin, crop_end, flags, layout.width, layout.height);
+        u32 crop_width = layout.width;
+        u32 crop_height = layout.height;
+        // The present says how much of the image the game drew: Kirby Air Riders draws 1920x1080
+        // into 2560x1440 images, Mario Kart World 2560x1440 into 3840x2160 ones. Showing the whole
+        // image put the frame in the top-left corner.
+        const u32 shown_width = (shown_size & 0xFFFF) + 1, shown_height = (shown_size >> 16) + 1;
+        const bool has_shown_size = shown_size != 0 && shown_width <= layout.width &&
+                                    shown_height <= layout.height;
+        if (has_shown_size) {
+            crop_width = shown_width;
+            crop_height = shown_height;
+        }
+        // Handheld titles keep their docked present images (up to 3840x2160) and draw the frame
+        // into the top-left 1920x1080, the handheld panel's resolution; the console's display
+        // scans out only that region. Showing whole images put the frame in a corner inside black
+        // margins that scaled with the window (seen on Mario Kart World and Splatoon Raiders).
+        if (!Settings::IsDockedMode()) {
+            crop_width = (std::min)(crop_width, 1920U);
+            crop_height = (std::min)(crop_height, 1080U);
+        } else if (!has_shown_size &&
+                   system.GetApplicationProcessProgramID() == 0x0400C3F00006E000ULL &&
+                   layout.width == 3840 && layout.height == 2160) {
+            // Mario Kart World docked draws 2560x1440 into the top-left of its 4K images.
+            crop_width = 2560;
+            crop_height = 1440;
+        }
         static const u32 env_crop_w = [] {
             const char* v = std::getenv("EDEN_NX2_CROP_WIDTH");
             return v ? static_cast<u32>(std::strtoul(v, nullptr, 10)) : 0U;
@@ -1729,15 +2113,17 @@ private:
             return v ? static_cast<u32>(std::strtoul(v, nullptr, 10)) : 0U;
         }();
         if (env_crop_w != 0 && env_crop_h != 0) {
-            crop = {0, 0, static_cast<int>(env_crop_w), static_cast<int>(env_crop_h)};
+            crop_width = env_crop_w;
+            crop_height = env_crop_h;
         }
         const u64 shown = (u64{layout.width} << 48) | (u64{layout.height} << 32) |
-                          (static_cast<u64>(crop.GetWidth()) << 16) | crop.GetHeight();
-        if (m_presents <= 4 || shown != m_shown_layout) {
+                          (u64{crop_width} << 16) | crop_height;
+        if (shown != m_shown_layout) {
             m_shown_layout = shown;
-            LOG_INFO(Service, "nx2:vi2 composite image {} layout {}x{}, crop ({},{})-({},{}) "
-                     "metadata {:08x} {:08x} {:08x}", image_id, layout.width, layout.height,
-                     crop.left, crop.top, crop.right, crop.bottom, crop_origin, crop_end, flags);
+            LOG_INFO(Service,
+                     "nx2:vi2 composite image {} layout {}x{}, drawn area {:#x}, crop {}x{}, docked={}",
+                     image_id, layout.width, layout.height, shown_size, crop_width, crop_height,
+                     Settings::IsDockedMode());
         }
         std::vector<Tegra::FramebufferConfig> layers{Tegra::FramebufferConfig{
             .address = *device,
@@ -1745,13 +2131,11 @@ private:
             .width = layout.width,
             .height = layout.height,
             .stride = static_cast<u32>(layout.pitch / 4),
-            .allocation_size = layout.size,
-            .block_height_log2 = layout.block_height_log2 >= 3
-                                     ? std::make_optional(layout.block_height_log2 - 3)
-                                     : std::nullopt,
-            .pixel_format = android::PixelFormat::Rgba8888,
+            // Preference word 6: 1 = RGBA8, 4 = RGB10A2.
+            .pixel_format = image_format == 4 ? android::PixelFormat::Rgba1010102
+                                              : android::PixelFormat::Rgba8888,
             .transform_flags = android::BufferTransformFlags::Unset,
-            .crop_rect = crop,
+            .crop_rect = {0, 0, static_cast<int>(crop_width), static_cast<int>(crop_height)},
             .blending = Tegra::BlendMode::Opaque,
             .native_tiling = true,
         }};
@@ -1771,7 +2155,11 @@ private:
     // nx2-frame-<n>.tga in <dir> (lets hidden test runs check the output; idea from changes.patch).
     void CaptureFrame() {
         static const char* const directory = std::getenv("EDEN_NX2_FRAME_CAPTURE");
-        if (directory == nullptr || (m_presents % 120) != 1 || m_capture_pending->exchange(true)) {
+        static const u64 every = [] {
+            const char* value = std::getenv("EDEN_NX2_FRAME_CAPTURE_EVERY");
+            return value != nullptr ? (std::max)(u64{1}, static_cast<u64>(std::strtoull(value, nullptr, 10))) : u64{120};
+        }();
+        if (directory == nullptr || (m_presents % every) != 1 % every || m_capture_pending->exchange(true)) {
             return;
         }
         const auto layout = Layout::DefaultFrameLayout(1280, 720);
@@ -1841,13 +2229,6 @@ private:
         }
     }
 
-    // 212(u64 client token): u64 mask of the buffer slots the client may acquire. The auto stub's
-    // zero mask left the client no buffer and it tore its display down.
-    void GetClientAvailability(HLERequestContext& ctx) {
-        constexpr u64 AvailableSlots = 0x7fff;
-        TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots), static_cast<u32>(AvailableSlots >> 32)});
-    }
-
     // 228(u64 token, u32 slot): return a buffer without presenting it.
     void CancelClientBuffer(HLERequestContext& ctx) {
         constexpr u64 AvailableSlots = 0x7fff;
@@ -1855,15 +2236,69 @@ private:
                              static_cast<u32>(AvailableSlots >> 32), 0, 0, 0, 0});
     }
 
+    // nn::vi2::QueryDisplayRefreshRate(display name): u32 refresh rate in Hz, then a bool (a u64
+    // in all). nn::vi::detail::DefaultDisplay::QueryRefreshRate takes only -1, 60 or 120 and fails
+    // on anything else; Minecraft polls it and never draws while it fails. A one-word reply left
+    // the bool to whatever the message buffer held.
+    void QueryDisplayRefreshRate(HLERequestContext& ctx) {
+        TipcReplyWords(ctx, {60, 0});
+    }
+
+    // nn::vi2::QueryDisplayHdrPaperWhite(display name): u16 paper white in nits. The empty reply
+    // left it to the message buffer's leftovers; answer the BT.2408 reference white.
+    void QueryDisplayHdrPaperWhite(HLERequestContext& ctx) {
+        TipcReplyWords(ctx, {203});
+    }
+
+    // nn::vi2::QueryDisplayHdrStatus(display name): u64 HdrOutputFormat, u16. The sdk's
+    // DefaultDisplay::QueryHdrStatus takes format 1 as HDR output and fails with 0x272 on
+    // anything above 1. With the empty auto stub reply it read the request's leftover words as
+    // the format; Kirby Air Riders re-queries whenever its HDR status event fires and rebuilt its
+    // window images every few frames, which showed black. Report SDR output.
+    // nn::vi2::QueryDisplayHdrStatus(display name): u64 output format, u16 peak luminance in
+    // nits. The sdk takes format 1 as SDR and 2 as HDR and fails the query on any other value.
+    // Report SDR output with a typical SDR panel's peak.
+    void QueryDisplayHdrStatus(HLERequestContext& ctx) {
+        TipcReplyWords(ctx, {1, 0, 400});
+    }
+
+    // 212(u64 layer): u64 bits of the layer's buffer slots that are ready. The client polls it once
+    // a second until some are set; it only got going because the auto stub's reply happened to
+    // hold non-zero leftovers. Report the same slots 228/229 hand back.
+    void GetLayerBufferBits(HLERequestContext& ctx) {
+        constexpr u64 AvailableSlots = 0x7fff;
+        TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots), static_cast<u32>(AvailableSlots >> 32)});
+    }
+
     void ReturnOne(HLERequestContext& ctx) {
         LOG_WARNING(Service, "(STUBBED) nx2:vi2 TIPC {}, returning 1", ctx.GetCommand());
         TipcReplyWords(ctx, {1});
     }
 
-    // The same reply as the auto stub (success, no data), without its log lines.
-    void SucceedQuietly(HLERequestContext& ctx) {
-        IPC::ResponseBuilder rb{ctx, 2};
-        rb.Push(ResultSuccess);
+    // The highest buffer resolution mode of the "default" display. Fire Emblem: Fortune's Weave picks
+    // its output from it: 1 -> 1280x720, 2 -> 1920x1080, 4 and 8 -> 2560x1440; 0 (the auto stub's
+    // reply), 3 and 5 fall back to 720p. Docked reports 4, handheld 2 (the screen is 1080p);
+    // EDEN_VI2_MAX_RESOLUTION_MODE=<n> overrides.
+    void GetBufferMaxResolution(HLERequestContext& ctx) {
+        const auto* packet = ctx.CommandBuffer();
+        const u64 name = u64{packet[2]} | (u64{packet[3]} << 32);
+        constexpr u64 DefaultDisplay = 0x00746c7561666564ULL; // "default"
+        Result result = Kernel::ResultInvalidCombination;
+        u64 mode{};
+        if (packet[0] == 0x7a && packet[1] == 2) {
+            result = Result{ErrorModule::VI, 7};
+            if (name == DefaultDisplay) {
+                static const char* forced = std::getenv("EDEN_VI2_MAX_RESOLUTION_MODE");
+                mode = forced ? std::strtoull(forced, nullptr, 0) : Settings::IsDockedMode() ? 4 : 2;
+                result = ResultSuccess;
+            }
+        }
+        IPC::ResponseBuilder rb{ctx, 4};
+        rb.Push(result.raw);
+        rb.Push(mode);
+        LOG_DEBUG(Service_VI,
+                  "nx2:vi2 max resolution: name={:#x} docked={} result={:#x} mode={}",
+                  name, Settings::IsDockedMode(), result.raw, mode);
     }
 
     // Must be < 8; nn::vi::detail::LayerHistory creates 7 timestamp recorders per layer.
@@ -1872,120 +2307,116 @@ private:
         TipcReplyWords(ctx, {7});
     }
 
-    // 11: the notification event the SDK's render thread waits on while it tears a client down.
-    // One event per session, signalled as bitmaps fill (201/202, 101/102); a fresh, never
-    // signalled event per call left that thread blocked forever after 202.
-    void GetNotificationEvent(HLERequestContext& ctx) {
-        if (!m_notification_event) {
-            m_notification_event = m_context.CreateEvent(fmt::format("nx2:vi2:Notify{}", m_events.size()));
-            m_events.push_back(m_notification_event);
+    void ReturnEvent(HLERequestContext& ctx) {
+        LOG_WARNING(Service, "(STUBBED) nx2:vi2 TIPC {} [2]={:#x} [3]={:#x}, returning an event",
+                    ctx.GetCommand(), ctx.CommandBuffer()[2], ctx.CommandBuffer()[3]);
+        auto* event = m_context.CreateEvent(fmt::format("nx2:vi2:Event{}", m_events.size()));
+        m_events.push_back(event);
+        IPC::ResponseBuilder rb{ctx, 2, 1, 0};
+        rb.Push(ResultSuccess);
+        rb.PushCopyObjects(ctx, event->GetReadableEvent());
+    }
+
+    // 31(u32 index < 8): the session's event for that slot (the sdk picks a free index). The
+    // 261..272 commands bind a slot to a display event source and unbind it again. Until a slot
+    // is bound it fires on every vblank, as all of them used to.
+    void AcquireNativeEvent(HLERequestContext& ctx) {
+        const u32 index = ctx.CommandBuffer()[2];
+        if (index >= m_native_events.size()) {
+            LOG_ERROR(Service, "nx2:vi2 31 index {} out of range", index);
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.Push(ResultUnknown);
+            return;
         }
-        if (AnyNotification()) {
-            m_notification_event->Signal(system.Kernel());
+        LOG_INFO(Service, "nx2:vi2 31 native event {}", index);
+        ReplyNativeEvent(ctx, index);
+    }
+
+    // 32(u32 index, copy handle): the client hands back its handle for an acquired slot and gets
+    // the slot's event again; the handle descriptor and handle come before the index. Games call
+    // it for slot 0 right after binding it to vsync. Title 1's main thread waits on this event
+    // until it has fired twice before it submits any GPU work, and hung there while it never
+    // fired.
+    void DuplicateNativeEvent(HLERequestContext& ctx) {
+        const u32* words = ctx.CommandBuffer();
+        u32 data = 2;
+        if (words[1] >> 31) {
+            const u32 descriptor = words[2];
+            data = 3 + ((descriptor >> 1) & 0xf) + ((descriptor >> 5) & 0xf) + (descriptor & 1 ? 2 : 0);
+        }
+        const u32 index = words[data];
+        if (index >= m_native_events.size()) {
+            LOG_ERROR(Service, "nx2:vi2 32 index {} out of range", index);
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.Push(ResultUnknown);
+            return;
+        }
+        LOG_INFO(Service, "nx2:vi2 32 native event {}", index);
+        ReplyNativeEvent(ctx, index);
+    }
+
+    // 261(u64 display name, u32 index): fire the slot on every vblank.
+    void BindVsync(HLERequestContext& ctx) {
+        const u32 index = ctx.CommandBuffer()[4];
+        LOG_INFO(Service, "nx2:vi2 261 native event {} -> vsync", index);
+        if (index < m_native_events.size() && m_native_events[index]) {
+            SetVsyncSlot(index, true);
+        }
+        TipcReplyWords(ctx, {});
+    }
+
+    // 263/265/267/269/271(u64 display name, u32 index): fire the slot when the display's refresh
+    // rate, HDR status, HDR paper white, buffer max resolution or mode capability changes, so the
+    // game re-queries it. None of them change here: fire once so the game reads the current
+    // state, then leave the slot quiet. Kirby Air Riders re-queried its HDR status on every
+    // present while this slot fired with vsync.
+    void BindChange(HLERequestContext& ctx) {
+        const u32 index = ctx.CommandBuffer()[4];
+        LOG_INFO(Service, "nx2:vi2 {} native event {} -> change notification", ctx.GetCommand(), index);
+        if (index < m_native_events.size() && m_native_events[index]) {
+            SetVsyncSlot(index, false);
+            m_native_events[index]->Signal(system.Kernel());
+        }
+        TipcReplyWords(ctx, {});
+    }
+
+    // 262..272 even (u64 display name, u32 index): detach the slot from its source.
+    void UnbindNativeEvent(HLERequestContext& ctx) {
+        const u32 index = ctx.CommandBuffer()[4];
+        LOG_INFO(Service, "nx2:vi2 {} native event {} unbound", ctx.GetCommand(), index);
+        if (index < m_native_events.size() && m_native_events[index]) {
+            SetVsyncSlot(index, false);
+        }
+        TipcReplyWords(ctx, {});
+    }
+
+    void ReplyNativeEvent(HLERequestContext& ctx, u32 index) {
+        auto*& event = m_native_events[index];
+        if (!event) {
+            event = m_context.CreateEvent(fmt::format("nx2:vi2:Native{}", index));
+            m_events.push_back(event);
+            SetVsyncSlot(index, true);
+            StartVsyncTimer();
         }
         IPC::ResponseBuilder rb{ctx, 2, 1, 0};
         rb.Push(ResultSuccess);
-        rb.PushCopyObjects(ctx, m_notification_event->GetReadableEvent());
+        rb.PushCopyObjects(ctx, event->GetReadableEvent());
     }
 
-    // 21(W: 32 u32 notification counts): hand them over and clear.
-    void GetNotifications(HLERequestContext& ctx) {
-        const auto size = std::min<std::size_t>(ctx.GetWriteBufferSize(), sizeof(m_notifications));
-        if (size != 0) {
-            ctx.WriteBuffer(m_notifications.data(), size);
-        }
-        if (size >= sizeof(m_notifications)) {
-            m_notifications.fill(0);
-            if (m_notification_event) {
-                m_notification_event->Clear(system.Kernel());
-            }
-        }
-        IPC::ResponseBuilder rb{ctx, 2};
-        rb.Push(ResultSuccess);
-    }
-
-    // 101(u64 display "default", u32 flags): remember which notification index this display owns.
-    void OpenDisplay(HLERequestContext& ctx) {
-        const auto* w = ctx.CommandBuffer();
-        m_display_notification = w[4];
-        IPC::ResponseBuilder rb{ctx, 2};
-        rb.Push(ResultSuccess);
-    }
-
-    // 102(u64 display): the display retired, wake whoever waits for that notification.
-    void CloseDisplay(HLERequestContext& ctx) {
-        Notify(m_display_notification);
-        IPC::ResponseBuilder rb{ctx, 2};
-        rb.Push(ResultSuccess);
-    }
-
-    // 201(u64 token, u32 retire notification, u32 available notification).
-    void RegisterClientState(HLERequestContext& ctx) {
-        const auto* w = ctx.CommandBuffer();
-        const u64 token = u64{w[2]} | (u64{w[3]} << 32);
-        if (token != 0 && w[4] < m_notifications.size() * 32 && w[5] < m_notifications.size() * 32 &&
-            w[4] != w[5]) {
-            m_clients[token] = w[4];
-        }
-        IPC::ResponseBuilder rb{ctx, 2};
-        rb.Push(ResultSuccess);
-    }
-
-    // 202(u64 token): the client retired; the SDK's render thread blocks on this notification.
-    void UnregisterClientState(HLERequestContext& ctx) {
-        const auto* w = ctx.CommandBuffer();
-        const u64 token = u64{w[2]} | (u64{w[3]} << 32);
-        const auto client = m_clients.find(token);
-        if (client != m_clients.end()) {
-            LOG_INFO(Service, "nx2:vi2 client {:#x} retired, notification {}", token, client->second);
-            Notify(client->second);
-            m_clients.erase(client);
-        }
-        IPC::ResponseBuilder rb{ctx, 2};
-        rb.Push(ResultSuccess);
-    }
-
-    bool AnyNotification() const {
-        return std::ranges::any_of(m_notifications, [](u32 bits) { return bits != 0; });
-    }
-
-    void Notify(u32 index) {
-        if (index >= m_notifications.size() * 32) {
-            return;
-        }
-        m_notifications[index / 32] |= 1U << (index % 32);
-        if (m_notification_event) {
-            m_notification_event->Signal(system.Kernel());
+    void SetVsyncSlot(u32 index, bool on) {
+        auto* event = m_native_events[index];
+        std::scoped_lock lk{m_vsync->mutex};
+        auto& list = m_vsync->events;
+        const auto it = std::find(list.begin(), list.end(), event);
+        if (on && it == list.end()) {
+            list.push_back(event);
+        } else if (!on && it != list.end()) {
+            list.erase(it);
         }
     }
 
-    std::map<u64, u32> m_clients; // token -> retire notification index
-    std::array<u32, 32> m_notifications{};
-    u32 m_display_notification{};
-    Kernel::KEvent* m_notification_event{};
-
-    // 31(u32 kind) and 32(u32 display): events signalled on every vblank. Title 1's main thread
-    // waits on the 32 event until it has fired twice before it submits any GPU work, and hung
-    // there while it never fired.
-    void GetVsyncEvent(HLERequestContext& ctx) {
-        LOG_INFO(Service, "nx2:vi2 {} vsync event, [2]={:#x}", ctx.GetCommand(), ctx.CommandBuffer()[2]);
-        auto* event = m_context.CreateEvent(fmt::format("nx2:vi2:Vsync{}", m_events.size()));
-        m_events.push_back(event);
-        {
-            std::scoped_lock lk{m_vsync->mutex};
-            m_vsync->events.push_back(event);
-        }
+    void StartVsyncTimer() {
         if (!m_vsync_timer) {
-            m_vsync_timer = Core::Timing::CreateEvent(
-                "nx2:vi2 vsync",
-                [vsync_state = m_vsync, &kernel = system.Kernel()](
-                    s64, std::chrono::nanoseconds) -> std::optional<std::chrono::nanoseconds> {
-                    std::scoped_lock lk{vsync_state->mutex};
-                    for (auto* vsync : vsync_state->events) {
-                        vsync->Signal(kernel);
-                    }
-                    return std::nullopt;
-                });
             // EDEN_NX2_VSYNC_HZ=<rate> (experiment): the game starts frames on this event, so a
             // frame that misses a 60 Hz tick idles until the next one.
             static const std::chrono::nanoseconds VblankInterval{[] {
@@ -1993,20 +2424,64 @@ private:
                 const long long hz = text ? (std::max)(std::strtoll(text, nullptr, 10), 1LL) : 60LL;
                 return 1'000'000'000LL / hz;
             }()};
+            m_vsync_timer = Core::Timing::CreateEvent(
+                "nx2:vi2 vsync",
+                [vsync_state = m_vsync, &kernel = system.Kernel()](
+                    s64 scheduled,
+                    std::chrono::nanoseconds late) -> std::optional<std::chrono::nanoseconds> {
+                    std::scoped_lock lk{vsync_state->mutex};
+                    for (auto* vsync : vsync_state->events) {
+                        vsync->Signal(kernel);
+                    }
+                    if (Common::DkbFrameTrace::Enabled()) {
+                        const s64 observed = scheduled + late.count();
+                        ++vsync_state->trace_callbacks;
+                        vsync_state->trace_late_callbacks +=
+                            VblankInterval.count() > 0 && late >= VblankInterval;
+                        vsync_state->trace_max_late =
+                            (std::max)(vsync_state->trace_max_late, late.count());
+                        if (vsync_state->trace_last_callback) {
+                            const s64 gap = observed - *vsync_state->trace_last_callback;
+                            vsync_state->trace_min_gap = vsync_state->trace_min_gap
+                                ? (std::min)(*vsync_state->trace_min_gap, gap) : gap;
+                        }
+                        vsync_state->trace_last_callback = observed;
+                        if (vsync_state->trace_rate.Ready(std::chrono::steady_clock::now())) {
+                            LOG_INFO(Service,
+                                     "DKB vsync present={} callbacks={} bound_events={} interval_ns={} "
+                                     "late_callbacks={} max_late_ns={} min_gap_ns={} "
+                                     "observed_global_ns={} guest_ticks={}",
+                                     vsync_state->trace_present.load(std::memory_order_relaxed),
+                                     vsync_state->trace_callbacks, vsync_state->events.size(),
+                                     VblankInterval.count(), vsync_state->trace_late_callbacks,
+                                     vsync_state->trace_max_late,
+                                     vsync_state->trace_min_gap.value_or(-1), observed,
+                                     kernel.System().CoreTiming().GetClockTicks());
+                            vsync_state->trace_callbacks = 0;
+                            vsync_state->trace_late_callbacks = 0;
+                            vsync_state->trace_max_late = 0;
+                            vsync_state->trace_min_gap.reset();
+                        }
+                    }
+                    return std::nullopt;
+                });
             system.CoreTiming().ScheduleLoopingEvent(VblankInterval, VblankInterval, m_vsync_timer);
         }
-        IPC::ResponseBuilder rb{ctx, 2, 1, 0};
-        rb.Push(ResultSuccess);
-        rb.PushCopyObjects(ctx, event->GetReadableEvent());
     }
 
     KernelHelpers::ServiceContext m_context;
     std::shared_ptr<Nx2NativeObjects> m_objects;
     std::vector<Kernel::KEvent*> m_events;
+    std::array<Kernel::KEvent*, 8> m_native_events{}; ///< 31's slots, also listed in m_events
     // Shared with the vsync timer callback, which can outlive the session by one call.
     struct VsyncState {
         std::mutex mutex;
         std::vector<Kernel::KEvent*> events;
+        Common::DkbFrameTrace::RateLimit trace_rate;
+        std::optional<s64> trace_last_callback, trace_min_gap;
+        s64 trace_max_late{};
+        u64 trace_callbacks{}, trace_late_callbacks{};
+        std::atomic<u64> trace_present{};
     };
     std::shared_ptr<VsyncState> m_vsync = std::make_shared<VsyncState>();
     std::shared_ptr<Core::Timing::EventType> m_vsync_timer;
@@ -2027,8 +2502,10 @@ inline bool Nx2FirstVideoCommand(std::string_view service, u32 command) {
 // The Switch 2 video decoder (nn::codec::video::detail::ipc). gsv 902/906/1002 hand out a session
 // whose TIPC 1 (CreateVideoDecoderService: handle at word 3, result at word 4) creates a decoder
 // service, another session of this class. Layouts read from the SDK's nn::codec VP9 decoder:
-// - 200(copy handle: work buffer transfer memory, u64 size, u32, u32, u32): initialize.
-// - 101(A: codec name or H264 SPS/PPS; u32 width, u32 height, u32 rate, u32): configure.
+// - 200(copy handle: work buffer transfer memory, u64 size, u32, u32, u32): initialize. 201 adds a
+//   fourth u32 (a flag that 200 leaves at 1) and 202 that and a u64: the same initialization.
+//   210(copy handle, u32 x4) replies only a result.
+// - 101(A: codec name, "video/vp9\0"; u32 width, u32 height, u32 rate, u32): configure.
 // - 3(): the submission-ready event (copy handle at word 3, result at word 4).
 // - 6 / 207 / 8: start / stop / flush; 115: finalize.
 // - 311(u32 image id): register an output image (gsv 911 creates it); reply its NativeSyncHandle,
@@ -2038,6 +2515,8 @@ inline bool Nx2FirstVideoCommand(std::string_view service, u32 command) {
 //   rewritten once that handle (the client's reads) has passed. Reply the image's next handle.
 // - 212(u32 image id): unregister it.
 // - 109(A: one compressed frame, u64 pts in us, u8 end of stream): submit input; reply a u64.
+//   400 is the same with a second A buffer after the frame, a 0x838-byte block of frame
+//   information; the decoder here only needs the frame.
 // - 213(): the next finished frame (16 words): u32 image id, u32 width, u32 height, u32 width,
 //   u32 height, u32 colour space, TimeSpan pts (ns), u8 end of stream.
 // A NativeSyncHandle is {u32 SyncCounterId (~syncpoint), u32 mode, u64 value}; clients wait on it
@@ -2053,21 +2532,26 @@ public:
         RegisterHandlersTipc({
             {1, &INx2VideoSession::CreateDecoderService, "CreateVideoDecoderService"},
             {3, &INx2VideoSession::GetEvent, "GetEvent"},
-            {6, &INx2VideoSession::Succeed, "Start"},
+            {6, &INx2VideoSession::Start, "Start"},
             {8, &INx2VideoSession::Flush, "Flush"},
             {101, &INx2VideoSession::Configure, "Configure"},
             {109, &INx2VideoSession::SubmitInput, "SubmitInputBuffer"},
-            {115, &INx2VideoSession::Succeed, "Finalize"},
+            {115, &INx2VideoSession::Finalize, "Finalize"},
             {200, &INx2VideoSession::Succeed, "Initialize"},
+            {201, &INx2VideoSession::Succeed, "InitializeWithFlag"},
+            {202, &INx2VideoSession::Succeed, "InitializeWithFlagAndValue"},
             {207, &INx2VideoSession::Flush, "Stop"},
+            {210, &INx2VideoSession::Succeed, "Unknown210"},
             {212, &INx2VideoSession::UnregisterBuffer, "UnregisterBuffer"},
             {213, &INx2VideoSession::GetOutputInfo, "GetOutputInfo"},
             {311, &INx2VideoSession::RegisterBuffer, "RegisterBuffer"},
             {314, &INx2VideoSession::ReleaseBuffer, "ReleaseBuffer"},
+            {400, &INx2VideoSession::SubmitInput, "SubmitInputBufferWithInfo"},
         });
     }
 
     ~INx2VideoSession() override {
+        m_ready->SetRunning(system.Kernel(), false);
         if (m_worker.joinable()) {
             {
                 std::scoped_lock lk{m_mutex};
@@ -2093,11 +2577,7 @@ public:
     }
 
 private:
-    struct Input {
-        std::vector<u8> data;
-        u64 pts; // us
-        bool end;
-    };
+    using Input = Nx2VideoInputQueue::Input;
     struct Decoded {
         std::optional<Tegra::Host1x::Nx2Picture> picture; // none: an empty end-of-stream frame
         u64 pts;
@@ -2116,7 +2596,6 @@ private:
     };
 
     static constexpr u32 NoSyncpoint = ~0U;
-    static constexpr size_t MaxQueuedInputs = 8;
     static constexpr size_t MaxDecodedAhead = 2; // decoded frames held while no image is free
     static constexpr u32 HostSyncpoints = 192;   // Tegra::Host1x::SyncpointManager
 
@@ -2125,6 +2604,10 @@ private:
         if (Nx2FirstVideoCommand(GetServiceName(), ctx.GetCommand())) {
             LOG_INFO(Service, "{} TIPC {} {} (first use): words {:08x}", GetServiceName(),
                      ctx.GetCommand(), what, fmt::join(std::span<const u32>{w, 12}, " "));
+        } else if (Nx2VideoTraceEnabled()) {
+            // EDEN_NX2_VDEC_TRACE=1: every video decoder call at Info level.
+            LOG_INFO(Service, "{} TIPC {} {}: [2]={:#x} [3]={:#x} [4]={:#x} [5]={:#x}",
+                     GetServiceName(), ctx.GetCommand(), what, w[2], w[3], w[4], w[5]);
         } else {
             LOG_DEBUG(Service, "{} TIPC {} {}: [2]={:#x} [3]={:#x} [4]={:#x} [5]={:#x}",
                       GetServiceName(), ctx.GetCommand(), what, w[2], w[3], w[4], w[5]);
@@ -2150,19 +2633,51 @@ private:
         TipcReplyWords(ctx, {});
     }
 
+    void Start(HLERequestContext& ctx) {
+        Log(ctx, "start");
+        if (Nx2VideoTraceEnabled()) {
+            LOG_INFO(Service, "nx2:vdec trace start syncpoint={}", m_syncpoint);
+        }
+        m_ready->SetRunning(system.Kernel(), true);
+        m_ready->Signal(system.Kernel());
+        TipcReplyWords(ctx, {});
+    }
+
     void Configure(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
-        std::vector<u8> configuration;
+        std::string codec;
+        std::span<const u8> name_buf;
         if (!ctx.BufferDescriptorA().empty()) {
-            const auto data = ctx.ReadBufferA(0);
-            configuration.assign(data.begin(), data.end());
+            name_buf = ctx.ReadBufferA(0);
+            codec.assign(reinterpret_cast<const char*>(name_buf.data()),
+                         strnlen(reinterpret_cast<const char*>(name_buf.data()), name_buf.size()));
+        }
+        if (name_buf.empty() && !ctx.BufferDescriptorX().empty()) {
+            name_buf = ctx.ReadBufferX(0);
+            codec.assign(reinterpret_cast<const char*>(name_buf.data()),
+                         strnlen(reinterpret_cast<const char*>(name_buf.data()), name_buf.size()));
+        }
+        if (!name_buf.empty()) {
+            if (codec.empty()) {
+                const std::string_view sv{reinterpret_cast<const char*>(name_buf.data()), name_buf.size()};
+                for (const auto& candidate : {"video/avc", "video/vp9", "video/vp8", "video/hevc"}) {
+                    if (sv.find(candidate) != std::string_view::npos) {
+                        codec = candidate;
+                        break;
+                    }
+                }
+            }
+            if (codec.empty()) {
+                LOG_INFO(Service, "{} configure: no codec name in {:02x}", GetServiceName(),
+                         fmt::join(name_buf, " "));
+            }
         }
         Log(ctx, "configure");
-        LOG_INFO(Service, "{} configure {} codec bytes {}x{} rate {}", GetServiceName(),
-                 configuration.size(), w[5], w[6], w[7]);
+        LOG_INFO(Service, "{} configure codec \"{}\" {}x{} rate {}", GetServiceName(), codec, w[5],
+                 w[6], w[7]);
         {
             std::scoped_lock lk{m_mutex};
-            m_configuration = std::move(configuration);
+            m_codec = std::move(codec);
             m_width = w[5];
             m_height = w[6];
         }
@@ -2187,16 +2702,13 @@ private:
                 "nx2:vdec ready",
                 [ready = m_ready, &kernel = system.Kernel()](
                     s64, std::chrono::nanoseconds) -> std::optional<std::chrono::nanoseconds> {
-                    std::scoped_lock lk{ready->mutex};
-                    if (ready->event != nullptr && ready->room.load(std::memory_order_relaxed)) {
-                        ready->event->Signal(kernel);
-                    }
+                    ready->Signal(kernel);
                     return std::nullopt;
                 });
             constexpr std::chrono::nanoseconds ReadyInterval{std::chrono::milliseconds{4}};
             system.CoreTiming().ScheduleLoopingEvent(ReadyInterval, ReadyInterval, m_ready_timer);
         }
-        m_event->Signal(system.Kernel());
+        m_ready->Signal(system.Kernel());
         IPC::ResponseBuilder rb{ctx, 2, 1, 0};
         rb.Push(ResultSuccess);
         rb.PushCopyObjects(ctx, m_event->GetReadableEvent());
@@ -2218,18 +2730,33 @@ private:
             if (release_fence) {
                 m_release_fences[image] = *release_fence;
             }
-            // After the end of a stream nothing fills an image again, so a release completes at
-            // once: its fence is the syncpoint's current value. Mario Kart World releases its
-            // images after a movie ends and waits for the returned fences; a fence for a frame
-            // that never comes hung the game on a black screen after its title movie.
-            if (release_fence && m_stream_ended && m_inputs.empty() && m_decoded.empty()) {
-                const u32 reached = static_cast<u32>(
-                    system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(m_syncpoint));
+            // Mario Kart World waits for returned images after a movie and acquires a frame for
+            // each completed fence, so its released images need synthetic end-of-stream frames.
+            static const bool release_now = [] {
+                const char* env_value = std::getenv("EDEN_NX2_VDEC_EOS_RELEASE_NOW");
+                return env_value != nullptr && env_value[0] != '0';
+            }();
+            const bool drain_eos =
+                system.GetApplicationProcessProgramID() == Settings::MarioKartWorldProgramId;
+            if ((drain_eos || release_now) && release_fence && m_stream_ended && m_inputs.Empty() &&
+                m_decoded.empty()) {
+                const u32 reached =
+                    drain_eos ? DrainFreeAsEndOfStream()
+                              : static_cast<u32>(system.Host1x().GetSyncpointManager()
+                                                     .GetGuestSyncpointValue(m_syncpoint));
                 m_sync_base = reached;
                 m_handed = 0;
                 value = reached;
             } else {
                 value = m_sync_base + ++m_handed;
+            }
+            if (Nx2VideoTraceEnabled()) {
+                LOG_INFO(Service,
+                         "nx2:vdec trace handout syncpoint={} image={} release={} fence={} "
+                         "current={} eos={} inputs={} decoded={} outputs={}",
+                         m_syncpoint, image, release_fence.has_value(), value,
+                         system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(m_syncpoint),
+                         m_stream_ended, m_inputs.Size(), m_decoded.size(), m_outputs.size());
             }
         }
         m_cv.notify_one();
@@ -2262,20 +2789,31 @@ private:
 
     void SubmitInput(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
-        // Words 2-4 are the A descriptor of the compressed frame.
-        const u64 pts = u64{w[5]} | (u64{w[6]} << 32);
-        const bool end = (w[7] & 0xFF) != 0;
+        // Words 2-4 are the A descriptor of the compressed frame (400: 5-7 that of its information
+        // block), the data words follow.
+        const size_t words = 2 + 3 * ctx.BufferDescriptorA().size();
+        const u64 pts = u64{w[words]} | (u64{w[words + 1]} << 32);
+        const bool end = (w[words + 2] & 0xFF) != 0;
         Log(ctx, "submit");
         Input input{{}, pts, end};
         if (!ctx.BufferDescriptorA().empty()) {
             const auto data = ctx.ReadBufferA(0);
             input.data.assign(data.begin(), data.end());
         }
+        const auto input_size = input.data.size();
         {
             std::scoped_lock lk{m_mutex};
-            m_inputs.push_back(std::move(input));
+            m_inputs.Push(std::move(input));
             m_stream_ended = false;
-            m_ready->room.store(m_inputs.size() < MaxQueuedInputs, std::memory_order_relaxed);
+            m_end_queued |= end;
+            m_ready->room.store(!m_end_queued && m_inputs.BelowReadyWatermark(),
+                                std::memory_order_relaxed);
+            if (Nx2VideoTraceEnabled()) {
+                LOG_INFO(Service,
+                         "nx2:vdec trace submit syncpoint={} input={} bytes={} pts={} eos={} queued={}",
+                         m_syncpoint, m_submitted + 1, input_size, pts, end,
+                         m_inputs.Size());
+            }
         }
         m_cv.notify_one();
         const u64 id = ++m_submitted;
@@ -2286,15 +2824,67 @@ private:
     // handed out keep their place, so the sync values stay in step with the client's ring.
     void Flush(HLERequestContext& ctx) {
         Log(ctx, ctx.GetCommand() == 8 ? "flush" : "stop");
+        if (ctx.GetCommand() == 207) {
+            m_ready->SetRunning(system.Kernel(), false);
+        }
         {
             std::scoped_lock lk{m_mutex};
-            m_inputs.clear();
+            if (Nx2VideoTraceEnabled()) {
+                LOG_INFO(Service,
+                         "nx2:vdec trace {} syncpoint={} inputs={} decoded={} outputs={} "
+                         "decoded_frames={} frames_out={} eos={} eos_queued={}",
+                         ctx.GetCommand() == 8 ? "flush" : "stop", m_syncpoint, m_inputs.Size(),
+                         m_decoded.size(), m_outputs.size(), m_decoded_frames, m_frames_out,
+                         m_stream_ended, m_end_queued);
+            }
+            m_inputs.Clear();
             m_flush = true;
             m_stream_ended = false;
+            m_end_queued = false;
             m_ready->room.store(true, std::memory_order_relaxed);
+            // Only Stop: Bananza flushes (8) after its movies end and treats every completed
+            // fence as a frame to acquire.
+            if (ctx.GetCommand() == 207) {
+                CompleteHandedFences();
+            }
         }
         m_cv.notify_one();
         TipcReplyWords(ctx, {});
+    }
+
+    void Finalize(HLERequestContext& ctx) {
+        Log(ctx, "finalize");
+        m_ready->SetRunning(system.Kernel(), false);
+        {
+            std::scoped_lock lk{m_mutex};
+            if (Nx2VideoTraceEnabled()) {
+                LOG_INFO(Service,
+                         "nx2:vdec trace finalize syncpoint={} inputs={} decoded={} outputs={} "
+                         "decoded_frames={} frames_out={} eos={} eos_queued={}",
+                         m_syncpoint, m_inputs.Size(), m_decoded.size(), m_outputs.size(),
+                         m_decoded_frames, m_frames_out, m_stream_ended, m_end_queued);
+            }
+            CompleteHandedFences();
+        }
+        TipcReplyWords(ctx, {});
+    }
+
+    // Advances the decoder's syncpoint to the last value handed out (m_mutex held).
+    void CompleteHandedFences() {
+        if (m_syncpoint == NoSyncpoint) {
+            return;
+        }
+        auto& syncpoints = system.Host1x().GetSyncpointManager();
+        const u32 target = m_sync_base + m_handed;
+        u32 current = static_cast<u32>(syncpoints.GetGuestSyncpointValue(m_syncpoint));
+        if (Nx2VideoTraceEnabled()) {
+            LOG_INFO(Service, "nx2:vdec trace complete fences syncpoint={} current={} target={}",
+                     m_syncpoint, current, target);
+        }
+        while (static_cast<s32>(target - current) > 0) {
+            syncpoints.IncrementGuest(m_syncpoint);
+            ++current;
+        }
     }
 
     void GetOutputInfo(HLERequestContext& ctx) {
@@ -2308,12 +2898,21 @@ private:
             }
         }
         if (!output) {
+            if (Nx2VideoTraceEnabled()) {
+                LOG_INFO(Service, "nx2:vdec trace output empty syncpoint={} result=0x1c286f",
+                         m_syncpoint);
+            }
             // Nothing finished: the code the client's own Acquire uses for an empty ring.
             IPC::ResponseBuilder rb{ctx, 2};
             rb.PushRaw<u32>(0x1c286f);
             return;
         }
         const u64 pts_ns = output->pts * 1000;
+        if (Nx2VideoTraceEnabled()) {
+            LOG_INFO(Service, "nx2:vdec trace output syncpoint={} image={} size={}x{} pts={} eos={}",
+                     m_syncpoint, output->image, output->width, output->height, output->pts,
+                     output->end);
+        }
         TipcReplyWords(ctx, {output->image, output->width, output->height, output->width,
                              output->height, 0, static_cast<u32>(pts_ns),
                              static_cast<u32>(pts_ns >> 32), output->end ? 1U : 0U, 0, 0, 0, 0,
@@ -2327,12 +2926,11 @@ private:
         std::unique_ptr<Tegra::Host1x::Nx2VideoDecoder> decoder;
         std::vector<Tegra::Host1x::Nx2Picture> pictures;
         std::vector<u8> bytes;
-        std::vector<u8> tiled_bytes;
         std::unique_lock lk{m_mutex};
         while (true) {
             m_cv.wait(lk, [&] {
                 return m_quit || m_flush || (!m_decoded.empty() && !m_free.empty()) ||
-                       (!m_inputs.empty() && m_decoded.size() < MaxDecodedAhead);
+                       (!m_inputs.Empty() && m_decoded.size() < MaxDecodedAhead);
             });
             if (m_quit) {
                 return;
@@ -2361,15 +2959,21 @@ private:
                 if (fence) {
                     WaitForRelease(*fence);
                 }
-                const auto [width, height] =
-                    WriteImage(decoder.get(), image, frame, bytes, tiled_bytes);
+                const auto [width, height] = WriteImage(decoder.get(), image, frame, bytes);
                 lk.lock();
                 // Even an image written during a flush counts: the client waits for its value.
                 m_outputs.push_back({image, width, height, frame.pts, frame.end});
                 if (frame.end) {
                     m_stream_ended = true;
+                    m_end_queued = false;
+                    m_ready->room.store(false, std::memory_order_relaxed);
                 }
                 system.Host1x().GetSyncpointManager().IncrementGuest(m_syncpoint);
+                m_last_output = m_outputs.back();
+                if (frame.end && m_inputs.Empty() && m_decoded.empty() &&
+                    system.GetApplicationProcessProgramID() == Settings::MarioKartWorldProgramId) {
+                    DrainFreeAsEndOfStream();
+                }
                 ++m_frames_out;
                 if (m_frames_out == 1 || (m_frames_out % 600) == 0 || frame.end) {
                     LOG_INFO(Service, "{} frame {} ({}x{}, pts {} us{}) in image {}",
@@ -2378,13 +2982,28 @@ private:
                 }
                 continue;
             }
-            Input input = std::move(m_inputs.front());
-            m_inputs.pop_front();
-            m_ready->room.store(m_inputs.size() < MaxQueuedInputs, std::memory_order_relaxed);
-            const auto configuration = m_configuration;
+            Input input = m_inputs.Pop();
+            if (!m_stream_ended && !m_end_queued) {
+                m_ready->room.store(m_inputs.BelowReadyWatermark(), std::memory_order_relaxed);
+            }
+            std::string codec = m_codec;
+            if (codec.empty() && Tegra::Host1x::IsH264Stream(input.data)) {
+                codec = "video/avc";
+                m_codec = codec;
+                LOG_INFO(Service, "{} empty codec, detected H.264 stream: using \"{}\"",
+                         GetServiceName(), codec);
+            }
             lk.unlock();
-            if (!decoder || !std::ranges::equal(decoder->Configuration(), configuration)) {
-                decoder = std::make_unique<Tegra::Host1x::Nx2VideoDecoder>(configuration);
+            if (!decoder || decoder->Name() != codec) {
+                if (codec.empty()) {
+                    LOG_WARNING(Service,
+                                "{} input without codec: size {}, pts {}, end {}, first bytes {:02x}",
+                                GetServiceName(), input.data.size(), input.pts, input.end,
+                                fmt::join(std::span<const u8>{input.data}.first(
+                                              std::min(input.data.size(), size_t{16})),
+                                          " "));
+                }
+                decoder = std::make_unique<Tegra::Host1x::Nx2VideoDecoder>(codec);
             }
             pictures.clear();
             decoder->Decode(input.data, input.pts, pictures);
@@ -2392,6 +3011,14 @@ private:
                 decoder->Drain(pictures);
             }
             lk.lock();
+            m_decoded_frames += pictures.size();
+            if (Nx2VideoTraceEnabled()) {
+                LOG_INFO(Service,
+                         "nx2:vdec trace decode syncpoint={} codec={} open={} pts={} eos={} "
+                         "pictures={} decoded_frames={} discarded_by_flush={}",
+                         m_syncpoint, decoder->Name(), decoder->IsOpen(), input.pts, input.end,
+                         pictures.size(), m_decoded_frames, m_flush);
+            }
             if (m_flush) {
                 continue;
             }
@@ -2411,6 +3038,22 @@ private:
         }
     }
 
+    u32 DrainFreeAsEndOfStream() {
+        auto& syncpoints = system.Host1x().GetSyncpointManager();
+        if (Nx2VideoTraceEnabled()) {
+            LOG_INFO(Service, "nx2:vdec trace synthetic EOS syncpoint={} images={}",
+                     m_syncpoint, m_free.size());
+        }
+        while (!m_free.empty()) {
+            const u32 image = m_free.front();
+            m_free.pop_front();
+            m_release_fences.erase(image);
+            m_outputs.push_back({image, m_last_output.width, m_last_output.height, m_last_output.pts, true});
+            syncpoints.IncrementGuest(m_syncpoint);
+        }
+        return static_cast<u32>(syncpoints.GetGuestSyncpointValue(m_syncpoint));
+    }
+
     // Waits (bounded) until the client's reads of an image it gave back have passed.
     void WaitForRelease(const Fence& fence) {
         if (fence.syncpoint >= HostSyncpoints) {
@@ -2422,58 +3065,115 @@ private:
                std::chrono::steady_clock::now() < deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds{1});
         }
+        if (Nx2VideoTraceEnabled()) {
+            LOG_INFO(Service, "nx2:vdec trace release wait syncpoint={} value={} reached={}",
+                     fence.syncpoint, fence.value,
+                     syncpoints.IsReadyGuest(fence.syncpoint, fence.value));
+        }
     }
 
     // Writes a decoded frame into an output image; returns the size the frame reports.
     std::pair<u32, u32> WriteImage(Tegra::Host1x::Nx2VideoDecoder* decoder, u32 image_id,
-                                   const Decoded& frame, std::vector<u8>& bytes,
-                                   std::vector<u8>& tiled_bytes) {
+                                   const Decoded& frame, std::vector<u8>& bytes) {
         u64 address{};
+        u32 parent{};
+        u64 parent_offset{};
         Nx2DecoderImageLayout layout{};
+        bool block_linear{};
         {
             std::scoped_lock lk{m_objects->mutex};
             const auto image = m_objects->images.find(image_id);
             if (image == m_objects->images.end()) {
+                if (Nx2VideoTraceEnabled()) {
+                    LOG_INFO(Service, "nx2:vdec trace write skipped syncpoint={} image={} destroyed",
+                             m_syncpoint, image_id);
+                }
                 return {m_width, m_height};
             }
             layout = Nx2CalculateDecoderImageLayout(image->second.preference.data());
+            block_linear = image->second.gpu_read &&
+                           layout.format != Tegra::Host1x::Nx2PictureFormat::Nv12;
             const auto memory = m_objects->memories.find(image->second.memory);
             if (memory != m_objects->memories.end() && memory->second.address != 0) {
                 address = memory->second.address + image->second.offset;
+                parent = memory->second.parent;
+                parent_offset = memory->second.parent_offset + image->second.offset;
             }
         }
         if (!frame.picture || decoder == nullptr || address == 0 ||
             system.ApplicationProcess() == nullptr) {
+            if (Nx2VideoTraceEnabled()) {
+                LOG_INFO(Service,
+                         "nx2:vdec trace write skipped syncpoint={} image={} cpu={:#x} picture={} eos={}",
+                         m_syncpoint, image_id, address, frame.picture.has_value(), frame.end);
+            }
             return {std::min(m_width, layout.width), std::min(m_height, layout.height)};
         }
+        const auto trace_write = [&] {
+            if (!Nx2VideoTraceEnabled()) {
+                return;
+            }
+            auto& registry = Nvidia::Devices::Nx2GpuMemoryRegistry::Get();
+            auto gpu_address = registry.GpuAddressOf(parent, parent_offset);
+            const auto device = registry.DeviceAddressOf(address);
+            if (!gpu_address && device && registry.DeviceAddressOfGpu(address) == device) {
+                gpu_address = address;
+            }
+            LOG_INFO(Service,
+                     "nx2:vdec trace write syncpoint={} decoded_frames={} output={} codec={} "
+                     "image={} cpu={:#x} gpu={:#x} gpu_known={} device={:#x} mapped={} "
+                     "format={} block_linear={} pitch={} chroma={:#x} pts={} eos={}",
+                     m_syncpoint, m_decoded_frames, m_frames_out + 1, decoder->Name(), image_id,
+                     address, gpu_address.value_or(0), gpu_address.has_value(),
+                     device.value_or(0), device.has_value(), static_cast<u32>(layout.format),
+                     block_linear, layout.pitch, layout.chroma_offset, frame.pts, frame.end);
+            std::scoped_lock lk{m_objects->mutex};
+            m_objects->last_video_write = Nx2NativeObjects::VideoTrace{
+                m_syncpoint, m_decoded_frames, image_id, gpu_address.value_or(0),
+                device.value_or(0), frame.pts, decoder->Name()};
+        };
         // A frame larger than the image is scaled down to it.
         const u32 width = std::min(frame.picture->width, layout.width);
         const u32 height = std::min(frame.picture->height, layout.height);
         bytes.resize(layout.size);
-        decoder->Render(*frame.picture, layout.format, width, height, layout.pitch,
-                        layout.chroma_offset, bytes);
-        DumpFrame(bytes, layout, width, height);
         auto& memory = system.ApplicationMemory();
-        if (layout.block_linear) {
-            tiled_bytes.assign(layout.size, 0);
-            Tegra::Texture::SwizzleSubrect(tiled_bytes, bytes, 4, layout.width, layout.height, 1,
-                                           0, 0, width, height, layout.gob_height_log2, 0,
-                                           static_cast<u32>(layout.pitch), true);
-            memory.WriteBlock(address, tiled_bytes.data(), tiled_bytes.size());
+        if (block_linear) {
+            // Read on the GPU: RGBA (the blit's format 0xd5) in the native block-linear layout,
+            // 16-GOB blocks, as our Eden tree writes these images.
+            decoder->Render(*frame.picture, Tegra::Host1x::Nx2PictureFormat::Rgba8, width, height,
+                            layout.pitch, 0, bytes);
+            DumpFrame(image_id, bytes, layout, width, height);
+            m_tiled.resize(layout.size);
+            Tegra::Texture::SwizzleTexture(m_tiled, bytes, 4, static_cast<u32>(layout.pitch / 4),
+                                           layout.height, 1, 4, 0, 1, true);
+            memory.WriteBlock(address, m_tiled.data(), m_tiled.size());
+            if (const auto device =
+                    Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(address)) {
+                system.GPU().InvalidateRegion(*device, m_tiled.size());
+            }
+            trace_write();
             return {width, height};
         }
+        decoder->Render(*frame.picture, layout.format, width, height, layout.pitch,
+                        layout.chroma_offset, bytes);
+        DumpFrame(image_id, bytes, layout, width, height);
         memory.WriteBlock(address, bytes.data(), layout.pitch * height);
         if (layout.format == Tegra::Host1x::Nx2PictureFormat::Nv12) {
             memory.WriteBlock(address + layout.chroma_offset, bytes.data() + layout.chroma_offset,
                               layout.pitch * ((height + 1) / 2));
         }
+        // The game samples the image on the GPU: drop the texture cache's copy of the old frame.
+        if (const auto device = Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(address)) {
+            system.GPU().InvalidateRegion(*device, layout.size);
+        }
+        trace_write();
         return {width, height};
     }
 
-    // EDEN_NX2_VDEC_DUMP=<dir>: sample every 120th decoded frame at quarter size, saving
-    // NV12 luma or the first RGB channel as PGM, and RGB output as PPM before storage conversion.
-    void DumpFrame(const std::vector<u8>& bytes, const Nx2DecoderImageLayout& layout, u32 width,
-                   u32 height) {
+    // EDEN_NX2_VDEC_DUMP=<dir>: save the luma of every 120th decoded frame, a quarter of its size,
+    // as nx2-vdec-image-<id>-<frame>.pgm (apart from how the game shows it).
+    void DumpFrame(u32 image_id, const std::vector<u8>& bytes, const Nx2DecoderImageLayout& layout,
+                   u32 width, u32 height) {
         static const char* const directory = std::getenv("EDEN_NX2_VDEC_DUMP");
         if (directory == nullptr || (m_frames_out % 120) != 0) {
             return;
@@ -2481,7 +3181,8 @@ private:
         const u32 bpp = layout.format == Tegra::Host1x::Nx2PictureFormat::Nv12 ? 1 : 4;
         const u32 w = width / 4;
         const u32 h = height / 4;
-        const std::string path = fmt::format("{}/nx2-vdec-{:05}.pgm", directory, m_frames_out + 1);
+        const std::string path =
+            fmt::format("{}/nx2-vdec-image-{}-{:05}.pgm", directory, image_id, m_frames_out + 1);
         if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
             std::fprintf(file, "P5 %u %u 255\n", w, h);
             for (u32 y = 0; y < h; ++y) {
@@ -2491,54 +3192,35 @@ private:
             }
             std::fclose(file);
         }
-        if (layout.format != Tegra::Host1x::Nx2PictureFormat::Nv12) {
-            const std::string color_path =
-                fmt::format("{}/nx2-vdec-{:05}.ppm", directory, m_frames_out + 1);
-            if (std::FILE* file = std::fopen(color_path.c_str(), "wb")) {
-                std::fprintf(file, "P6 %u %u 255\n", w, h);
-                const bool bgra = layout.format == Tegra::Host1x::Nx2PictureFormat::Bgra8;
-                for (u32 y = 0; y < h; ++y) {
-                    for (u32 x = 0; x < w; ++x) {
-                        const u8* pixel = bytes.data() + y * 4 * layout.pitch + x * 16;
-                        std::fputc(pixel[bgra ? 2 : 0], file);
-                        std::fputc(pixel[1], file);
-                        std::fputc(pixel[bgra ? 0 : 2], file);
-                    }
-                }
-                std::fclose(file);
-            }
-        }
     }
-
-    struct ReadyState {
-        std::mutex mutex;
-        Kernel::KEvent* event{};
-        std::atomic<bool> room{true}; ///< The input queue takes more frames
-    };
 
     KernelHelpers::ServiceContext m_context;
     std::shared_ptr<Nx2NativeObjects> m_objects;
     Kernel::KEvent* m_event{};
-    std::shared_ptr<ReadyState> m_ready = std::make_shared<ReadyState>();
+    std::shared_ptr<Nx2VideoReadyState> m_ready = std::make_shared<Nx2VideoReadyState>();
     std::shared_ptr<Core::Timing::EventType> m_ready_timer;
     u64 m_submitted{};
     u32 m_syncpoint{NoSyncpoint}; ///< Counts finished frames (allocated at the first register)
     u32 m_sync_base{};            ///< Its value before the first frame
+    std::vector<u8> m_tiled;      ///< Decode thread: block-linear copy of a frame (WriteImage)
 
     // Shared with the decode thread.
     std::mutex m_mutex;
     std::condition_variable m_cv;
-    std::vector<u8> m_configuration;
+    std::string m_codec;
     u32 m_width{};
     u32 m_height{};
     u32 m_handed{}; ///< Output images handed out (registered or released) so far
     u64 m_frames_out{};
-    std::deque<Input> m_inputs;
+    u64 m_decoded_frames{};
+    Nx2VideoInputQueue m_inputs;
     std::deque<Decoded> m_decoded;     ///< Waiting for a free output image
     std::deque<u32> m_free;            ///< Output images, in the order the client acquires them
     std::map<u32, Fence> m_release_fences;
     std::deque<Output> m_outputs;      ///< Finished, for 213
+    Output m_last_output{};
     bool m_stream_ended{};             ///< End-of-stream frame handed out, nothing submitted since
+    bool m_end_queued{};
     bool m_flush{};
     bool m_quit{};
     std::thread m_worker;
@@ -2559,11 +3241,9 @@ public:
             {204, &INx2GraphicsSystemSession::AttachSyncptMemory, "AttachSyncptMemory (guessed)"},
             {305, &INx2GraphicsSystemSession::OpenViSession, "OpenViSession (guessed)"},
             {497, &INx2GraphicsSystemSession::OpenGpuSession, "OpenGpuSession (guessed)"},
-            {1121, &INx2GraphicsSystemSession::OpenGpuTimeSession, "OpenGpuTimeSession"},
             {111, &INx2GraphicsSystemSession::CreateNativeMemory, "CreateNativeMemory"},
             {112, &INx2GraphicsSystemSession::DestroyNativeMemory, "DestroyNativeMemory"},
             {114, &INx2GraphicsSystemSession::BindNativeMemory, "BindNativeMemory"},
-            {115, &INx2GraphicsSystemSession::ConfigureNativeMemory, "ConfigureNativeMemory"},
             {314, &INx2GraphicsSystemSession::ConfigureWindowImagePool, "DestroyNativeWindowAliasImagePool"},
             {315, &INx2GraphicsSystemSession::ConfigureWindowImagePool, "CreateNativeWindowAliasImagePool"},
             {423, &INx2GraphicsSystemSession::BindNativeGpuMemory, "BindNativeGpuMemory"},
@@ -2579,6 +3259,7 @@ public:
              "CalculateDecoderImagePoolBuffer"},
             {901, &INx2GraphicsSystemSession::Stub, "VideoInitialize (guessed)"},
             {902, &INx2GraphicsSystemSession::OpenVideoSession, "OpenVideoDecoderSession (guessed)"},
+            {905, &INx2GraphicsSystemSession::OpenVideoSession, "OpenVideoDecoderSessionWithFlag"},
             {906, &INx2GraphicsSystemSession::OpenVideoSession, "OpenVideoDecoderSessionWithVersion"},
             {1001, &INx2GraphicsSystemSession::Stub, "VideoInitialize2 (guessed)"},
             {1002, &INx2GraphicsSystemSession::OpenVideoSession, "OpenVideoDecoderSession2 (guessed)"},
@@ -2591,7 +3272,92 @@ public:
             {1291, &INx2GraphicsSystemSession::CalculateChatImagePoolSize,
              "CalculateChatImagePoolSize (guessed)"},
             {911, &INx2GraphicsSystemSession::CreateDecoderImage, "CreateDecoderImage"},
+            // 912(u32 image id): the video group's x12, freeing one decoder output image (Switch
+            // Sports frees its four when its movie ends). Unlisting it stops the decode thread
+            // writing frames into memory the game reuses.
+            {912, &INx2GraphicsSystemSession::DestroyNativeImage, "DestroyDecoderImage"},
             {961, &INx2GraphicsSystemSession::GetCpuImageDescriptor, "GetCpuUserImageDescriptor"},
+            // Firmware commands without a known meaning: zeroed replies.
+            {11, &INx2GraphicsSystemSession::RegisterClientHandle, "RegisterClientHandle"},
+            {113, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown113"},
+            {115, &INx2GraphicsSystemSession::QueryGrantedFeatures, "QueryGrantedFeatures"},
+            {120, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown120"},
+            {121, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown121"},
+            {122, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown122"},
+            {123, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown123"},
+            {124, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown124"},
+            {125, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown125"},
+            {126, &INx2GraphicsSystemSession::GetSessionFlag, "GetSessionFlag"},
+            {131, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown131"},
+            {133, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown133"},
+            {187, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown187"},
+            {201, &INx2GraphicsSystemSession::CheckPermission, "CheckPermission201"},
+            {211, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown211"},
+            {212, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown212"},
+            {213, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown213"},
+            {214, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown214"},
+            {215, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown215"},
+            {301, &INx2GraphicsSystemSession::CheckPermission, "CheckPermission301"},
+            {303, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown303"},
+            {311, &INx2GraphicsSystemSession::CreateNativeImage, "CreateFeatureImagePool311"},
+            {312, &INx2GraphicsSystemSession::DestroyNativeImage, "DestroyFeatureImagePool312"},
+            {321, &INx2GraphicsSystemSession::CreateNativeImage, "CreateFeatureImagePool321"},
+            {361, &INx2GraphicsSystemSession::GetCpuImageDescriptor, "GetFeatureCpuImageDescriptor361"},
+            {391, &INx2GraphicsSystemSession::CalculateChatImagePoolSize, "CalculateFeatureImagePoolSize391"},
+            {401, &INx2GraphicsSystemSession::CheckPermission, "CheckPermission401"},
+            {402, &INx2GraphicsSystemSession::CheckPermission, "CheckPermission402"},
+            {403, &INx2GraphicsSystemSession::CheckPermission, "CheckPermission403"},
+            {424, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown424"},
+            {425, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown425"},
+            {427, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown427"},
+            {434, &INx2GraphicsSystemSession::AttachGpuAddressSpace, "AttachGpuAddressSpace"},
+            {436, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown436"},
+            {461, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown461"},
+            {462, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown462"},
+            {463, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown463"},
+            {464, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown464"},
+            {465, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown465"},
+            {466, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown466"},
+            {467, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown467"},
+            {468, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown468"},
+            {493, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown493"},
+            {494, &INx2GraphicsSystemSession::CheckPermission, "CheckPermission494"},
+            {603, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown603"},
+            {612, &INx2GraphicsSystemSession::DestroyNativeImage, "DestroyFeatureImagePool612"},
+            {613, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown613"},
+            {614, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown614"},
+            {615, &INx2GraphicsSystemSession::CreateNativeImage, "CreateFeatureImagePool615"},
+            {691, &INx2GraphicsSystemSession::CalculateChatImagePoolSize, "CalculateFeatureImagePoolSize691"},
+            {801, &INx2GraphicsSystemSession::CheckPermission, "CheckPermission801"},
+            {802, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown802"},
+            {803, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown803"},
+            {811, &INx2GraphicsSystemSession::CreateNativeImage, "CreateFeatureImagePool811"},
+            {812, &INx2GraphicsSystemSession::DestroyNativeImage, "DestroyFeatureImagePool812"},
+            {813, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown813"},
+            {814, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown814"},
+            {861, &INx2GraphicsSystemSession::GetCpuImageDescriptor, "GetFeatureCpuImageDescriptor861"},
+            {891, &INx2GraphicsSystemSession::CalculateChatImagePoolSize, "CalculateFeatureImagePoolSize891"},
+            {1003, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown1003"},
+            {1011, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown1011"},
+            {1012, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown1012"},
+            {1091, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown1091"},
+            {1101, &INx2GraphicsSystemSession::CheckPermission, "CheckPermission1101"},
+            {1102, &INx2GraphicsSystemSession::CheckPermission, "CheckPermission1102"},
+            {1111, &INx2GraphicsSystemSession::SetFeatureVersion, "SetFeatureVersion"},
+            {1112, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown1112"},
+            {1113, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown1113"},
+            {1121, &INx2GraphicsSystemSession::OpenGpuTimeSession, "OpenGpuTimeSession"},
+            {1203, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown1203"},
+            {1212, &INx2GraphicsSystemSession::DestroyNativeImage, "DestroyFeatureImagePool1212"},
+            {1501, &INx2GraphicsSystemSession::CheckPermission, "CheckPermission1501"},
+            {1502, &INx2GraphicsSystemSession::CheckPermission, "CheckPermission1502"},
+            {1503, &INx2GraphicsSystemSession::CheckPermission, "CheckPermission1503"},
+            {1601, &INx2GraphicsSystemSession::CheckPermission, "CheckPermission1601"},
+            {1602, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown1602"},
+            {1603, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown1603"},
+            {1611, &INx2GraphicsSystemSession::CreateNativeImage, "CreateFeatureImagePool1611"},
+            {1612, &INx2GraphicsSystemSession::DestroyNativeImage, "DestroyFeatureImagePool1612"},
+            {1691, &INx2GraphicsSystemSession::CalculateChatImagePoolSize, "CalculateFeatureImagePoolSize1691"},
         });
     }
 
@@ -2607,6 +3373,56 @@ public:
     }
 
 private:
+    // Feature permission checks (201, 301, 401-403, 1101, 1102, 1501-1503): each tests one bit of
+    // the permissions the session was opened with and fails when it is clear. Games only ask for
+    // features they are granted.
+    void CheckPermission(HLERequestContext& ctx) {
+        LOG_DEBUG(Service, "nx2:gsv TIPC {} permission check", ctx.GetCommand());
+        TipcReplyWords(ctx, {});
+    }
+
+    // 115(u64 requested feature flags): the subset that is granted, which is all of them here.
+    // A zeroed reply would deny every feature.
+    void QueryGrantedFeatures(HLERequestContext& ctx) {
+        const auto* w = ctx.CommandBuffer();
+        LOG_INFO(Service, "nx2:gsv TIPC 115 features {:#x}", u64{w[2]} | (u64{w[3]} << 32));
+        TipcReplyWords(ctx, {w[2], w[3]});
+    }
+
+    // 126: one bit of the session's state (meaning unknown); clear.
+    void GetSessionFlag(HLERequestContext& ctx) {
+        TipcReplyWords(ctx, {0});
+    }
+
+    // 434(u32 id from nx2:gpu 33): the session takes a reference on that GPU address space.
+    void AttachGpuAddressSpace(HLERequestContext& ctx) {
+        const u32 id = ctx.CommandBuffer()[2];
+        LOG_INFO(Service, "nx2:gsv TIPC 434 address space {:#x}", id);
+        m_address_spaces.insert(id);
+        TipcReplyWords(ctx, {});
+    }
+
+    // 11(copy handle): handed over once per session and kept; a second call fails.
+    void RegisterClientHandle(HLERequestContext& ctx) {
+        if (m_client_handle_registered) {
+            LOG_WARNING(Service, "nx2:gsv TIPC 11 called twice");
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.Push(ResultUnknown);
+            return;
+        }
+        m_client_handle_registered = true;
+        TipcReplyWords(ctx, {});
+    }
+
+    // 1111(u32): a version or mode number the server checks and records.
+    void SetFeatureVersion(HLERequestContext& ctx) {
+        LOG_INFO(Service, "nx2:gsv TIPC 1111 value {:#x}", ctx.CommandBuffer()[2]);
+        TipcReplyWords(ctx, {});
+    }
+
+    std::set<u32> m_address_spaces;        ///< Ids attached with 434
+    bool m_client_handle_registered = false; ///< Set by 11
+
     // Index of the first raw data word of a TIPC request: header (2 words), then an optional
     // special header with pid and copy/move handle words.
     static size_t TipcDataOffset(const u32* cmd_buf) {
@@ -2630,7 +3446,9 @@ private:
     // and InitializeVp9Decoder failed with 2001-0114 (title 1 aborts when a movie starts).
     // Newer SDKs (nn::codec::video::detail::InitializeServerContext) send 906(u8, u64 decoder
     // library version) instead of 902; title 4 sends version 0x3'00030000 and aborted with
-    // InvalidHandle at its first movie while 906 was auto-stubbed.
+    // InvalidHandle at its first movie while 906 was auto-stubbed. The SDK of later titles
+    // (ipc::Initialize(bool)) sends 905(u8) instead of 902 when its flag is set; the reply is the
+    // same. 1001/1002 open the encoder's creator session (CreateVideoEncoderService uses it).
     void OpenVideoSession(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         const bool second = ctx.GetCommand() == 1002;
@@ -2643,13 +3461,11 @@ private:
 
     // nn::camera::sdk::CreateCameraContext sends 601() then 602(u64 1), which returns the camera
     // context session (handle at word 3, result at word 4). Auto-stubbed, 602 had no handle, the
-    // SDK sent 603 (destroy) and title 1 (1.8.0) aborted with 2034-0000. Its commands fall
-    // through to the nx2 auto stub.
+    // SDK sent 603 (destroy) and title 1 (1.8.0) aborted with 2034-0000. Its commands are
+    // answered by INx2CameraSession.
     void OpenCameraSession(HLERequestContext& ctx) {
         LOG_WARNING(Service, "(STUBBED) nx2:gsv TIPC 602, returning a nx2:camera session");
-        ReturnRawSession(system, ctx,
-                         std::make_shared<INx2StubInterface>(
-                             system, INx2StubInterface::InternName("nx2:camera")));
+        ReturnRawSession(system, ctx, std::make_shared<INx2CameraSession>(system));
     }
 
     // nn::chat::gsv::Initialize sends 1201 then 1202, the same pair as 901/902 and 1001/1002.
@@ -2666,6 +3482,7 @@ private:
     }
 
     void OpenGpuTimeSession(HLERequestContext& ctx) {
+        LOG_INFO(Service, "nx2:gsv TIPC 1121, returning a nx2:gpu_time session");
         ReturnRawSession(system, ctx, std::make_shared<INx2GpuTimeSession>(system));
     }
 
@@ -2687,7 +3504,6 @@ private:
     static constexpr u32 HostSyncpoints = 192;        // Tegra::Host1x::SyncpointManager
 
     void AttachSyncptMemory(HLERequestContext& ctx) {
-        std::scoped_lock lock{m_syncpt_mutex};
         // RequestParser doesn't skip TIPC handle words, so read the raw data words.
         const auto* cmd_buf = ctx.CommandBuffer();
         const size_t data = TipcDataOffset(cmd_buf);
@@ -2740,18 +3556,11 @@ private:
     // Mirrors Eden's guest syncpoint values into the shared RO page. Returns true if any changed.
     bool UpdateSyncptValues() {
         auto& manager = system.Host1x().GetSyncpointManager();
-        const u32 count = std::min(m_syncpt_count, HostSyncpoints);
-        if (count == 0) {
-            return false;
-        }
-        std::array<u64_le, HostSyncpoints> values{};
-        m_syncpt_memory->ReadBlock(m_syncpt_ro + SyncptValuesOffset, values.data(),
-                                  count * sizeof(values[0]));
         bool changed = false;
-        for (u32 id = 0; id < count; ++id) {
+        for (u32 id = 0; id < std::min(m_syncpt_count, HostSyncpoints); ++id) {
             const u64 value = manager.GetGuestSyncpointValue(id);
             const u64 address = m_syncpt_ro + SyncptValuesOffset + id * 8;
-            if (values[id] != value) {
+            if (m_syncpt_memory->Read64(address) != value) {
                 m_syncpt_memory->Write64(address, value);
                 changed = true;
             }
@@ -2763,18 +3572,20 @@ private:
     // and rearms if it still has to wait. Acknowledging without a value change costs the client a
     // wakeup per poll, which keeps waits whose syncpoint we never see from hanging.
     void PollSyncpts() {
-        std::scoped_lock lock{m_syncpt_mutex};
         if (m_syncpt_memory == nullptr) {
             return;
         }
+        const u32 words = (m_syncpt_count + 63) / 64;
+        std::array<u64, 0x40> armed{};
+        for (u32 w = 0; w < words; ++w) {
+            armed[w] = m_syncpt_memory->Read64(m_syncpt_rw + SyncptRwBitsOffset + w * 8);
+        }
         UpdateSyncptValues();
         bool acked = false;
-        const u32 words = (m_syncpt_count + 63) / 64;
         for (u32 w = 0; w < words; ++w) {
-            const u64 rw_bits = m_syncpt_memory->Read64(m_syncpt_rw + SyncptRwBitsOffset + w * 8);
             const u64 ro_address = m_syncpt_ro + SyncptRoBitsOffset + w * 8;
-            if (m_syncpt_memory->Read64(ro_address) != rw_bits) {
-                m_syncpt_memory->Write64(ro_address, rw_bits);
+            if (m_syncpt_memory->Read64(ro_address) != armed[w]) {
+                m_syncpt_memory->Write64(ro_address, armed[w]);
                 acked = true;
             }
         }
@@ -2792,7 +3603,17 @@ private:
     // size, u64 alignment; the client raises the alignment to at least 4 KiB and rounds the size.
     void CalculateRequirements(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
-        const auto layout = Nx2CalculateImageLayout(w + 2);
+        const auto layout = Nx2CalculateNativeImageRequirements(
+            std::span<const u32, 16>{w + 2, 16}, w[18]);
+        const auto trace = Core::WindowTrace::Enabled()
+                               ? Core::WindowTrace::sessions.Find(ctx.GetThread().GetOwnerProcess())
+                               : nullptr;
+        if (trace && trace->TakeGsvLog()) {
+            LOG_INFO(Service, "Star Fox gsv 1510: session={} tls={:#x} kind={} {}x{} raw_block={} raw_pitch_gobs={} format={} block_format_and_luminance={:#x} count={} -> pitch={:#x} block_rows_log2={} size={:#x} alignment={:#x}",
+                     trace->id, GetInteger(ctx.GetThread().GetTlsAddress()), w[3], layout.width, layout.height,
+                     w[6], w[7], w[8], w[9], w[18],
+                     layout.pitch, layout.block_height_log2, layout.size, layout.alignment);
+        }
         LOG_DEBUG(Service, "nx2:gsv 1510 kind={} {}x{} block={} pitch={:#x} format={} -> size={:#x} align={:#x}",
                   w[3], layout.width, layout.height, layout.block_height_log2, layout.pitch, w[8],
                   layout.size, layout.alignment);
@@ -2848,17 +3669,21 @@ private:
 
     void DestroyNativeMemory(HLERequestContext& ctx) {
         const u32 id = ctx.CommandBuffer()[2];
-        std::scoped_lock lk{m_objects->mutex};
-        m_objects->ReleaseMappings([id](const auto& mapping) { return mapping.memory == id; });
-        m_objects->memories.erase(id);
+        std::vector<std::optional<std::pair<u64, u64>>> unmaps;
+        {
+            std::scoped_lock lk{m_objects->mutex};
+            for (auto& [image_id, image] : m_objects->images) {
+                if (image.memory == id && image.mapped_here) {
+                    unmaps.push_back(TakeDecoderMapping(image));
+                }
+            }
+            m_objects->memories.erase(id);
+        }
+        for (const auto& range : unmaps) {
+            DropDecoderMapping(range);
+        }
         LOG_DEBUG(Service, "nx2:gsv 112 DestroyNativeMemory id {}", id);
         TipcReplyWords(ctx, {});
-    }
-
-    // 115(u32 mode, u32): replies a u64 optional memory mode; 0 keeps the nvdrv-compatible path
-    // (an empty reply leaves the request's mode word where the SDK reads it).
-    void ConfigureNativeMemory(HLERequestContext& ctx) {
-        TipcReplyWords(ctx, {0, 0});
     }
 
     // 114(u32 id, u64 address, u64 size, u64 flags, u64 offset): back native memory with process
@@ -2874,19 +3699,17 @@ private:
     void BindNativeGpuMemory(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         LOG_DEBUG(Service, "nx2:gsv 423 parent={} offset={:#x}", w[7], Pair(w, 8));
-        BindMemory(w[2], Pair(w, 3), Pair(w, 5), "423");
+        BindMemory(w[2], Pair(w, 3), Pair(w, 5), "423", w[7], Pair(w, 8));
         TipcReplyWords(ctx, {});
     }
 
-    void BindMemory(u32 id, u64 address, u64 size, const char* command) {
+    void BindMemory(u32 id, u64 address, u64 size, const char* command, u32 parent = 0,
+                    u64 parent_offset = 0) {
         std::scoped_lock lk{m_objects->mutex};
         auto& memory = m_objects->memories[id];
-        if (memory.address == address && memory.bound_size == size) {
-            return;
-        }
-        m_objects->ReleaseMappings([id](const auto& mapping) { return mapping.memory == id; });
         memory.address = address;
-        memory.bound_size = size;
+        memory.parent = parent;
+        memory.parent_offset = parent_offset;
         if (memory.size == 0) {
             memory.size = size;
         }
@@ -2911,6 +3734,8 @@ private:
         TipcReplyWords(ctx, {id});
     }
 
+    // Pool size of a feature's images (1291 here; 391, 691, 891 and 1691 for the other feature
+    // groups, which share the server template).
     // nn::chat::gsv::CalculateRequiredBufferMemory: 1291(preference[16], u32 count), the request
     // of 1510, replies result, u64 size, u64 alignment. Auto-stubbed, the size became 0x1000 and
     // the camera pool (1211) got memory for none of its images.
@@ -2928,80 +3753,42 @@ private:
     // 428(u32 native image handle) nn::gpu::sdk::QueryNativeImage and 426(u32 handle, u32, u32
     // address space, u8 permission) nn::gpu::sdk::MapNativeImage, used by NVN for images another
     // server created (GameChat's camera pool from 1211). Reply words 3-4 the GPU address of the
-    // image (426 only; GPU == CPU address, see Nx2NativeObjects::Memory), 5-6 its last-inclusive
-    // mapping address, 7-38 a GpuOunceUserImageDescriptor and 39 the flags. The SDK
+    // image (426 only; GPU == CPU address, see Nx2NativeObjects::Memory), 5-6 the u64 offset of
+    // the image in its memory, 7-38 a GpuOunceUserImageDescriptor and 39 the flags. The SDK
     // requires descriptor byte 0x00 == 1, byte 0x20 == 1 and a non-zero size at 0x2c (offset at
     // 0x28); NVN reads (width - 1) | (height - 1) << 16 at 0x08 and the layout kind at 0x24 (1
     // takes RGBA formats 0x25/0x37/0x38, 2 the 0x99-0x9c formats). Block height and pitch use
     // the 429 preference words (0x10, 0x14), a guess.
     void QueryNativeImage(HLERequestContext& ctx) {
-        using Nvidia::Devices::Nx2GpuMappingTable;
         const u32 handle = ctx.CommandBuffer()[2];
-        const bool map = ctx.GetCommand() == 426;
-        std::scoped_lock lk{m_objects->mutex};
+        if (QueryDecoderImage(ctx, handle)) {
+            return;
+        }
         std::array<u32, 16> preference{};
         u64 image_offset = 0;
         u64 memory_address = 0;
-        bool decoder_image = false;
-        auto it = m_objects->images.upper_bound(handle);
-        if (it == m_objects->images.begin()) {
-            InvalidNativeImage(ctx);
-            return;
-        }
-        --it;
-        const auto& image = it->second;
-        const u64 index = handle - it->first;
-        if (index >= image.count || image.size == 0 ||
-            index > (std::numeric_limits<u64>::max() - image.offset) / image.size) {
-            InvalidNativeImage(ctx);
-            return;
-        }
-        preference = image.preference;
-        decoder_image = image.decoder;
-        image_offset = image.offset + index * image.size;
-        auto layout = Nx2CalculateImageLayout(preference.data());
-        if (decoder_image) {
-            const auto decoder_layout = Nx2CalculateDecoderImageLayout(preference.data());
-            if (decoder_layout.block_linear) {
-                layout.pitch = decoder_layout.pitch;
-                layout.block_height_log2 = decoder_layout.gob_height_log2 + 3;
-                layout.size = decoder_layout.size;
+        {
+            std::scoped_lock lk{m_objects->mutex};
+            auto it = m_objects->images.upper_bound(handle);
+            if (it != m_objects->images.begin()) {
+                --it;
+                if (handle - it->first < it->second.count) {
+                    preference = it->second.preference;
+                    image_offset = (handle - it->first) * it->second.size;
+                    if (const auto memory = m_objects->memories.find(it->second.memory);
+                        memory != m_objects->memories.end()) {
+                        memory_address = memory->second.address;
+                    }
+                }
             }
         }
-        u64 gpu_address = 0;
-        u64 last_address = image_offset;
-        if (map) {
-            const auto memory_it = m_objects->memories.find(image.memory);
-            if (memory_it == m_objects->memories.end()) {
-                InvalidNativeImage(ctx);
-                return;
-            }
-            const auto& memory = memory_it->second;
-            memory_address = memory.address;
-            const u64 bound = std::min(memory.size, memory.bound_size);
-            const auto range = Nx2GpuMappingTable::ImageRange(memory_address, bound, image_offset,
-                                                            layout.size);
-            if (!range || layout.size != image.size ||
-                layout.size > std::numeric_limits<u32>::max()) {
-                InvalidNativeImage(ctx);
-                return;
-            }
-            gpu_address = memory_address + image_offset;
-            last_address = gpu_address + layout.size - 1;
-            const auto lease = Nvidia::Devices::Nx2GpuMemoryRegistry::Get().AcquireNative(
-                range->gpu, range->size);
-            if (!lease) {
-                InvalidNativeImage(ctx);
-                return;
-            }
-            m_objects->mappings.push_back(
-                {image.memory, handle, ctx.CommandBuffer()[4], gpu_address, last_address, *lease});
-        }
+        const auto layout = Nx2CalculateImageLayout(preference.data());
+        const u64 gpu_address = ctx.GetCommand() == 426 ? memory_address + image_offset : 0;
         std::array<u32, 37> words{};
         words[0] = static_cast<u32>(gpu_address);
         words[1] = static_cast<u32>(gpu_address >> 32);
-        words[2] = static_cast<u32>(last_address);
-        words[3] = static_cast<u32>(last_address >> 32);
+        words[2] = static_cast<u32>(image_offset);
+        words[3] = static_cast<u32>(image_offset >> 32);
         u32* const desc = words.data() + 4;
         desc[0] = 1;
         desc[1] = preference[1];
@@ -3021,28 +3808,106 @@ private:
         }
     }
 
-    static void InvalidNativeImage(HLERequestContext& ctx) {
-        IPC::ResponseBuilder rb{ctx, 2};
-        rb.PushRaw<u32>(0x100f3);
+    // 428/426 for a decoder output image (Fire Emblem: Fortune's Weave's movie player blits each
+    // one, block-linear RGBA, format 0xd5, block height 16 GOBs, into a texture of its own). The
+    // reply follows our Eden tree, where the movies play: words 3-4 the GPU address, 5-6 the last
+    // byte's address, then the descriptor {1, 0, dimensions, .., 0x01000001, 1, offset, size}
+    // (offset 0 once mapped). 426 maps the image at its own address for the GPU: decoder pool
+    // memory is process memory (114) that no GPU mapping covers, and the blit read zeros.
+    bool QueryDecoderImage(HLERequestContext& ctx, u32 handle) {
+        const bool map = ctx.GetCommand() == 426;
+        u64 address{};
+        u64 size{};
+        u64 offset{};
+        u32 dimensions{};
+        bool register_mapping = false;
+        {
+            std::scoped_lock lk{m_objects->mutex};
+            const auto image = m_objects->images.find(handle);
+            if (image == m_objects->images.end() || !image->second.decoder) {
+                return false;
+            }
+            const auto memory = m_objects->memories.find(image->second.memory);
+            if (memory == m_objects->memories.end() || memory->second.address == 0) {
+                return false;
+            }
+            image->second.gpu_read = true;
+            offset = image->second.offset;
+            size = image->second.size;
+            dimensions = image->second.preference[2];
+            if (map) {
+                address = memory->second.address + offset;
+                register_mapping = image->second.gpu_maps++ == 0 &&
+                                   !Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(address);
+                image->second.mapped_here |= register_mapping;
+            }
+        }
+        if (register_mapping) {
+            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Register(address, size);
+        }
+        LOG_INFO(Service, "nx2:gsv {} decoder image {} at {:#x}+{:#x}{}", ctx.GetCommand(), handle,
+                 address, size, register_mapping ? ", mapped for the GPU" : "");
+        std::array<u32, 37> words{};
+        if (map) {
+            const u64 last = address + size - 1;
+            words[0] = static_cast<u32>(address);
+            words[1] = static_cast<u32>(address >> 32);
+            words[2] = static_cast<u32>(last);
+            words[3] = static_cast<u32>(last >> 32);
+        }
+        u32* const desc = words.data() + 4;
+        desc[0] = 1;
+        desc[2] = dimensions;
+        desc[8] = 0x01000001;
+        desc[9] = 1;
+        desc[10] = map ? 0 : static_cast<u32>(offset);
+        desc[11] = static_cast<u32>(size);
+        IPC::ResponseBuilder rb{ctx, static_cast<u32>(2 + words.size())};
+        rb.PushRaw<u32>(ResultSuccess.raw);
+        for (const u32 w : words) {
+            rb.Push<u32>(w);
+        }
+        return true;
     }
 
+    // 427(u32 handle, u32 address space, u64 address, u64 last address): undoes a 426. The last
+    // unmap of a decoder image drops the GPU mapping 426 made.
     void UnmapNativeImage(HLERequestContext& ctx) {
-        const auto* words = ctx.CommandBuffer();
-        const u64 first = Pair(words, 4);
-        const u64 last = Pair(words, 6);
-        std::scoped_lock lk{m_objects->mutex};
-        const auto it = std::find_if(m_objects->mappings.begin(), m_objects->mappings.end(),
-                                     [&](const auto& mapping) {
-            return mapping.image == words[2] && mapping.address_space == words[3] &&
-                   mapping.first == first && mapping.last == last;
-        });
-        if (it == m_objects->mappings.end()) {
-            InvalidNativeImage(ctx);
-            return;
+        const auto* w = ctx.CommandBuffer();
+        const u32 handle = w[2];
+        std::optional<std::pair<u64, u64>> unmap;
+        {
+            std::scoped_lock lk{m_objects->mutex};
+            if (const auto image = m_objects->images.find(handle);
+                image != m_objects->images.end() && image->second.gpu_maps != 0 &&
+                --image->second.gpu_maps == 0) {
+                unmap = TakeDecoderMapping(image->second);
+            }
         }
-        Nvidia::Devices::Nx2GpuMemoryRegistry::Get().ReleaseNative(it->lease);
-        m_objects->mappings.erase(it);
+        LOG_DEBUG(Service, "nx2:gsv 427 image {} [{:#x}, {:#x}]", handle, Pair(w, 4), Pair(w, 6));
+        DropDecoderMapping(unmap);
         TipcReplyWords(ctx, {});
+    }
+
+    // The range 426 mapped for an image, if it did; called with m_objects->mutex held.
+    std::optional<std::pair<u64, u64>> TakeDecoderMapping(Nx2NativeObjects::Image& image) {
+        image.gpu_maps = 0;
+        if (!std::exchange(image.mapped_here, false)) {
+            return std::nullopt;
+        }
+        const auto memory = m_objects->memories.find(image.memory);
+        if (memory == m_objects->memories.end() || memory->second.address == 0) {
+            return std::nullopt;
+        }
+        return std::pair{memory->second.address + image.offset, image.size};
+    }
+
+    static void DropDecoderMapping(const std::optional<std::pair<u64, u64>>& range) {
+        if (range) {
+            auto& registry = Nvidia::Devices::Nx2GpuMemoryRegistry::Get();
+            registry.Unmap(range->first, range->second);
+            registry.ReleaseBacking(range->first, range->second);
+        }
     }
 
     // 911(preference[16], u32 count, u32 memory id) (nn::codec::InitializeDecoderImagePool):
@@ -3072,9 +3937,9 @@ private:
     // nn::gs::sdk::ReadUserImage* (behind nn::codec::ReadDecoderOutputImage*) copy an image out
     // with: u8 kind at +0; for the pitch-linear kinds (8 RGBA, 9 BGRA, 10 NV12) the plane's
     // offset into the pool memory (u32 +0x8) and row pitch (u64 +0x10), NV12's chroma plane at
-    // +0x18/+0x20. Kind 11 is native tiled RGBA, with block columns at +0x10 and block width
-    // and height in pixels at +0x14/+0x16.
+    // +0x18/+0x20. 11-13 are the block-linear kinds, not used here.
     void GetCpuImageDescriptor(HLERequestContext& ctx) {
+        using Tegra::Host1x::Nx2PictureFormat;
         const u32 id = ctx.CommandBuffer()[2];
         std::array<u32, 32> words{};
         {
@@ -3082,7 +3947,16 @@ private:
             const auto image = m_objects->images.find(id);
             if (image != m_objects->images.end() && image->second.decoder) {
                 const auto layout = Nx2CalculateDecoderImageLayout(image->second.preference.data());
-                words = Nx2DecoderCpuImageDescriptor(layout, image->second.offset);
+                const u64 offset = image->second.offset;
+                words[0] = layout.format == Nx2PictureFormat::Nv12    ? 0xa
+                           : layout.format == Nx2PictureFormat::Bgra8 ? 0x9
+                                                                      : 0x8;
+                words[2] = static_cast<u32>(offset);
+                words[4] = static_cast<u32>(layout.pitch);
+                if (layout.format == Nx2PictureFormat::Nv12) {
+                    words[6] = static_cast<u32>(offset + layout.chroma_offset);
+                    words[8] = static_cast<u32>(layout.pitch);
+                }
             }
         }
         if (Nx2FirstVideoCommand("nx2:gsv", 961) || words[0] == 0) {
@@ -3094,14 +3968,18 @@ private:
 
     void DestroyNativeImage(HLERequestContext& ctx) {
         const u32 id = ctx.CommandBuffer()[2];
-        std::scoped_lock lk{m_objects->mutex};
-        if (const auto it = m_objects->images.find(id); it != m_objects->images.end()) {
-            const u32 count = it->second.count;
-            m_objects->ReleaseMappings([id, count](const auto& mapping) {
-                return mapping.image >= id && mapping.image - id < count;
-            });
+        if (Nx2VideoTraceEnabled()) {
+            LOG_INFO(Service, "nx2:vdec trace destroy image={} command={}", id, ctx.GetCommand());
         }
-        m_objects->images.erase(id);
+        std::optional<std::pair<u64, u64>> unmap;
+        {
+            std::scoped_lock lk{m_objects->mutex};
+            if (const auto image = m_objects->images.find(id); image != m_objects->images.end()) {
+                unmap = TakeDecoderMapping(image->second);
+                m_objects->images.erase(image);
+            }
+        }
+        DropDecoderMapping(unmap);
         TipcReplyWords(ctx, {});
     }
 
@@ -3154,7 +4032,6 @@ private:
     std::shared_ptr<Nx2NativeObjects> m_objects{std::make_shared<Nx2NativeObjects>()};
     KernelHelpers::ServiceContext m_context;
     std::array<Kernel::KEvent*, 2> m_syncpt_events{};
-    std::mutex m_syncpt_mutex;
     Core::Memory::Memory* m_syncpt_memory{};
     u64 m_syncpt_rw{};
     u64 m_syncpt_ro{};

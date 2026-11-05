@@ -1,10 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-
 #include "video_core/renderer_vulkan/present/fsr3_frame_gen.h"
 #include "video_core/renderer_vulkan/present/util.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -154,7 +150,7 @@ struct InterpPushConstants {
 Fsr3FrameGen::Fsr3FrameGen(const Device& device, MemoryAllocator& memory_allocator,
                            VkExtent2D extent, VkFormat format)
     : m_allocator{memory_allocator}, m_extent{extent},
-      m_flow_extent{std::max(1u, extent.width / 2), std::max(1u, extent.height / 2)},
+      m_flow_extent{(std::max)(1u, extent.width / 2), (std::max)(1u, extent.height / 2)},
       m_format{format} {
     CreateResources(device);
     CreateShaders(device);

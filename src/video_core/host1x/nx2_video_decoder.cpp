@@ -1,16 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#include <algorithm>
 #include <array>
 #include <cstring>
 #include <optional>
 #include <set>
-#include <string_view>
 
 #include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/host1x/ffmpeg.h"
+#include "video_core/host1x/h264_packet.h"
 #include "video_core/host1x/nx2_video_decoder.h"
 
 extern "C" {
@@ -49,62 +48,53 @@ std::optional<NvdecCommon::VideoCodec> CodecFromMime(std::string_view mime) {
 
 } // namespace
 
-std::optional<Nx2VideoConfiguration> ParseNx2VideoConfiguration(std::span<const u8> configuration) {
-    if (configuration.empty()) {
-        return std::nullopt;
+bool IsH264Stream(std::span<const u8> data) {
+    if (data.size() >= 4) {
+        // Annex-B 3-byte start code: 00 00 01 <nal_header>
+        if (data[0] == 0 && data[1] == 0 && data[2] == 1) {
+            const u8 nal_type = data[3] & 0x1F;
+            if ((data[3] & 0x80) == 0 && nal_type >= 1 && nal_type <= 23) {
+                return true;
+            }
+        }
     }
-    const auto name_end = std::find(configuration.begin(), configuration.end(), u8{});
-    const std::string_view mime{reinterpret_cast<const char*>(configuration.data()),
-                               static_cast<size_t>(name_end - configuration.begin())};
-    if (const auto codec = CodecFromMime(mime)) {
-        return Nx2VideoConfiguration{*codec, {}};
+    if (data.size() >= 5) {
+        // Annex-B 4-byte start code: 00 00 00 01 <nal_header>
+        if (data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1) {
+            const u8 nal_type = data[4] & 0x1F;
+            if ((data[4] & 0x80) == 0 && nal_type >= 1 && nal_type <= 23) {
+                return true;
+            }
+        }
+        // avcC / MP4 length-prefixed NAL unit: [u32 be length] <nal_header>
+        const u32 nalu_len = (static_cast<u32>(data[0]) << 24) |
+                             (static_cast<u32>(data[1]) << 16) |
+                             (static_cast<u32>(data[2]) << 8) |
+                             static_cast<u32>(data[3]);
+        if (nalu_len > 0 && nalu_len <= data.size() - 4) {
+            const u8 nal_type = data[4] & 0x1F;
+            if ((data[4] & 0x80) == 0 && nal_type >= 1 && nal_type <= 23) {
+                return true;
+            }
+        }
     }
-    const auto prefix_size = [&](size_t offset) -> size_t {
-        const auto remaining = configuration.subspan(offset);
-        if (remaining.size() >= 4 && remaining[0] == 0 && remaining[1] == 0 &&
-            remaining[2] == 0 && remaining[3] == 1) {
-            return 4;
+    if (data.size() >= 7) {
+        // avcC configuration record: version=1, profile, compat, level, lengthSizeMinusOne | 0xFC, numSPS | 0xE0
+        if (data[0] == 1 && (data[4] & 0xFC) == 0xFC && (data[5] & 0xE0) == 0xE0 && (data[5] & 0x1F) > 0) {
+            return true;
         }
-        if (remaining.size() >= 3 && remaining[0] == 0 && remaining[1] == 0 && remaining[2] == 1) {
-            return 3;
-        }
-        return 0;
-    };
-    bool has_sps{};
-    bool has_pps{};
-    for (size_t offset = 0; offset < configuration.size();) {
-        const size_t prefix = prefix_size(offset);
-        if (prefix == 0 || offset + prefix == configuration.size()) {
-            return std::nullopt;
-        }
-        const size_t start = offset + prefix;
-        size_t end = start + 1;
-        while (end < configuration.size() && prefix_size(end) == 0) {
-            ++end;
-        }
-        const u8 header = configuration[start];
-        const u8 type = header & 0x1f;
-        if ((header & 0x80) != 0 || (type != 7 && type != 8) ||
-            end - start < (type == 7 ? 4U : 2U)) {
-            return std::nullopt;
-        }
-        has_sps |= type == 7;
-        has_pps |= type == 8;
-        offset = end;
     }
-    if (!has_sps || !has_pps) {
-        return std::nullopt;
-    }
-    return Nx2VideoConfiguration{NvdecCommon::VideoCodec::H264, configuration};
+    return false;
 }
 
 struct Nx2VideoDecoder::Impl {
-    std::vector<u8> configuration;
+    std::string name;
     std::optional<FFmpeg::Decoder> decoder;
     std::optional<FFmpeg::HardwareContext> hardware;
     std::optional<FFmpeg::DecoderContext> context;
     SwsContext* scaler{};
     bool open{};
+    H264PacketConverter h264_packets;
     /// Timestamps of submitted frames not yet output. Frames copied back from a host GPU decoder
     /// lose theirs and take the earliest one instead.
     std::multiset<u64> pending_pts;
@@ -137,18 +127,16 @@ struct Nx2VideoDecoder::Impl {
     }
 };
 
-Nx2VideoDecoder::Nx2VideoDecoder(std::span<const u8> configuration)
-    : impl{std::make_unique<Impl>()} {
-    impl->configuration.assign(configuration.begin(), configuration.end());
-    const auto parsed = ParseNx2VideoConfiguration(impl->configuration);
-    if (!parsed) {
-        LOG_ERROR(HW_GPU, "nx2 video: unsupported {}-byte codec configuration", configuration.size());
+Nx2VideoDecoder::Nx2VideoDecoder(std::string_view mime) : impl{std::make_unique<Impl>()} {
+    impl->name = std::string{mime};
+    const auto codec = CodecFromMime(mime);
+    if (!codec) {
+        LOG_ERROR(HW_GPU, "nx2 video: no decoder for codec \"{}\"", mime);
         return;
     }
-    impl->decoder.emplace(parsed->codec);
+    impl->decoder.emplace(*codec);
     if (impl->decoder->GetCodec() == nullptr) {
-        LOG_ERROR(HW_GPU, "nx2 video: FFmpeg has no decoder for codec {}",
-                  static_cast<u64>(parsed->codec));
+        LOG_ERROR(HW_GPU, "nx2 video: FFmpeg has no decoder for \"{}\"", mime);
         return;
     }
     impl->context.emplace(*impl->decoder);
@@ -156,10 +144,8 @@ Nx2VideoDecoder::Nx2VideoDecoder(std::span<const u8> configuration)
         impl->hardware.emplace();
         impl->hardware->InitializeForDecoder(*impl->context, *impl->decoder);
     }
-    impl->open = impl->context->OpenContext(*impl->decoder, parsed->extradata);
-    LOG_INFO(HW_GPU, "nx2 video: decoder for codec {} ({} configuration bytes) {}",
-             static_cast<u64>(parsed->codec), parsed->extradata.size(),
-             impl->open ? "open" : "failed to open");
+    impl->open = impl->context->OpenContext(*impl->decoder);
+    LOG_INFO(HW_GPU, "nx2 video: decoder for \"{}\" {}", mime, impl->open ? "open" : "failed to open");
 }
 
 Nx2VideoDecoder::~Nx2VideoDecoder() = default;
@@ -168,8 +154,8 @@ bool Nx2VideoDecoder::IsOpen() const {
     return impl->open;
 }
 
-std::span<const u8> Nx2VideoDecoder::Configuration() const {
-    return impl->configuration;
+const std::string& Nx2VideoDecoder::Name() const {
+    return impl->name;
 }
 
 void Nx2VideoDecoder::Decode(std::span<const u8> data, u64 pts, std::vector<Nx2Picture>& pictures) {
@@ -178,6 +164,12 @@ void Nx2VideoDecoder::Decode(std::span<const u8> data, u64 pts, std::vector<Nx2P
     }
     impl->packet.assign(data.size() + AV_INPUT_BUFFER_PADDING_SIZE, 0);
     std::memcpy(impl->packet.data(), data.data(), data.size());
+
+    // Convert MP4/avcC length-prefixed NALUs to Annex-B start codes for FFmpeg if needed.
+    if (impl->name.find("avc") != std::string::npos || impl->name.find("264") != std::string::npos) {
+        impl->h264_packets.Convert(std::span<u8>{impl->packet.data(), data.size()});
+    }
+
     FFmpeg::Packet packet{std::span<const u8>{impl->packet.data(), data.size()}};
     packet.GetPacket()->pts = static_cast<s64>(pts);
     // Hidden VP9 frames never come out: keep the set from growing over a long movie.
@@ -203,6 +195,7 @@ void Nx2VideoDecoder::Reset() {
         avcodec_flush_buffers(impl->context->GetCodecContext());
     }
     impl->pending_pts.clear();
+    impl->h264_packets.Reset();
 }
 
 void Nx2VideoDecoder::Render(const Nx2Picture& picture, Nx2PictureFormat format, u32 width,
@@ -211,12 +204,45 @@ void Nx2VideoDecoder::Render(const Nx2Picture& picture, Nx2PictureFormat format,
     const u64 needed = format == Nx2PictureFormat::Nv12
                            ? chroma_offset + pitch * ((u64{height} + 1) / 2)
                            : pitch * height;
-    if (width == 0 || height == 0 || out.size() < needed) {
+    const u64 min_pitch = format == Nx2PictureFormat::Nv12 ? ((u64{width} + 1) / 2) * 2 : 0;
+    if (width == 0 || height == 0 || pitch < min_pitch || out.size() < needed) {
         return;
     }
     const AVPixelFormat target = format == Nx2PictureFormat::Nv12    ? AV_PIX_FMT_NV12
                                  : format == Nx2PictureFormat::Rgba8 ? AV_PIX_FMT_RGBA
                                                                      : AV_PIX_FMT_BGRA;
+    // Frames copied back from a host GPU decoder are already NV12. Copy them as they are:
+    // FFmpeg 6.1's swscale leaves the chroma plane of an NV12 to NV12 copy at zero, which shows
+    // the movies green.
+    if (target == AV_PIX_FMT_NV12 && f->format == AV_PIX_FMT_NV12 &&
+        static_cast<u32>(f->width) == width && static_cast<u32>(f->height) == height) {
+        for (u32 y = 0; y < height; ++y) {
+            std::memcpy(out.data() + y * pitch, f->data[0] + y * f->linesize[0], width);
+        }
+        for (u32 y = 0; y < (height + 1) / 2; ++y) {
+            std::memcpy(out.data() + chroma_offset + y * pitch, f->data[1] + y * f->linesize[1],
+                        min_pitch);
+        }
+        return;
+    }
+    if (target == AV_PIX_FMT_NV12 && f->format == AV_PIX_FMT_YUV420P &&
+        f->color_range != AVCOL_RANGE_JPEG && static_cast<u32>(f->width) == width &&
+        static_cast<u32>(f->height) == height) {
+        for (u32 y = 0; y < height; ++y) {
+            std::memcpy(out.data() + y * pitch, f->data[0] + y * f->linesize[0], width);
+        }
+        const u32 chroma_width = static_cast<u32>(min_pitch / 2);
+        for (u32 y = 0; y < (height + 1) / 2; ++y) {
+            const u8* u = f->data[1] + y * f->linesize[1];
+            const u8* v = f->data[2] + y * f->linesize[2];
+            u8* dst = out.data() + chroma_offset + y * pitch;
+            for (u32 x = 0; x < chroma_width; ++x) {
+                dst[x * 2] = u[x];
+                dst[x * 2 + 1] = v[x];
+            }
+        }
+        return;
+    }
     impl->scaler = sws_getCachedContext(impl->scaler, f->width, f->height,
                                         static_cast<AVPixelFormat>(f->format),
                                         static_cast<int>(width), static_cast<int>(height), target,
@@ -227,19 +253,23 @@ void Nx2VideoDecoder::Render(const Nx2Picture& picture, Nx2PictureFormat format,
                   av_get_pix_fmt_name(target));
         return;
     }
-    if (format != Nx2PictureFormat::Nv12) {
-        // The stream's matrix and range; untagged HD video is BT.709.
-        int space = SWS_CS_ITU601;
-        if (f->colorspace == AVCOL_SPC_BT709 ||
-            (f->colorspace == AVCOL_SPC_UNSPECIFIED && f->height >= 720)) {
-            space = SWS_CS_ITU709;
-        } else if (f->colorspace == AVCOL_SPC_BT2020_NCL || f->colorspace == AVCOL_SPC_BT2020_CL) {
-            space = SWS_CS_BT2020;
-        }
-        const int* coefficients = sws_getCoefficients(space);
-        sws_setColorspaceDetails(impl->scaler, coefficients, f->color_range == AVCOL_RANGE_JPEG,
-                                 coefficients, 1, 0, 1 << 16, 1 << 16);
+    // The stream's matrix and range; untagged HD video is BT.709.
+    int space = SWS_CS_ITU601;
+    if (f->colorspace == AVCOL_SPC_BT709 ||
+        (f->colorspace == AVCOL_SPC_UNSPECIFIED && f->height >= 720)) {
+        space = SWS_CS_ITU709;
+    } else if (f->colorspace == AVCOL_SPC_BT2020_NCL || f->colorspace == AVCOL_SPC_BT2020_CL) {
+        space = SWS_CS_BT2020;
     }
+    const bool full_range_source = f->color_range == AVCOL_RANGE_JPEG ||
+                                  f->format == AV_PIX_FMT_YUVJ420P ||
+                                  f->format == AV_PIX_FMT_YUVJ422P ||
+                                  f->format == AV_PIX_FMT_YUVJ444P ||
+                                  f->format == AV_PIX_FMT_YUVJ440P ||
+                                  f->format == AV_PIX_FMT_YUVJ411P;
+    const int* coefficients = sws_getCoefficients(space);
+    sws_setColorspaceDetails(impl->scaler, coefficients, full_range_source, coefficients,
+                             format != Nx2PictureFormat::Nv12, 0, 1 << 16, 1 << 16);
     std::array<u8*, 4> planes{out.data(), nullptr, nullptr, nullptr};
     std::array<int, 4> strides{static_cast<int>(pitch), 0, 0, 0};
     if (format == Nx2PictureFormat::Nv12) {

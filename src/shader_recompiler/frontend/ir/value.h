@@ -245,11 +245,11 @@ private:
     union {
         NonTriviallyDummy dummy{};
         boost::container::small_vector<std::pair<Block*, Value>, 2> phi_args;
-        std::array<Value, 8> args;
+        std::array<Value, 5> args;
     };
     std::unique_ptr<AssociatedInsts> associated_insts;
 };
-static_assert(sizeof(Inst) <= 192, "Inst size unintentionally increased");
+static_assert(sizeof(Inst) <= 128, "Inst size unintentionally increased");
 
 struct AssociatedInsts {
     union {

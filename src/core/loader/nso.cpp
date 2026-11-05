@@ -7,11 +7,11 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cstring>
-#include <limits>
 #include <span>
 #include <vector>
 
 #include "common/common_funcs.h"
+#include "common/game_presets.h"
 #include "common/hex_util.h"
 #include "common/logging.h"
 #include "common/lz4_compression.h"
@@ -19,6 +19,7 @@
 #include "common/settings.h"
 #include "common/swap.h"
 #include "core/core.h"
+#include "core/arm/dynarmic/window_trace.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/hle/kernel/code_set.h"
 #include "core/hle/kernel/k_page_table.h"
@@ -95,59 +96,48 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         return 0;
     }();
 
-    const auto& last_segment = nso_header.segments.back();
-    const u64 segment_end = u64{last_segment.location} + last_segment.size;
-    if (segment_end + last_segment.bss_size + module_start >
-        std::numeric_limits<u32>::max() - Core::Memory::YUZU_PAGEMASK) {
-        LOG_ERROR(Loader, "NSO {} has an invalid image size", nso_file.GetName());
-        return std::nullopt;
-    }
-
-    size_t compressed_buffer_size = 0;
-    for (size_t i = 0; i < nso_header.segments.size(); ++i) {
-        const auto& segment = nso_header.segments[i];
-        const bool compressed = nso_header.IsSegmentCompressed(i);
-        const u64 stored_size = compressed ? nso_header.segments_compressed_size[i] : segment.size;
-        if (u64{segment.location} + segment.size > segment_end ||
-            u64{segment.offset} + stored_size > nso_file.GetSize() ||
-            (compressed && (stored_size > static_cast<u64>(std::numeric_limits<int>::max()) ||
-                            segment.size > static_cast<u32>(std::numeric_limits<int>::max())))) {
-            LOG_ERROR(Loader, "NSO {} segment {} has an invalid range", nso_file.GetName(), i);
-            return std::nullopt;
-        }
-        if (compressed) {
-            compressed_buffer_size = std::max(compressed_buffer_size, static_cast<size_t>(stored_size));
-        }
-    }
-
+    auto const last_segment_it = &nso_header.segments[nso_header.segments.size() - 1];
     // Build program image directly in codeset memory :)
     Kernel::CodeSet codeset;
-    codeset.memory.resize(module_start + segment_end);
+    codeset.memory.resize(module_start + last_segment_it->location + last_segment_it->size);
     {
-        std::vector<u8> compressed_data(compressed_buffer_size);
+        std::vector<u8> compressed_data(*std::ranges::max_element(nso_header.segments_compressed_size));
+        std::vector<u8> decompressed_size(std::ranges::max_element(nso_header.segments, [](auto const& a, auto const& b) {
+            return a.size < b.size;
+        })->size);
         for (std::size_t i = 0; i < nso_header.segments.size(); ++i) {
-            const auto& segment = nso_header.segments[i];
-            auto destination = std::span{codeset.memory}.subspan(module_start + segment.location,
-                                                              segment.size);
+            nso_file.Read(compressed_data.data(), nso_header.segments_compressed_size[i], nso_header.segments[i].offset);
             if (nso_header.IsSegmentCompressed(i)) {
-                const auto source = std::span{compressed_data}.first(nso_header.segments_compressed_size[i]);
-                if (nso_file.Read(source.data(), source.size(), segment.offset) != source.size()) {
-                    LOG_ERROR(Loader, "NSO {} segment {} could not be read", nso_file.GetName(), i);
-                    return std::nullopt;
+                if (nso_header.IsZBICCompressed()) {
+                    // ZBIC compression
+                    const int r = Common::Compression::DecompressDataZBIC(
+                        std::span<u8>{decompressed_size}.first(nso_header.segments[i].size),
+                        std::span<const u8>{compressed_data}.first(nso_header.segments_compressed_size[i])
+                    );
+                    ASSERT(r > 0);
+                } else {
+                    // LZ4 compression
+                    int r = Common::Compression::DecompressDataLZ4(
+                        decompressed_size.data(),
+                        nso_header.segments[i].size,
+                        compressed_data.data(),
+                        nso_header.segments_compressed_size[i]
+                    );
+                    ASSERT(r == int(nso_header.segments[i].size));
                 }
-                const int result = nso_header.IsZBICCompressed()
-                    ? Common::Compression::DecompressDataZBIC(destination, source)
-                    : Common::Compression::DecompressDataLZ4(destination.data(), destination.size(),
-                                                             source.data(), source.size());
-                if (result < 0 || static_cast<size_t>(result) != destination.size()) {
-                    LOG_ERROR(Loader, "NSO {} segment {} decompression failed: expected {} bytes, got {}",
-                              nso_file.GetName(), i, destination.size(), result);
-                    return std::nullopt;
-                }
-            } else if (!destination.empty() &&
-                       nso_file.Read(destination.data(), destination.size(), segment.offset) != destination.size()) {
-                LOG_ERROR(Loader, "NSO {} segment {} could not be read", nso_file.GetName(), i);
-                return std::nullopt;
+
+                std::memcpy(
+                    codeset.memory.data() + module_start + nso_header.segments[i].location,
+                    decompressed_size.data(),
+                    nso_header.segments[i].size
+                );
+            } else {
+                // Not compressed
+                std::memcpy(
+                    codeset.memory.data() + module_start + nso_header.segments[i].location,
+                    compressed_data.data(),
+                    nso_header.segments[i].size
+                );
             }
             codeset.segments[i].addr = module_start + nso_header.segments[i].location;
             codeset.segments[i].offset = module_start + nso_header.segments[i].location;
@@ -186,6 +176,71 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         pi_header = pm->PatchNSO(pi_header, name);
 
         std::copy(pi_header.begin() + sizeof(NSOHeader), pi_header.end(), patchable_section.data());
+    }
+
+    // Mario Kart World selects a 1- or 2-vblank frame mode in its main loop. Force its native
+    // 30 FPS mode, or let it choose dynamically using the whole frame time (CPU + GPU wait).
+    // Match the instruction sequence instead of relying on a title-version-specific address.
+    const bool mkw_dynamic = Settings::values.mkw_dynamic_fps.GetValue();
+    bool mkw_dynamic_fps_patch_applied = false;
+    if ((mkw_dynamic || Settings::values.mkw_30fps.GetValue()) && name == "main" &&
+        process.GetProgramId() == Settings::MarioKartWorldProgramId) {
+        constexpr u32 ModeLoadInsn = 0xB9421268; // ldr w8, [x19, #0x210]
+        const u32 mode = mkw_dynamic ? 0U : 2U;
+        const u32 mode_instruction = 0x52800008U | (mode << 5); // mov w8, #mode
+        const auto& text = nso_header.segments[0];
+        u8* const code = codeset.memory.data() + module_start + text.location;
+        const size_t count = text.size / sizeof(u32);
+        const auto word = [code](size_t index) {
+            u32 value;
+            std::memcpy(&value, code + index * sizeof(u32), sizeof(value));
+            return value;
+        };
+        size_t mode_site = 0;
+        size_t mode_matches = 0;
+        for (size_t i = 2; i + 8 < count; ++i) {
+            if (word(i) != ModeLoadInsn || word(i - 2) != 0x6B01013F || // cmp w9, w1
+                (word(i - 1) & 0xFF00001F) != 0x54000001 ||             // b.ne
+                (word(i + 1) & 0xFF00001F) != 0x35000008) {             // cbnz w8
+                continue;
+            }
+            for (size_t j = i + 2; j < i + 8; ++j) {
+                if (word(j) == 0x52A84E08) { // mov w8, #60.0f
+                    mode_site = i;
+                    ++mode_matches;
+                    break;
+                }
+            }
+        }
+
+        size_t frame_time_site = 0;
+        size_t frame_time_matches = 0;
+        if (mode_matches == 1 && mkw_dynamic) {
+            for (size_t i = mode_site + 1; i < mode_site + 32 && i < count; ++i) {
+                if ((word(i) & 0xFFFFFFE0) == 0xF9409660) { // ldr xN, [x19, #0x128]
+                    frame_time_site = i;
+                    ++frame_time_matches;
+                }
+            }
+        }
+
+        if (mode_matches == 1 && (!mkw_dynamic || frame_time_matches == 1)) {
+            std::memcpy(code + mode_site * sizeof(u32), &mode_instruction,
+                        sizeof(mode_instruction));
+            if (mkw_dynamic) {
+                const u32 whole_frame_time = 0xF9407660 | (word(frame_time_site) & 0x1F);
+                std::memcpy(code + frame_time_site * sizeof(u32), &whole_frame_time,
+                            sizeof(whole_frame_time));
+                mkw_dynamic_fps_patch_applied = true;
+            }
+            LOG_INFO(Loader, "Mario Kart World: {} FPS mode enabled (main+{:#x})",
+                     mkw_dynamic ? "dynamic" : "30",
+                     text.location + mode_site * sizeof(u32));
+        } else {
+            LOG_WARNING(Loader,
+                        "Mario Kart World FPS patch skipped (mode matches {}, frame-time matches {})",
+                        mode_matches, frame_time_matches);
+        }
     }
 
 #ifdef HAS_NCE
@@ -259,8 +314,23 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
     }
 
     // Load codeset for current process
+    if (name == "sdk") {
+        const bool matching_sdk =
+            Core::WindowTrace::Enabled() && process.GetProgramId() == Core::WindowTrace::ProgramId &&
+            Common::HexToString(std::span{nso_header.build_id}.first(20)) ==
+                "41D4DE4A3B78214AD20C896960DF0E5EA0ED595F";
+        Core::WindowTrace::sessions.Reset(&process, matching_sdk ? load_base : 0);
+        if (Core::WindowTrace::Enabled()) {
+            const auto session = Core::WindowTrace::sessions.Find(&process);
+            LOG_INFO(Loader, "Star Fox window trace: matching SDK={} base={:#x} session={}",
+                     matching_sdk, matching_sdk ? load_base : 0, session ? session->id : 0);
+        }
+    }
     LOG_INFO(Loader, "Module {} loaded at {:#x} (size {:#x})", nso_file.GetName(), load_base, image_size);
     process.LoadModule(system.Kernel(), std::move(codeset), load_base);
+    if (name == "main" && process.GetProgramId() == Settings::MarioKartWorldProgramId) {
+        process.SetMkwDynamicFpsPatchApplied(mkw_dynamic_fps_patch_applied);
+    }
     return load_base + image_size;
 }
 

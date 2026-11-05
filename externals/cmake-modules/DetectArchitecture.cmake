@@ -36,8 +36,8 @@ This file is based off of Yuzu and Dynarmic.
 # should NOT be too dependent on the architecture
 # otherwise, you may end up with duplicate code
 if (CMAKE_OSX_ARCHITECTURES)
-    list(LENGTH CMAKE_OSX_ARCHITECTURES ARCHITECTURE_COUNT)
-    if (ARCHITECTURE_COUNT GREATER 1)
+    list(LENGTH CMAKE_OSX_ARCHITECTURES architecture_count)
+    if (architecture_count GREATER 1)
         set(MULTIARCH_BUILD 1)
     else()
         set(MULTIARCH_BUILD 0)

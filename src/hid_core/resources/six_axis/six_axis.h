@@ -7,6 +7,7 @@
 #include "hid_core/hid_types.h"
 #include "hid_core/resources/controller_base.h"
 #include "hid_core/resources/ring_lifo.h"
+#include "hid_core/resources/six_axis/sensor_info.h"
 
 namespace Core::HID {
 class EmulatedController;
@@ -65,7 +66,7 @@ private:
         bool unaltered_passthrough{false};
         Core::HID::SixAxisSensorFusionParameters fusion{};
         Core::HID::SixAxisSensorCalibrationParameter calibration{};
-        Core::HID::SixAxisSensorIcInformation ic_information{};
+        Core::HID::SixAxisSensorIcInformation ic_information{DefaultSixAxisSensorIcInformation()};
         Core::HID::GyroscopeZeroDriftMode gyroscope_zero_drift_mode{
             Core::HID::GyroscopeZeroDriftMode::Standard};
     };

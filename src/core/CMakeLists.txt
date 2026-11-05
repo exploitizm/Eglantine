@@ -532,6 +532,8 @@ add_library(core STATIC
     hle/service/audio/audio_renderer_manager.cpp
     hle/service/audio/audio_renderer_manager.h
     hle/service/audio/nx2_audio_device_manager.h
+    hle/service/audio/nx2_sysmix.cpp
+    hle/service/audio/nx2_sysmix.h
     hle/service/audio/nx2_audio_user_client.h
     hle/service/audio/audio_renderer.cpp
     hle/service/audio/audio_renderer.h
@@ -543,6 +545,9 @@ add_library(core STATIC
     hle/service/audio/final_output_recorder_manager.cpp
     hle/service/audio/final_output_recorder_manager.h
     hle/service/audio/hardware_opus_decoder_manager.cpp
+    hle/service/audio/hardware_audio_codec.cpp
+    hle/service/audio/hardware_audio_codec.h
+    hle/service/audio/hardware_audio_codec_protocol.h
     hle/service/audio/hardware_opus_decoder_manager.h
     hle/service/audio/hardware_opus_decoder.cpp
     hle/service/audio/hardware_opus_decoder.h
@@ -795,6 +800,7 @@ add_library(core STATIC
     hle/service/nfp/nfp_types.h
     hle/service/ngc/ngc.cpp
     hle/service/ngc/ngc.h
+    hle/service/ngc/guest_hid.h
     hle/service/nifm/nifm.cpp
     hle/service/nifm/nifm.h
     hle/service/nim/nim.cpp
@@ -1044,7 +1050,10 @@ add_library(core STATIC
     hle/service/nx2_streamplay.h
     hle/service/nx2_stub_interface.h
     hle/service/nx2_gsv.h
-    hle/service/nx2_sparse_region.h
+    hle/service/nx2_video_input_queue.h
+    hle/service/nx2_image_layout.h
+    hle/service/nx2_present_pacer.h
+    hle/service/nx2_video_ready.h
     hle/service/services.cpp
     hle/service/services.h
     hle/service/set/factory_settings_server.cpp
@@ -1172,7 +1181,6 @@ add_library(core STATIC
     memory/dmnt_cheat_types.h
     memory/dmnt_cheat_vm.cpp
     memory/dmnt_cheat_vm.h
-    memory/read_traps.h
     perf_stats.cpp
     perf_stats.h
     reporter.cpp
@@ -1213,7 +1221,7 @@ else()
         $<$<COMPILE_LANGUAGE:C,CXX>:-Wconversion>
         $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-sign-conversion>
         $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-cast-function-type>
-        $<$<CXX_COMPILER_ID:AppleClang,Clang>:-fsized-deallocation>)
+        $<$<CXX_COMPILER_ID:Clang>:-fsized-deallocation>)
     # pre-clang19 will spam with "OH DID YOU MEAN THIS?" otherwise...
     if (CXX_CLANG AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 20)
         target_compile_options(core PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-cast-function-type-mismatch>)
@@ -1290,6 +1298,11 @@ if (TARGET OpenSSL::SSL)
     target_link_libraries(core PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 else()
     target_sources(core PRIVATE hle/service/ssl/ssl_backend_none.cpp)
+endif()
+
+if (ENABLE_LTO AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT MSVC)
+    # Fibers can migrate between host threads; keep kernel TLS lookups outside LTO callers.
+    set_source_files_properties(hle/kernel/kernel.cpp PROPERTIES COMPILE_OPTIONS -fno-lto)
 endif()
 
 create_target_directory_groups(core)

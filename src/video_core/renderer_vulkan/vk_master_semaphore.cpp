@@ -104,7 +104,13 @@ void MasterSemaphore::Wait(u64 tick) {
     }
 
     // If none of the above is hit, fallback to a regular wait
-    while (!semaphore.Wait(tick)) {
+    try {
+        while (!semaphore.Wait(tick)) {
+        }
+    } catch (const vk::Exception& exception) {
+        // The throw ends the process; say why first (a device loss reached nothing else here).
+        LOG_CRITICAL(Render_Vulkan, "Waiting for GPU tick {} failed: {}", tick, exception.what());
+        throw;
     }
 
     Refresh();
@@ -353,7 +359,7 @@ void MasterSemaphore::WaitThread(std::stop_token token) {
             free_queue.push_front(std::move(fence));
             gpu_tick.store(host_tick, std::memory_order_release);
         }
-        gpu_tick.notify_all();
+        gpu_tick.notify_one();
     }
 }
 

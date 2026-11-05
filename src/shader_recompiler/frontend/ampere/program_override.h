@@ -23,10 +23,9 @@ inline u64 NativeProgramKey(std::span<const Instruction> source) {
 inline std::vector<u8> EncodeProgramOverride(std::span<const Instruction> source,
                                             const LoweredProgram& program) {
     if (!program || program.source_size != source.size_bytes() || program.source_instruction_offsets.size() != source.size()) return {};
-    const std::array<u32, 7> header{0x4e454445, 0x3330564f,
+    const std::array<u32, 6> header{0x4e454445, 0x3230564f,
         static_cast<u32>(source.size_bytes()), static_cast<u32>(program.instructions.size()),
-        program.required_texture_buffer, static_cast<u32>(program.source_instruction_offsets.size()),
-        program.required_surface_buffer};
+        program.required_texture_buffer, static_cast<u32>(program.source_instruction_offsets.size())};
     std::vector<u8> bytes(sizeof(header) + source.size_bytes() + program.instructions.size() * 8 + program.source_instruction_offsets.size() * 4);
     std::memcpy(bytes.data(), header.data(), sizeof(header));
     std::memcpy(bytes.data() + sizeof(header), source.data(), source.size_bytes());
@@ -40,18 +39,12 @@ inline u32 ProgramOverrideSourceSize(std::span<const u8> bytes) {
     std::array<u32, 6> header{};
     if (bytes.size() < sizeof(header)) return 0;
     std::memcpy(header.data(), bytes.data(), sizeof(header));
-    const bool has_surface = header[1] == 0x3330564f;
-    const bool mapped = has_surface || header[1] == 0x3230564f;
-    const size_t header_size = sizeof(header) + (has_surface ? sizeof(u32) : 0);
-    if (bytes.size() < header_size) return 0;
-    u32 surface = ~0U;
-    if (has_surface) std::memcpy(&surface, bytes.data() + sizeof(header), sizeof(surface));
+    const bool mapped = header[1] == 0x3230564f;
     if (header[0] != 0x4e454445 || (!mapped && header[1] != 0x3130564f) ||
         (mapped ? header[5] != header[2] / 16 : header[5] != 0) ||
         header[2] == 0 || header[2] % sizeof(Instruction) || header[2] > 1048576 ||
-        header[3] == 0 || header[3] > 1048576 || (header[4] != ~0U && header[4] >= 18) ||
-        (surface != ~0U && surface >= 18)) return 0;
-    if (bytes.size() != header_size + size_t{header[2]} + size_t{header[3]} * 8 + size_t{header[5]} * 4) return 0;
+        header[3] == 0 || header[3] > 1048576 || (header[4] != ~0U && header[4] >= 18)) return 0;
+    if (bytes.size() != sizeof(header) + size_t{header[2]} + size_t{header[3]} * 8 + size_t{header[5]} * 4) return 0;
     return header[2];
 }
 
@@ -67,17 +60,15 @@ inline LoweredProgram DecodeProgramOverride(std::span<const u8> bytes,
     std::array<u32, 6> header{};
     if (!ProgramOverrideSourceSize(bytes)) return fail("invalid native override header or length");
     std::memcpy(header.data(), bytes.data(), sizeof(header));
-    const bool has_surface = header[1] == 0x3330564f;
-    const size_t header_size = sizeof(header) + (has_surface ? sizeof(u32) : 0);
     if (header[2] != source.size_bytes()) return fail("native override source length mismatch");
-    if (std::memcmp(bytes.data() + header_size, source.data(), source.size_bytes()))
+    if (std::memcmp(bytes.data() + sizeof(header), source.data(), source.size_bytes()))
         return fail("native override source mismatch");
     result.instructions.resize(header[3]);
-    std::memcpy(result.instructions.data(), bytes.data() + header_size + source.size_bytes(), header[3] * 8);
+    std::memcpy(result.instructions.data(), bytes.data() + sizeof(header) + source.size_bytes(), header[3] * 8);
     if (header[5]) {
         result.source_instruction_offsets.resize(header[5]);
         std::memcpy(result.source_instruction_offsets.data(),
-                    bytes.data() + header_size + source.size_bytes() + size_t{header[3]} * 8,
+                    bytes.data() + sizeof(header) + source.size_bytes() + size_t{header[3]} * 8,
                     size_t{header[5]} * 4);
         u32 previous = 0;
         for (u32 offset : result.source_instruction_offsets) {
@@ -88,10 +79,6 @@ inline LoweredProgram DecodeProgramOverride(std::span<const u8> bytes,
     }
     result.source_size = header[2];
     result.required_texture_buffer = header[4];
-    result.required_surface_buffer = ~0U;
-    if (has_surface) {
-        std::memcpy(&result.required_surface_buffer, bytes.data() + sizeof(header), sizeof(u32));
-    }
     return result;
 }
 
