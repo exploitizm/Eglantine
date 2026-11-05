@@ -755,6 +755,23 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
         }
 
         if (mesh_draw) {
+            // The first task/mesh draws (GPU thread only). On the PS5 each becomes chunks of
+            // emulated task workgroups (radv_task_emulated), so the counts show what it was given.
+            static u32 mesh_draws_logged{};
+            if (mesh_draws_logged++ < 64) {
+                const auto& regs = maxwell3d->regs;
+                const auto program = [&](size_t slot) {
+                    return (u64{regs.pipelines[slot].reserved[0] & 0xff} << 32) |
+                           regs.pipelines[slot].reserved[1];
+                };
+                LOG_INFO(Render_Vulkan,
+                         "Mesh draw: groups={} instances={} first={} base_instance={} indexed={} "
+                         "slot1={:#x} slot3={:#x} rt0={:#x} {}x{}",
+                         draw_params.num_vertices, draw_params.num_instances,
+                         draw_params.first_index, draw_params.base_instance, is_indexed,
+                         program(1), program(3), regs.rt[0].Address(), regs.rt[0].width,
+                         regs.rt[0].height);
+            }
             scheduler.Record([groups = draw_params.num_vertices](vk::CommandBuffer cmdbuf) {
                 cmdbuf.DrawMeshTasksEXT(groups, 1, 1);
             });

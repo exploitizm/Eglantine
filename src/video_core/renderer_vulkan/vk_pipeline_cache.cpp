@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -1224,6 +1226,17 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         ConvertLegacyToGeneric(program, runtime_info);
         const std::vector<u32> code{EmitSPIRV(profile, runtime_info, program, binding)};
         device.SaveShader(code);
+        // EDEN_GRAPHICS_SPIRV_DUMP=<dir>: each graphics stage's SPIR-V as <hash>-s<slot>.spv,
+        // to compile a pipeline that hangs the GPU off the console.
+        if (static const char* const spirv_dir = std::getenv("EDEN_GRAPHICS_SPIRV_DUMP");
+            spirv_dir != nullptr) {
+            const auto path = fmt::format("{}/{:016x}-s{}.spv", spirv_dir, key.unique_hashes[index],
+                                          index);
+            if (std::FILE* const file = std::fopen(path.c_str(), "wb")) {
+                std::fwrite(code.data(), sizeof(u32), code.size(), file);
+                std::fclose(file);
+            }
+        }
         modules[stage_index] = BuildShader(device, code);
 
         // Text log + .spv dump. Text log is gated by gpu_log_level != Off; .spv dump
