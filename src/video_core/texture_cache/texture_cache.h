@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include "video_core/texture_cache/blit_source_format.h"
+
 #include <algorithm>
 #include <numeric>
 #include <cstdlib>
@@ -1332,7 +1334,10 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
             return false;
         }
         const auto& motion_surface = use_history ? motion_vectors : src;
-        const ImageInfo motion_info(motion_surface);
+        ImageInfo motion_info(motion_surface);
+        if (!use_history) {
+            motion_info.format = result->src_format;
+        }
         has_deleted_images = false;
         const ImageId motion_id =
             FindOrInsertImage(motion_info, motion_surface.Address(), RelaxedOptions{});
@@ -1406,8 +1411,27 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
             const SubresourceRange range{.base = *base, .extent = {1, 1}};
             return RenderTargetFromImage(id, ImageViewInfo(ImageViewType::e2D, format, range));
         };
-        const auto src_view = view(src_id, src, result->src_format);
-        const auto motion_view = view(motion_id, motion_surface, motion_info.format);
+        const auto sampled_view = [&](ImageId id, const auto& surface, PixelFormat format)
+            -> std::optional<std::pair<FramebufferId, ImageViewId>> {
+            if (format != PixelFormat::E5B9G9R9_FLOAT) {
+                return view(id, surface, format);
+            }
+            const auto base = slot_images[id].TryFindBase(surface.Address());
+            if (!base) {
+                return std::nullopt;
+            }
+            const SubresourceRange range{.base = *base, .extent = {1, 1}};
+            const ImageViewId sampled = FindOrEmplaceImageView(
+                id, ImageViewInfo(ImageViewType::e2D, format, range));
+            if (!sampled) {
+                return std::nullopt;
+            }
+            // Shared-exponent RGB is sampled, never bound as a colour attachment.
+            return std::pair{FramebufferId{}, sampled};
+        };
+        const auto src_view = sampled_view(src_id, src, result->src_format);
+        const auto motion_view = !use_history ? src_view
+                                             : sampled_view(motion_id, motion_surface, motion_info.format);
         const auto dst_view = view(dst_id, dst, result->dst_format);
         if (!src_view || !motion_view || !dst_view) {
             return false;
@@ -2968,6 +2992,9 @@ std::optional<typename TextureCache<P>::BlitImages> TextureCache<P>::GetBlitImag
     const GPUVAddr src_addr = src.Address();
     ImageInfo dst_info(dst);
     ImageInfo src_info(src);
+    if (BlitSourceFormat) {
+        src_info.format = *BlitSourceFormat;
+    }
     const bool can_be_depth_blit =
         dst_info.format == src_info.format && copy.filter == Tegra::Engines::Fermi2D::Filter::Point;
     ImageId dst_id;

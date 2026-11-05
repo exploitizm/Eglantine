@@ -12,7 +12,10 @@ namespace VideoCommon::DlssContract {
 constexpr bool ValidColorFormats(VideoCore::Surface::PixelFormat input,
                                   VideoCore::Surface::PixelFormat output, bool use_history) {
     using VideoCore::Surface::PixelFormat;
-    return (input == PixelFormat::B10G11R11_FLOAT && output == input) ||
+    return (!use_history && input == PixelFormat::E5B9G9R9_FLOAT &&
+            output == PixelFormat::B10G11R11_FLOAT) ||
+           (!use_history && input == PixelFormat::A8B8G8R8_UNORM && output == input) ||
+           (input == PixelFormat::B10G11R11_FLOAT && output == input) ||
            (!use_history && input == PixelFormat::A8B8G8R8_SRGB &&
             output == PixelFormat::R16G16B16A16_FLOAT);
 }

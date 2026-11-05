@@ -9,6 +9,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <condition_variable>
 #include <optional>
 #include <string>
 #include <utility>
@@ -63,19 +64,30 @@ public:
     }
 
     void MapAt(u32 handle, u64 offset, u64 gpu_address, u64 cpu_address, u64 size) {
-        std::scoped_lock lk{mutex};
-        TrimMappings(gpu_address, size);
-        mappings.push_back({gpu_address, cpu_address, size, handle, offset});
-        for (auto& [owner, listener] : listeners) {
+        std::scoped_lock order{ordered};
+        ActiveCall running{*this};
+        std::vector<Listeners> current;
+        {
+            std::scoped_lock lk{mutex};
+            TrimMappings(gpu_address, size);
+            mappings.push_back({gpu_address, cpu_address, size, handle, offset});
+            current = CurrentListeners();
+        }
+        for (auto& listener : current) {
             listener.map(gpu_address, cpu_address, size);
         }
     }
 
-    // NormalUnmapGpuMemory4K, or destroying the memory: the GPU range stops reaching it.
     void Unmap(u64 gpu_address, u64 size) {
-        std::scoped_lock lk{mutex};
-        TrimMappings(gpu_address, size);
-        for (auto& [owner, listener] : listeners) {
+        std::scoped_lock order{ordered};
+        ActiveCall running{*this};
+        std::vector<Listeners> current;
+        {
+            std::scoped_lock lk{mutex};
+            TrimMappings(gpu_address, size);
+            current = CurrentListeners();
+        }
+        for (auto& listener : current) {
             listener.unmap(gpu_address, size);
         }
     }
@@ -87,8 +99,13 @@ public:
             std::scoped_lock lk{device_mutex};
             device_ranges.erase(cpu_address);
         }
-        std::scoped_lock lk{mutex};
-        for (auto& [owner, listener] : listeners) {
+        ActiveCall running{*this};
+        std::vector<Listeners> current;
+        {
+            std::scoped_lock lk{mutex};
+            current = CurrentListeners();
+        }
+        for (auto& listener : current) {
             if (listener.release) {
                 listener.release(cpu_address, size);
             }
@@ -100,28 +117,23 @@ public:
     // The GPU mapping never changes, so the texture cache doesn't rebuild the images over it as
     // blocks get memory; unbacked blocks read zero.
     void CreateSparse(u64 gpu_address, u64 size) {
-        std::scoped_lock lk{mutex};
-        sparse_regions[gpu_address] = size;
-        for (auto& [owner, listener] : listeners) {
-            if (listener.sparse) {
-                listener.sparse(gpu_address, size, true);
-            }
-        }
+        std::scoped_lock order{ordered};
+        SparseChanged(gpu_address, size, true);
     }
 
     void DestroySparse(u64 gpu_address, u64 size) {
-        std::scoped_lock lk{mutex};
-        sparse_regions.erase(gpu_address);
-        for (auto& [owner, listener] : listeners) {
-            if (listener.sparse) {
-                listener.sparse(gpu_address, size, false);
-            }
-        }
+        std::scoped_lock order{ordered};
+        SparseChanged(gpu_address, size, false);
     }
 
     void BackSparse(u64 gpu_address, u64 cpu_address, u64 size) {
-        std::scoped_lock lk{mutex};
-        for (auto& [owner, listener] : listeners) {
+        ActiveCall running{*this};
+        std::vector<Listeners> current;
+        {
+            std::scoped_lock lk{mutex};
+            current = CurrentListeners();
+        }
+        for (auto& listener : current) {
             if (listener.back) {
                 listener.back(gpu_address, cpu_address, size);
             }
@@ -133,8 +145,14 @@ public:
     // cpu_address 0 it is unmapped and reads zero. The GPU mapping stays as it is; only the
     // region's device pages change, in GPU-thread order.
     void MapSparseTile(u64 gpu_address, u64 cpu_address, u64 size) {
-        std::scoped_lock lk{mutex};
-        for (auto& [owner, listener] : listeners) {
+        std::scoped_lock order{ordered};
+        ActiveCall running{*this};
+        std::vector<Listeners> current;
+        {
+            std::scoped_lock lk{mutex};
+            current = CurrentListeners();
+        }
+        for (auto& listener : current) {
             if (listener.tile) {
                 listener.tile(gpu_address, cpu_address, size);
             }
@@ -144,15 +162,24 @@ public:
     void AddListener(const void* owner, Listener listener, UnmapListener unmap_listener,
                      ReleaseListener release_listener = {}, SparseListener sparse_listener = {},
                      BackListener back_listener = {}, TileListener tile_listener = {}) {
-        std::scoped_lock lk{mutex};
-        for (const auto& m : mappings) {
+        std::scoped_lock order{ordered};
+        ActiveCall running{*this};
+        std::vector<Mapping> current_mappings;
+        std::map<u64, u64> current_sparse;
+        {
+            std::scoped_lock lk{mutex};
+            current_mappings = mappings;
+            current_sparse = sparse_regions;
+        }
+        for (const auto& m : current_mappings) {
             listener(m.gpu_address, m.cpu_address, m.size);
         }
         if (sparse_listener) {
-            for (const auto& [gpu_address, size] : sparse_regions) {
+            for (const auto& [gpu_address, size] : current_sparse) {
                 sparse_listener(gpu_address, size, true);
             }
         }
+        std::scoped_lock lk{mutex};
         listeners.insert_or_assign(owner, Listeners{std::move(listener), std::move(unmap_listener),
                                                     std::move(release_listener),
                                                     std::move(sparse_listener),
@@ -161,13 +188,22 @@ public:
     }
 
     void RemoveListener(const void* owner) {
-        std::scoped_lock lk{mutex};
-        listeners.erase(owner);
+        std::scoped_lock order{ordered};
+        {
+            std::scoped_lock lk{mutex};
+            listeners.erase(owner);
+        }
+        // Already-copied callbacks may wait for GPU queue progress. Waiting for them must not
+        // prevent new GPU-side BackSparse callbacks from running (a writer-preferring shared
+        // mutex would recreate the queue deadlock).
+        std::unique_lock done{call_mutex};
+        call_cv.wait(done, [this] { return calls_running == 0; });
     }
 
     // A new emulation session starts: forget the previous game's mappings and device ranges (its
     // address spaces removed their listeners when they closed).
     void Reset() {
+        std::scoped_lock order{ordered};
         {
             std::scoped_lock lk{device_mutex};
             device_ranges.clear();
@@ -311,6 +347,35 @@ private:
         TileListener tile;
     };
 
+    // Copies of the listeners, to call without `mutex`. Needs `mutex`.
+    std::vector<Listeners> CurrentListeners() const {
+        std::vector<Listeners> current;
+        current.reserve(listeners.size());
+        for (const auto& [owner, listener] : listeners) {
+            current.push_back(listener);
+        }
+        return current;
+    }
+
+    void SparseChanged(u64 gpu_address, u64 size, bool create) {
+        ActiveCall running{*this};
+        std::vector<Listeners> current;
+        {
+            std::scoped_lock lk{mutex};
+            if (create) {
+                sparse_regions[gpu_address] = size;
+            } else {
+                sparse_regions.erase(gpu_address);
+            }
+            current = CurrentListeners();
+        }
+        for (auto& listener : current) {
+            if (listener.sparse) {
+                listener.sparse(gpu_address, size, create);
+            }
+        }
+    }
+
     // Drops [gpu_address, +size) from the recorded mappings, keeping the parts outside it.
     void TrimMappings(u64 gpu_address, u64 size) {
         const u64 end = gpu_address + size;
@@ -334,7 +399,27 @@ private:
         mappings = std::move(kept);
     }
 
+    // Serialize game-side mappings without blocking GPU-side sparse backing.
+    std::mutex ordered;
     std::mutex mutex;
+    struct ActiveCall {
+        explicit ActiveCall(Nx2GpuMemoryRegistry& registry_) : registry{registry_} {
+            std::scoped_lock lk{registry.call_mutex};
+            ++registry.calls_running;
+        }
+        ~ActiveCall() {
+            std::scoped_lock lk{registry.call_mutex};
+            if (--registry.calls_running == 0) {
+                registry.call_cv.notify_all();
+            }
+        }
+        ActiveCall(const ActiveCall&) = delete;
+        ActiveCall& operator=(const ActiveCall&) = delete;
+        Nx2GpuMemoryRegistry& registry;
+    };
+    std::mutex call_mutex;
+    std::condition_variable call_cv;
+    size_t calls_running{};
     std::vector<Mapping> mappings;
     std::map<u64, u64> sparse_regions; ///< GPU address -> size
     std::map<const void*, Listeners> listeners;

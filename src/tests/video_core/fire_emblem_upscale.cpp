@@ -7,6 +7,8 @@
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ampere/instruction.h"
 #include "video_core/fire_emblem_upscale.h"
+#include "video_core/dlss_contract.h"
+#include "video_core/texture_cache/blit_source_format.h"
 
 namespace {
 using namespace Tegra::Texture;
@@ -230,4 +232,164 @@ TEST_CASE("Star Fox logged native-resolution cutscene colour pair is accepted", 
     alias.address_low = input.address_low;
     alias.address_high.Assign(input.address_high);
     REQUIRE_FALSE(FE::ValidPair(input, alias, true));
+}
+
+TEST_CASE("Ocarina movie captured contract uses its own slots without jitter", "[oot_upscale]") {
+    const auto passes = FE::CapturedPasses(FE::OcarinaProgramId);
+    REQUIRE(passes);
+    REQUIRE(passes->prepass == 0x2f5791cea2a85397ULL);
+    REQUIRE(passes->output == 0x6093c9143ba0904dULL);
+    REQUIRE(passes->spatial_only);
+    REQUIRE(passes->skip_network);
+    REQUIRE_FALSE(passes->jitter_offset);
+    REQUIRE(passes->prepass_color_offset == 0x58);
+    REQUIRE(passes->output_color_input_offset == 0xa8);
+    REQUIRE(passes->output_color_offset == 0xc8);
+    REQUIRE(passes->input_format == TextureFormat::A8B8G8R8);
+    REQUIRE(passes->output_format == TextureFormat::A8B8G8R8);
+    REQUIRE_FALSE(passes->input_srgb);
+    REQUIRE(FE::UseReplacement(FE::OcarinaProgramId, passes->output, nullptr));
+    REQUIRE(FE::UseReplacement(FE::OcarinaProgramId, passes->output, "fsr"));
+    REQUIRE_FALSE(FE::UseReplacement(FE::OcarinaProgramId, passes->output, "native"));
+    REQUIRE_FALSE(FE::UseReplacement(FE::OcarinaProgramId, passes->prepass, nullptr));
+    REQUIRE_FALSE(FE::CapturedPasses(FE::StarFoxProgramId)->skip_network);
+}
+
+TEST_CASE("Ocarina movie validates logged RGB surfaces and rejects chroma", "[oot_upscale]") {
+    const auto passes = *FE::CapturedPasses(FE::OcarinaProgramId);
+    const auto input = std::bit_cast<TICEntry>(std::array<u32, 8>{
+        0x58d24908, 0x6ecc4000, 0x00600021, 0x00070020,
+        0xe880077f, 0x80000437, 0x03000000, 0x00000000});
+    const auto output = std::bit_cast<TICEntry>(std::array<u32, 8>{
+        0x58d24908, 0x1344a000, 0x00640081, 0x00070020,
+        0xe88009ff, 0x8000059f, 0x03000000, 0x00000000});
+    const auto chroma = std::bit_cast<TICEntry>(std::array<u32, 8>{
+        0x70d24918, 0x1331d000, 0x00640081, 0x00070020,
+        0xe88003bf, 0x8000021b, 0x03000000, 0x00000000});
+    REQUIRE(FE::ValidPair(input, output, passes));
+    REQUIRE_FALSE(FE::ValidPair(chroma, output, passes));
+    REQUIRE_FALSE(FE::ValidPair(input, input, passes));
+    REQUIRE_FALSE(FE::ValidPair(output, input, passes));
+    REQUIRE_FALSE(FE::ValidPair(input, output, true));
+    for (const bool alter_input : {false, true}) {
+        const auto rejected = [&](auto mutate) {
+            auto from = input;
+            auto to = output;
+            mutate(alter_input ? from : to);
+            REQUIRE_FALSE(FE::ValidPair(from, to, passes));
+        };
+        rejected([](auto& image) { image.srgb_conversion.Assign(1); });
+        rejected([](auto& image) { image.format.Assign(TextureFormat::A2B10G10R10); });
+        rejected([](auto& image) { image.r_type.Assign(ComponentType::FLOAT); });
+        rejected([](auto& image) { image.x_source.Assign(SwizzleSource::B); });
+        rejected([](auto& image) { image.msaa_mode.Assign(MsaaMode::Msaa2x2); });
+        rejected([](auto& image) { image.max_mip_level.Assign(1); });
+        rejected([](auto& image) { image.height_minus_1.Assign(539); });
+        rejected([](auto& image) { image.texture_type.Assign(TextureType::Texture2DArray); });
+        rejected([](auto& image) { image.address_low = 0; image.address_high.Assign(0); });
+    }
+}
+
+TEST_CASE("Ocarina network sequence includes repeated programs and excludes video conversion",
+          "[oot_upscale]") {
+    for (u32 step = 0; step < FE::OcarinaNetworkKeys.size(); ++step) {
+        REQUIRE(FE::OcarinaStepMatches(step, FE::OcarinaNetworkKeys[step]));
+        REQUIRE_FALSE(FE::OcarinaStepMatches(step, 0xf9e5b02b5fabff78ULL));
+        REQUIRE_FALSE(FE::OcarinaStepMatches(step, FE::OcarinaNetworkKeys[step] ^ 1));
+    }
+    REQUIRE_FALSE(FE::OcarinaStepMatches(13, FE::OcarinaOutputProgramKey));
+}
+
+TEST_CASE("Ocarina RGBA8 output format is spatial only", "[oot_upscale]") {
+    using VideoCore::Surface::PixelFormat;
+    REQUIRE(VideoCommon::DlssContract::ValidColorFormats(
+        PixelFormat::A8B8G8R8_UNORM, PixelFormat::A8B8G8R8_UNORM, false));
+    REQUIRE_FALSE(VideoCommon::DlssContract::ValidColorFormats(
+        PixelFormat::A8B8G8R8_UNORM, PixelFormat::A8B8G8R8_UNORM, true));
+}
+
+TEST_CASE("Ocarina cannot fall back to a partially suppressed native evaluation", "[oot_upscale]") {
+    REQUIRE_FALSE(FE::SuppressOcarinaOutput(false, 0));
+    REQUIRE(FE::SuppressOcarinaOutput(true, 0));
+    for (u32 skipped = 1; skipped <= 12; ++skipped) {
+        REQUIRE(FE::SuppressOcarinaOutput(false, skipped));
+        REQUIRE(FE::SuppressOcarinaOutput(true, skipped));
+    }
+    REQUIRE_FALSE(FE::OcarinaNetworkContains(0xf9e5b02b5fabff78ULL));
+    REQUIRE_FALSE(FE::OcarinaNetworkContains(0));
+    for (const u64 key : FE::OcarinaNetworkKeys) {
+        REQUIRE(FE::OcarinaNetworkContains(key));
+    }
+}
+
+TEST_CASE("Ocarina gameplay selects its separate captured neural output", "[oot_upscale]") {
+    const auto passes = FE::CapturedPasses(FE::OcarinaProgramId, FE::OcarinaGameplayProgramKey);
+    REQUIRE(passes);
+    REQUIRE(passes->standalone);
+    REQUIRE(passes->spatial_only);
+    REQUIRE(passes->skip_network);
+    REQUIRE_FALSE(passes->jitter_offset);
+    REQUIRE(passes->output_color_input_offset == 0xc0);
+    REQUIRE(passes->output_color_offset == 0xd0);
+    REQUIRE(FE::UseReplacement(FE::OcarinaProgramId, FE::OcarinaGameplayProgramKey, nullptr));
+    REQUIRE(FE::UseReplacement(FE::OcarinaProgramId, FE::OcarinaGameplayProgramKey, "fsr"));
+    REQUIRE_FALSE(FE::UseReplacement(FE::OcarinaProgramId, FE::OcarinaGameplayProgramKey, "native"));
+    REQUIRE_FALSE(FE::UseReplacement(FE::StarFoxProgramId, FE::OcarinaGameplayProgramKey, nullptr));
+    REQUIRE_FALSE(FE::CapturedPasses(FE::OcarinaProgramId)->standalone);
+}
+
+TEST_CASE("Ocarina gameplay validates its logged shared-exponent source and float output",
+          "[oot_upscale]") {
+    const auto passes = *FE::CapturedPasses(FE::OcarinaProgramId, FE::OcarinaGameplayProgramKey);
+    const auto input = std::bit_cast<TICEntry>(std::array<u32, 8>{
+        0x78d7ffa0, 0x132b1000, 0x00640081, 0x00070020,
+        0xe8800355, 0x800001df, 0x03000000, 0x00000000});
+    const auto output = std::bit_cast<TICEntry>(std::array<u32, 8>{
+        0x78d7ffa1, 0x252ff000, 0x00600081, 0x00070020,
+        0xe88009ff, 0x8000059f, 0x03000000, 0x00000000});
+    REQUIRE(input.Width() == 854);
+    REQUIRE(input.Height() == 480);
+    REQUIRE(FE::ValidPair(input, output, passes));
+    REQUIRE_FALSE(FE::ValidPair(input, output, *FE::CapturedPasses(FE::OcarinaProgramId)));
+    REQUIRE_FALSE(FE::ValidPair(input, input, passes));
+    REQUIRE_FALSE(FE::ValidPair(output, input, passes));
+    for (bool alter_input : {false, true}) {
+        const auto rejected = [&](auto mutate) {
+            auto from = input;
+            auto to = output;
+            mutate(alter_input ? from : to);
+            REQUIRE_FALSE(FE::ValidPair(from, to, passes));
+        };
+        rejected([](auto& image) { image.format.Assign(TextureFormat::A8B8G8R8); });
+        rejected([](auto& image) { image.srgb_conversion.Assign(1); });
+        rejected([](auto& image) { image.w_source.Assign(SwizzleSource::A); });
+        rejected([](auto& image) { image.r_type.Assign(ComponentType::UNORM); });
+        rejected([](auto& image) { image.texture_type.Assign(TextureType::Texture2DArray); });
+        rejected([](auto& image) { image.max_mip_level.Assign(1); });
+        rejected([](auto& image) { image.is_sparse.Assign(1); });
+        rejected([](auto& image) { image.width_minus_one.Assign(31); });
+    }
+    using VideoCore::Surface::PixelFormat;
+    REQUIRE(VideoCommon::DlssContract::ValidColorFormats(
+        PixelFormat::E5B9G9R9_FLOAT, PixelFormat::B10G11R11_FLOAT, false));
+    REQUIRE_FALSE(VideoCommon::DlssContract::ValidColorFormats(
+        PixelFormat::E5B9G9R9_FLOAT, PixelFormat::B10G11R11_FLOAT, true));
+}
+
+TEST_CASE("Spatial source format override restores nested and exceptional callers",
+          "[oot_upscale]") {
+    using VideoCore::Surface::PixelFormat;
+    REQUIRE_FALSE(VideoCommon::BlitSourceFormat);
+    {
+        VideoCommon::ScopedBlitSourceFormat first{PixelFormat::E5B9G9R9_FLOAT};
+        REQUIRE(VideoCommon::BlitSourceFormat == PixelFormat::E5B9G9R9_FLOAT);
+        try {
+            VideoCommon::ScopedBlitSourceFormat nested{PixelFormat::A8B8G8R8_UNORM};
+            REQUIRE(VideoCommon::BlitSourceFormat == PixelFormat::A8B8G8R8_UNORM);
+            throw 1;
+        } catch (int) {
+        }
+        REQUIRE(VideoCommon::BlitSourceFormat == PixelFormat::E5B9G9R9_FLOAT);
+    }
+    REQUIRE_FALSE(VideoCommon::BlitSourceFormat);
 }

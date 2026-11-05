@@ -31,6 +31,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu.h"
+#include "video_core/fire_emblem_upscale.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/gpu_timestamp.h"
 #include "video_core/host1x/host1x.h"
@@ -514,6 +515,7 @@ bool GPU::UseNvdec() const {
 }
 
 void GPU::RendererFrameEndNotify() {
+    VideoCommon::FireEmblemUpscale::DlssTraceFrame.fetch_add(1, std::memory_order_relaxed);
     impl->RendererFrameEndNotify();
 }
 
