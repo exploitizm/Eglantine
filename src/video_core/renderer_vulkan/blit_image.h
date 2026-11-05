@@ -190,7 +190,7 @@ private:
 
     [[nodiscard]] VkPipeline FindOrEmplaceColorPipeline(const BlitImagePipelineKey& key);
 
-    [[nodiscard]] VkPipeline FindOrEmplaceTemporalUpscalePipeline(VkRenderPass renderpass);
+    [[nodiscard]] VkPipeline FindOrEmplaceTemporalUpscalePipeline(const Framebuffer* framebuffer);
     [[nodiscard]] VkPipeline FindOrEmplaceTemporalSharpenPipeline(VkRenderPass renderpass);
 
     [[nodiscard]] VkPipeline FindOrEmplaceDepthStencilPipeline(const BlitImagePipelineKey& key);

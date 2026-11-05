@@ -7,6 +7,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/surface.h"
+#include "video_core/textures/texture_view.h"
 #include "video_core/texture_cache/types.h"
 
 namespace VideoCommon {
@@ -14,16 +15,6 @@ namespace VideoCommon {
 using Tegra::Texture::TICEntry;
 using VideoCore::Surface::PixelFormat;
 
-// Native descriptors address the selected view directly. The legacy NVN
-// layer-base bookkeeping is not an additional array prefix for this ABI.
-inline TICEntry TextureViewHeader(TICEntry entry, bool native) {
-    if (native) {
-        entry.layer_base_0_2.Assign(0);
-        entry.layer_base_3_7.Assign(0);
-        entry.layer_base_8_10.Assign(0);
-    }
-    return entry;
-}
 
 struct ImageInfo {
     ImageInfo() = default;

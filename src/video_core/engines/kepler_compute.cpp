@@ -9,6 +9,7 @@
 #include <bit>
 #include <bitset>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <optional>
@@ -20,9 +21,12 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
+#include "shader_recompiler/frontend/ampere/program_capture.h"
+#include "shader_recompiler/frontend/ampere/program_override.h"
 #include "core/core.h"
 #include "video_core/gpu_split.h"
 #include "video_core/fire_emblem_upscale.h"
+#include "video_core/texture_cache/blit_source_format.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2.h"
 #include "video_core/engines/fermi_2d.h"
@@ -407,7 +411,7 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                         VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
                 }
                 return true;
-            }, [&](const auto& descriptor) { return DispatchNativeCompute(descriptor); });
+            }, [&](const auto& descriptor) { return DispatchNativeCompute(system, descriptor); });
         if (error.empty()) {
             LOG_DEBUG(HW_GPU, "Native QMD control action={:#x}, QMD={:#x}", argument, qmd_address);
             return true;
@@ -524,7 +528,7 @@ void KeplerCompute::CallMultiMethod(Core::System& system, u32 method, const u32*
     }
 }
 
-bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& qmd) {
+bool KeplerCompute::DispatchNativeCompute(Core::System& system, const NativeQmdScheduler::Descriptor& qmd) {
     launch_description = {};
     launch_description.grid_dim_x.Assign(qmd[12]);
     launch_description.grid_dim_y.Assign(qmd[13] & 0xffff);
@@ -551,6 +555,29 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     }
     if (!launch_description.block_dim_x || !launch_description.block_dim_y || !launch_description.block_dim_z)
         return false;
+    oot_processed_dispatch = false;
+    if (system.GetApplicationProcessProgramID() == 0x0400486024DEC000ULL) {
+        TraceOcarinaDispatch();
+        if (TryOcarinaGameplayUpscale()) {
+            return true;
+        }
+        using namespace VideoCommon::FireEmblemUpscale;
+        if (UseReplacement(OcarinaProgramId, OcarinaOutputProgramKey,
+                           std::getenv("EDEN_NX2_DLSS_REPLACEMENT")) &&
+            GameDlssBlocker() != VideoCore::GameDlssReason::None) {
+            const auto prepass_input = DlssImage(
+                CapturedPasses(OcarinaProgramId)->prepass_color_offset);
+            if (oot_input || (prepass_input && ValidInput(
+                                  *prepass_input, *CapturedPasses(OcarinaProgramId)))) {
+                if (const auto key = OcarinaNativeKey()) {
+                    oot_processed_dispatch = true;
+                    if (ProcessOcarinaDlss(*key)) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
     dlss_chain.output_pass = false;
     // Fortune's Weave's evaluation is 13 dispatches. Bound incomplete evaluations, including
     // skipped dispatches, so a missing output pass cannot keep the chain active indefinitely.
@@ -602,6 +629,166 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     return dispatched;
 }
 
+std::optional<u64> KeplerCompute::OcarinaNativeKey() {
+    const GPUVAddr address = regs.code_loc.Address() + launch_description.program_start;
+    if (const auto found = oot_native_programs.find(address); found != oot_native_programs.end()) {
+        const auto& code = found->second.code;
+        if (memory_manager.IsFullyMappedRange(address, code.size())) {
+            oot_native_scratch.resize(code.size());
+            memory_manager.ReadBlockUnsafe(address, oot_native_scratch.data(), code.size());
+            if (oot_native_scratch == code) {
+                return found->second.key;
+            }
+        }
+        oot_native_bytes -= code.size();
+        oot_native_programs.erase(found);
+    }
+    using namespace Shader::Ampere;
+    std::vector<Instruction> instructions;
+    ProgramCaptureState capture;
+    bool complete = false;
+    for (u32 index = 0; index < ProgramCaptureState::MaximumInstructions; ++index) {
+        const GPUVAddr instruction_address = address + u64{index} * sizeof(Instruction);
+        if (!memory_manager.IsFullyMappedRange(instruction_address, sizeof(Instruction))) {
+            break;
+        }
+        Instruction instruction;
+        memory_manager.ReadBlockUnsafe(instruction_address, &instruction, sizeof(instruction));
+        instructions.push_back(instruction);
+        const auto result = capture.Observe(instruction, index);
+        if (result == ProgramCaptureState::Result::InvalidTarget) {
+            return std::nullopt;
+        }
+        if (result == ProgramCaptureState::Result::Complete) {
+            complete = true;
+            break;
+        }
+    }
+    if (!complete) {
+        return std::nullopt;
+    }
+    const u64 key = NativeProgramKey(instructions);
+    std::vector<u8> code(instructions.size() * sizeof(Instruction));
+    std::memcpy(code.data(), instructions.data(), code.size());
+    // Bound captured code, and compare every cached byte before trusting its key. Reused or
+    // self-modified guest addresses therefore cannot inherit a stale replacement decision.
+    if (oot_native_programs.size() >= 128 || oot_native_bytes + code.size() > 4 * 1024 * 1024) {
+        oot_native_programs.clear();
+        oot_native_bytes = 0;
+    }
+    oot_native_bytes += code.size();
+    oot_native_programs.emplace(address, OcarinaNativeProgram{key, std::move(code)});
+    return key;
+}
+
+// Observe before shader lowering/rejection, independently of replacement decisions.
+// A known HMMA key starts the initial window; manual triggers also capture unknown programs.
+void KeplerCompute::TraceOcarinaDispatch() {
+    static const u32 frames = [] {
+        const char* value = std::getenv("EDEN_NX2_OOT_DLSS_TRACE_FRAMES");
+        return value ? static_cast<u32>(std::min<unsigned long>(
+                           std::strtoul(value, nullptr, 10), 120UL)) : 0U;
+    }();
+    if (frames == 0) {
+        return;
+    }
+    const u64 frame = VideoCommon::FireEmblemUpscale::DlssTraceFrame.load(
+        std::memory_order_relaxed);
+    if (oot_trace_finished) {
+        static const char* trigger = std::getenv("EDEN_NX2_OOT_DLSS_TRACE_TRIGGER");
+        if (!trigger || frame == oot_trace_poll_frame) {
+            return;
+        }
+        oot_trace_poll_frame = frame;
+        if (auto* file = std::fopen(trigger, "rb")) {
+            std::fclose(file);
+            std::remove(trigger);
+            oot_trace_finished = false;
+            oot_trace_start_frame = frame;
+            oot_trace_dispatches = 0;
+        } else {
+            return;
+        }
+    }
+    // The dispatch cap also stops output if rendering stalls before the next present.
+    if ((oot_trace_start_frame && frame - *oot_trace_start_frame >= frames) ||
+        oot_trace_dispatches >= 4096) {
+        LOG_INFO(HW_GPU, "OOT DLSS discovery complete: {} dispatches, {} present boundaries",
+                 oot_trace_dispatches, oot_trace_start_frame ? frame - *oot_trace_start_frame : 0);
+        oot_trace_finished = true;
+        oot_trace_programs.clear();
+        return;
+    }
+    const GPUVAddr program = regs.code_loc.Address() + launch_description.program_start;
+    const auto captured = OcarinaNativeKey();
+    if (!captured) {
+        return;
+    }
+    const u64 key = *captured;
+    constexpr std::array network_keys{
+        0x0618cc4a3ac8f33aULL, 0x0be2f024aea21a6cULL, 0x1fdb95ea2565f49cULL,
+        0x2a366b38546a4d5eULL, 0x2f5791cea2a85397ULL, 0x313d724f3e214203ULL,
+        0x6093c9143ba0904dULL, 0xdf2c83cf2ad70790ULL, 0xe27336d38f1cc8f4ULL,
+        0xecebb02dec6faa17ULL};
+    if (!oot_trace_start_frame) {
+        if (std::find(network_keys.begin(), network_keys.end(), key) == network_keys.end()) {
+            return;
+        }
+        oot_trace_start_frame = frame;
+    }
+    if (oot_trace_programs.emplace(program, key).second) {
+        if (const char* directory = std::getenv("EDEN_NX2_OOT_DLSS_TRACE_DUMP")) {
+            const auto& code = oot_native_programs.at(program).code;
+            std::ofstream dump(fmt::format("{}/{:016x}-cs-{:x}.bin", directory, key, program),
+                               std::ios::binary);
+            dump.write(reinterpret_cast<const char*>(code.data()), code.size());
+        }
+    }
+    const u32 sequence = oot_trace_dispatches++;
+    const auto& cbuf = launch_description.const_buffer_config[0];
+    const GPUVAddr address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
+    const u32 bytes = std::min<u32>(cbuf.size.Value(), 0x1000U);
+    LOG_INFO(HW_GPU, "OOT DLSS dispatch seq={} frame={} key={:016x} code={:#x} grid={}x{}x{} block={}x{}x{} cb0={:#x} bytes={:#x} tic={:#x} limit={} observed before replacement decision",
+             sequence, frame - *oot_trace_start_frame, key, program,
+             launch_description.grid_dim_x.Value(), launch_description.grid_dim_y.Value(),
+             launch_description.grid_dim_z.Value(), launch_description.block_dim_x.Value(),
+             launch_description.block_dim_y.Value(), launch_description.block_dim_z.Value(),
+             address, bytes, regs.tic.Address(), regs.tic.limit);
+    if (!(launch_description.const_buffer_enable_mask & 1) ||
+        !memory_manager.IsFullyMappedRange(address, bytes)) {
+        LOG_INFO(HW_GPU, "OOT DLSS cb0 unavailable seq={}", sequence);
+        return;
+    }
+    for (u32 offset = 0; offset + sizeof(u32) <= bytes; offset += sizeof(u32)) {
+        const u32 handle = memory_manager.Read<u32>(address + offset);
+        // Raw constants preserve possible jitter. A handle-shaped word is only a candidate;
+        // shader instructions must confirm which descriptors are actually read or written.
+        if (offset % 16 == 0 && offset + 16 <= bytes) {
+            std::array<u32, 4> words{};
+            memory_manager.ReadBlockUnsafe(address + offset, words.data(), sizeof(words));
+            LOG_INFO(HW_GPU, "OOT DLSS cb0 seq={} +{:03x}: {:08x}",
+                     sequence, offset, fmt::join(words, " "));
+        }
+        const u32 index = handle & 0xfffff;
+        const GPUVAddr descriptor = regs.tic.Address() + u64{index} * sizeof(Texture::TICEntry);
+        if (handle == 0 || index > regs.tic.limit ||
+            !memory_manager.IsFullyMappedRange(descriptor, sizeof(Texture::TICEntry))) {
+            continue;
+        }
+        const auto tic = GetTICEntry(index);
+        if (tic.Address() == 0) {
+            continue;
+        }
+        const auto raw = std::bit_cast<std::array<u32, 8>>(tic);
+        LOG_INFO(HW_GPU, "OOT DLSS candidate seq={} cb0+{:03x}={:08x} tic={} addr={:#x} {}x{}x{} format={:#x} types={}/{}/{}/{} srgb={} raw={:08x}",
+                 sequence, offset, handle, index, tic.Address(), tic.Width(), tic.Height(),
+                 tic.Depth(), static_cast<u32>(tic.format.Value()),
+                 static_cast<u32>(tic.r_type.Value()), static_cast<u32>(tic.g_type.Value()),
+                 static_cast<u32>(tic.b_type.Value()), static_cast<u32>(tic.a_type.Value()),
+                 tic.srgb_conversion.Value(), fmt::join(raw, " "));
+    }
+}
+
 namespace {
 constexpr u32 DLSS_NETWORK_CLEAN_EVALUATIONS = 8;
 /// Health checks in a row the network must pass before it is shown (about a second: a network that
@@ -616,14 +803,21 @@ constexpr u32 DLSS_CHECK_MISMATCH_PERCENT = 3;
 
 bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     using namespace VideoCommon::FireEmblemUpscale;
-    const auto passes = CapturedPasses(program_id);
-    if (!passes) {
+    if (program_id == OcarinaProgramId && oot_processed_dispatch) {
         return false;
+    }
+    const auto passes = CapturedPasses(program_id, native_key);
+    if (!passes || passes->standalone) {
+        return false;
+    }
+    if (passes->skip_network) {
+        return ProcessOcarinaDlss(native_key);
     }
     if (passes->spatial_only && (native_key == passes->prepass || native_key == passes->output)) {
         TraceDlssContract(native_key, false);
     }
     if (native_key == passes->prepass) {
+        dlss_chain.program_id = program_id;
         dlss_chain.spatial_only = passes->spatial_only;
         CaptureFireEmblemJitter();
         dlss_chain.active = true;
@@ -647,6 +841,214 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     return dlss_chain.failure != VideoCore::GameDlssReason::None &&
            native_key != passes->prepass &&
            dlss_chain.programs.contains(native_key);
+}
+
+std::optional<Texture::TICEntry> KeplerCompute::DlssImage(u32 offset) {
+    const auto& cbuf = launch_description.const_buffer_config[0];
+    const GPUVAddr address = cbuf.Address();
+    if (!(launch_description.const_buffer_enable_mask & 1) ||
+        cbuf.size.Value() < offset + sizeof(u32) ||
+        !memory_manager.IsFullyMappedRange(address + offset, sizeof(u32))) {
+        return std::nullopt;
+    }
+    const u32 index = memory_manager.Read<u32>(address + offset) & 0xfffff;
+    const GPUVAddr descriptor = regs.tic.Address() + u64{index} * sizeof(Texture::TICEntry);
+    if (index > regs.tic.limit ||
+        !memory_manager.IsFullyMappedRange(descriptor, sizeof(Texture::TICEntry))) {
+        return std::nullopt;
+    }
+    return GetTICEntry(index);
+}
+
+bool KeplerCompute::TryOcarinaGameplayUpscale() {
+    using namespace VideoCommon::FireEmblemUpscale;
+    if (!UseReplacement(OcarinaProgramId, OcarinaGameplayProgramKey,
+                        std::getenv("EDEN_NX2_DLSS_REPLACEMENT")) ||
+        GameDlssBlocker() == VideoCore::GameDlssReason::None) {
+        return false;
+    }
+    const auto passes = *CapturedPasses(OcarinaProgramId, OcarinaGameplayProgramKey);
+    const auto input = DlssImage(passes.output_color_input_offset);
+    const auto output = DlssImage(passes.output_color_offset);
+    if (!input || !output || !ValidPair(*input, *output, passes)) {
+        return false;
+    }
+    // This pass can be rejected before ShaderCache reaches ProcessGameDlss. Check the complete
+    // captured native instruction range here, on every attempt, rather than trusting an address.
+    const GPUVAddr address = regs.code_loc.Address() + launch_description.program_start;
+    std::array<Shader::Ampere::Instruction, OcarinaGameplayInstructionCount> instructions;
+    if (!memory_manager.IsFullyMappedRange(address, sizeof(instructions))) {
+        return false;
+    }
+    memory_manager.ReadBlockUnsafe(address, instructions.data(), sizeof(instructions));
+    if (Shader::Ampere::NativeProgramKey(instructions) != OcarinaGameplayProgramKey) {
+        return false;
+    }
+    const auto surface = [](const Texture::TICEntry& tic) {
+        Fermi2D::Surface result{};
+        result.format = Tegra::RenderTargetFormat::B10G11R11_FLOAT;
+        result.linear = Fermi2D::MemoryLayout::BlockLinear;
+        result.block_width.Assign(tic.block_width);
+        result.block_height.Assign(tic.block_height);
+        result.block_depth.Assign(tic.block_depth);
+        result.depth = 1;
+        result.width = tic.Width();
+        result.height = tic.Height();
+        result.addr_upper = static_cast<u32>(tic.Address() >> 32);
+        result.addr_lower = static_cast<u32>(tic.Address());
+        return result;
+    };
+    const VideoCommon::ScopedBlitSourceFormat source_format{
+        VideoCore::Surface::PixelFormat::E5B9G9R9_FLOAT};
+    const bool applied = rasterizer->AccelerateTemporalUpscale(
+        surface(*input), surface(*output), {}, nullptr, {0.0f, 0.0f}, {0.0f, 0.0f}, false);
+    static u32 evaluations{};
+    if (evaluations++ < 8 || evaluations % 600 == 0) {
+        LOG_INFO(HW_GPU, "Ocarina gameplay spatial: applied={} key={:016x} temporal=false input={:#x} {}x{} E5B9G9R9 output={:#x} {}x{} B10G11R11 HMMA=188 GPU dispatch={}",
+                 applied, OcarinaGameplayProgramKey, input->Address(), input->Width(), input->Height(),
+                 output->Address(), output->Width(), output->Height(), !applied);
+    }
+    return applied;
+}
+
+bool KeplerCompute::TryOcarinaUpscale(const Texture::TICEntry& input,
+                                     const Texture::TICEntry& output) {
+    const auto passes = VideoCommon::FireEmblemUpscale::CapturedPasses(
+        VideoCommon::FireEmblemUpscale::OcarinaProgramId);
+    if (!VideoCommon::FireEmblemUpscale::ValidPair(input, output, *passes)) {
+        return false;
+    }
+    const auto surface = [](const Texture::TICEntry& tic) {
+        Fermi2D::Surface result{};
+        result.format = Tegra::RenderTargetFormat::A8B8G8R8_UNORM;
+        result.linear = Fermi2D::MemoryLayout::BlockLinear;
+        result.block_width.Assign(tic.block_width);
+        result.block_height.Assign(tic.block_height);
+        result.block_depth.Assign(tic.block_depth);
+        result.depth = 1;
+        result.width = tic.Width();
+        result.height = tic.Height();
+        result.addr_upper = static_cast<u32>(tic.Address() >> 32);
+        result.addr_lower = static_cast<u32>(tic.Address());
+        return result;
+    };
+    return rasterizer->AccelerateTemporalUpscale(surface(input), surface(output), {}, nullptr,
+                                                {0.0f, 0.0f}, {0.0f, 0.0f}, false);
+}
+
+bool KeplerCompute::ProcessOcarinaDlss(u64 native_key) {
+    using namespace VideoCommon::FireEmblemUpscale;
+    const auto passes = *CapturedPasses(OcarinaProgramId);
+    const bool replacement = UseReplacement(OcarinaProgramId, passes.output,
+                                            std::getenv("EDEN_NX2_DLSS_REPLACEMENT")) &&
+                             GameDlssBlocker() != VideoCore::GameDlssReason::None;
+    if (!replacement) {
+        oot_prepared = false;
+        oot_bootstrap = false;
+        oot_input.reset();
+        oot_output.reset();
+        oot_network_step = 0;
+        return false;
+    }
+    if (native_key == passes.prepass) {
+        oot_network_step = 0;
+        oot_dispatches = 0;
+        oot_sequence_valid = true;
+        oot_skipped = 0;
+        oot_prepared = false;
+        oot_bootstrap = false;
+        oot_input = DlssImage(passes.prepass_color_offset);
+        if (oot_input && ValidInput(*oot_input, passes) && !oot_bootstrap_attempted) {
+            // The console trace established this evaluation's contract. Resolve its actual
+            // output at the final pass without translating or dispatching an initial neural
+            // warm-up. A failed first output disables bootstrap and allows a complete native
+            // fallback on subsequent evaluations.
+            oot_bootstrap_attempted = true;
+            oot_bootstrap = true;
+        }
+        // After bootstrap, prepare this frame's validated display output before suppressing
+        // any pass. Allocation/format failures retain the complete subsequent native evaluation.
+        if (oot_input && oot_output) {
+            const GPUVAddr descriptor = regs.tic.Address() +
+                u64{oot_output_index} * sizeof(Texture::TICEntry);
+            if (oot_output_index <= regs.tic.limit &&
+                memory_manager.IsFullyMappedRange(descriptor, sizeof(Texture::TICEntry))) {
+                const auto current_output = GetTICEntry(oot_output_index);
+                if (std::memcmp(&current_output, &*oot_output, sizeof(current_output)) == 0) {
+                    oot_prepared = TryOcarinaUpscale(*oot_input, current_output);
+                }
+            }
+        }
+    }
+    if (!oot_input) {
+        return false;
+    }
+    if (++oot_dispatches > 64) {
+        oot_sequence_valid = false;
+        if (!oot_prepared && !oot_bootstrap) {
+            oot_input.reset();
+            oot_output.reset();
+            return false;
+        }
+    }
+    if (!OcarinaStepMatches(oot_network_step, native_key)) {
+        // Once any native pass is suppressed, keep the prepared image and suppress the
+        // remaining network programs. Falling back mid-evaluation would read stale buffers.
+        // Unrelated programs still run; a changed sequence cannot prime the next evaluation.
+        oot_sequence_valid = false;
+        oot_network_step = static_cast<u32>(OcarinaNetworkKeys.size());
+    } else {
+        ++oot_network_step;
+    }
+    if (native_key != passes.output) {
+        const bool suppress = (oot_prepared || oot_bootstrap) && OcarinaNetworkContains(native_key);
+        if (suppress) {
+            ++oot_skipped;
+            if (oot_evaluations < 8) {
+                LOG_INFO(HW_GPU, "Ocarina DLSS suppressed step={} key={:016x} GPU dispatch=false",
+                         oot_network_step, native_key);
+            }
+        }
+        return suppress;
+    }
+    const auto input = DlssImage(passes.output_color_input_offset);
+    const auto output = DlssImage(passes.output_color_offset);
+    const bool same_input = input && *input == *oot_input && ValidInput(*input, passes);
+    const bool same_output = output && oot_output &&
+                             std::memcmp(&*output, &*oot_output, sizeof(*output)) == 0;
+    const bool applied = output && ValidPair(*oot_input, *output, passes) &&
+                         (TryOcarinaUpscale(*oot_input, *output) || (oot_prepared && same_output));
+    const bool suppress_output = SuppressOcarinaOutput(applied, oot_skipped);
+    if (applied && same_input && oot_sequence_valid) {
+        const auto& cbuf = launch_description.const_buffer_config[0];
+        oot_output_index = memory_manager.Read<u32>(
+            cbuf.Address() + passes.output_color_offset) & 0xfffff;
+        oot_output = *output;
+    } else {
+        oot_output.reset();
+    }
+    if (oot_evaluations++ < 8 || oot_evaluations % 600 == 0) {
+        LOG_INFO(HW_GPU, "Ocarina DLSS spatial: applied={} temporal=false input={:#x} {}x{} output={:#x} {}x{} skipped={}/13 native_output_dispatch={}",
+                 applied, input ? input->Address() : 0, input ? input->Width() : 0,
+                 input ? input->Height() : 0, output ? output->Address() : 0,
+                 output ? output->Width() : 0, output ? output->Height() : 0,
+                 oot_skipped + (suppress_output ? 1 : 0), !suppress_output);
+    }
+    if (suppress_output && !applied) {
+        static u32 failures{};
+        if (failures++ < 4) {
+            LOG_ERROR(HW_GPU, "Ocarina spatial output unavailable after {} skipped passes (prepared={} bootstrap={}); incomplete native output suppressed; next evaluation runs native",
+                      oot_skipped, oot_prepared, oot_bootstrap);
+        }
+    }
+    if (suppress_output && oot_evaluations <= 8) {
+        LOG_INFO(HW_GPU, "Ocarina DLSS suppressed step=13 key={:016x} GPU dispatch=false",
+                 native_key);
+    }
+    oot_input.reset();
+    oot_prepared = false;
+    oot_bootstrap = false;
+    return suppress_output;
 }
 
 // The game's own DLSS network (its translated programs) is shown once every pass of an
@@ -929,24 +1331,30 @@ void KeplerCompute::CaptureFireEmblemJitter() {
     (void)fe_upscale_jitter.Take();
     dlss_motion_vectors.reset();
     dlss_depth.reset();
-    const auto& cbuf = launch_description.const_buffer_config[0];
-    const GPUVAddr address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
-    if (!(launch_description.const_buffer_enable_mask & 1) || cbuf.size.Value() < 0x27c ||
-        !memory_manager.IsFullyMappedRange(address, 0x27c)) {
+    const auto passes = CapturedPasses(dlss_chain.program_id);
+    if (!passes || !passes->jitter_offset) {
         return;
     }
-    const u32 index = memory_manager.Read<u32>(address + PrepassColorOffset) & 0xfffff;
+    const u32 bytes = std::max(passes->prepass_color_offset + sizeof(u32),
+                               *passes->jitter_offset + 2 * sizeof(f32));
+    const auto& cbuf = launch_description.const_buffer_config[0];
+    const GPUVAddr address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
+    if (!(launch_description.const_buffer_enable_mask & 1) || cbuf.size.Value() < bytes ||
+        !memory_manager.IsFullyMappedRange(address, bytes)) {
+        return;
+    }
+    const u32 index = memory_manager.Read<u32>(address + passes->prepass_color_offset) & 0xfffff;
     if (index > regs.tic.limit || !memory_manager.IsFullyMappedRange(
             regs.tic.Address() + u64{index} * sizeof(Texture::TICEntry), sizeof(Texture::TICEntry))) {
         return;
     }
     const auto color = GetTICEntry(index);
-    if (!ValidInput(color, dlss_chain.spatial_only)) {
+    if (!ValidInput(color, *passes)) {
         return;
     }
     fe_upscale_jitter.Capture(color.Address(), color.Width(), color.Height(),
-        {std::bit_cast<f32>(memory_manager.Read<u32>(address + JitterOffset)),
-         std::bit_cast<f32>(memory_manager.Read<u32>(address + JitterOffset + sizeof(f32)))});
+        {std::bit_cast<f32>(memory_manager.Read<u32>(address + *passes->jitter_offset)),
+         std::bit_cast<f32>(memory_manager.Read<u32>(address + *passes->jitter_offset + sizeof(f32)))});
     if (!dlss_chain.spatial_only) {
         RememberDlssMotionVectors();
     }
@@ -1038,9 +1446,13 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
         }
         return GetTICEntry(index);
     };
-    const auto input = image(OutputColorInputOffset);
-    const auto output = image(OutputColorOffset);
-    if (!input || !output || !ValidPair(*input, *output, dlss_chain.spatial_only) ||
+    const auto passes = CapturedPasses(dlss_chain.program_id);
+    if (!passes) {
+        return false;
+    }
+    const auto input = image(passes->output_color_input_offset);
+    const auto output = image(passes->output_color_offset);
+    if (!input || !output || !ValidPair(*input, *output, *passes) ||
         jitter->color != input->Address() || (use_history && dlss_motion_color != input->Address()) ||
         jitter->width != input->Width() || jitter->height != input->Height()) {
         return false;
@@ -1059,10 +1471,11 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
         result.addr_lower = static_cast<u32>(tic.Address());
         return result;
     };
-    const auto input_format = dlss_chain.spatial_only ? Tegra::RenderTargetFormat::A8B8G8R8_SRGB
-                                                     : Tegra::RenderTargetFormat::B10G11R11_FLOAT;
-    const auto output_format = dlss_chain.spatial_only ? Tegra::RenderTargetFormat::R16G16B16A16_FLOAT
-                                                      : Tegra::RenderTargetFormat::B10G11R11_FLOAT;
+    const auto input_format = passes->input_srgb ? Tegra::RenderTargetFormat::A8B8G8R8_SRGB
+                                                 : Tegra::RenderTargetFormat::B10G11R11_FLOAT;
+    const auto output_format = passes->output_format == Texture::TextureFormat::R16G16B16A16
+                                   ? Tegra::RenderTargetFormat::R16G16B16A16_FLOAT
+                                   : Tegra::RenderTargetFormat::B10G11R11_FLOAT;
     const bool done = rasterizer->AccelerateTemporalUpscale(
         surface(*input, input_format), surface(*output, output_format),
         use_history ? surface(*motion, Tegra::RenderTargetFormat::R16G16_FLOAT) : Fermi2D::Surface{},

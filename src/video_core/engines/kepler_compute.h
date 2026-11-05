@@ -12,6 +12,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include "common/bit_field.h"
@@ -246,6 +247,10 @@ public:
 
     bool IsNativeMode() const { return native_mode; }
     bool ProcessGameDlss(u64 program_id, u64 native_key);
+    bool ProcessOcarinaDlss(u64 native_key);
+    bool TryOcarinaGameplayUpscale();
+    bool TryOcarinaUpscale(const Texture::TICEntry& input, const Texture::TICEntry& output);
+    std::optional<Texture::TICEntry> DlssImage(u32 offset);
     void TraceDlssContract(u64 native_key, bool warn_unvalidated = true);
 
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
@@ -268,7 +273,9 @@ private:
     std::unique_ptr<FrontState> front;
     bool front_macros{}; ///< The front owns the macro code and bindings (the back skips them)
 
-    bool DispatchNativeCompute(const NativeQmdScheduler::Descriptor& descriptor);
+    bool DispatchNativeCompute(Core::System& system, const NativeQmdScheduler::Descriptor& descriptor);
+    void TraceOcarinaDispatch();
+    std::optional<u64> OcarinaNativeKey();
     void ProcessNativeReportSemaphore(u32 argument);
     void DescribeNativeResources(const NativeQmdScheduler::Descriptor& qmd);
     void RememberDlssMotionVectors();
@@ -283,6 +290,7 @@ private:
     /// the game's own network output is shown instead of the replacement upscale.
     struct DlssChain {
         bool active{};
+        u64 program_id{};
         bool spatial_only{};
         bool output_pass{};
         u32 rejected{};
@@ -313,6 +321,30 @@ private:
     std::optional<Texture::TICEntry> dlss_motion_vectors;
     std::optional<Texture::TICEntry> dlss_depth;
     u32 dlss_contract_trace_count{};
+    std::optional<Texture::TICEntry> oot_output;
+    u32 oot_output_index{};
+    std::optional<Texture::TICEntry> oot_input;
+    u32 oot_network_step{};
+    u32 oot_dispatches{};
+    u32 oot_skipped{};
+    u32 oot_evaluations{};
+    bool oot_prepared{};
+    bool oot_bootstrap{};
+    bool oot_bootstrap_attempted{};
+    bool oot_processed_dispatch{};
+    struct OcarinaNativeProgram {
+        u64 key;
+        std::vector<u8> code;
+    };
+    std::unordered_map<GPUVAddr, OcarinaNativeProgram> oot_native_programs;
+    std::vector<u8> oot_native_scratch;
+    size_t oot_native_bytes{};
+    bool oot_sequence_valid{};
+    u64 oot_trace_poll_frame{~u64{}};
+    std::optional<u64> oot_trace_start_frame;
+    u32 oot_trace_dispatches{};
+    bool oot_trace_finished{};
+    std::unordered_map<GPUVAddr, u64> oot_trace_programs;
     GPUVAddr dlss_motion_color{};
     VideoCommon::FireEmblemUpscale::FrameJitter fe_upscale_jitter;
     bool ProcessNativeMethod(Core::System& system, u32 method, u32 argument, bool is_last_call);

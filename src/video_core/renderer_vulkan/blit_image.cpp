@@ -820,7 +820,7 @@ void BlitImageHelper::TemporalUpscale(const Framebuffer* dst_framebuffer,
                                       f32 current_weight, f32 kernel_scale, f32 clip_width,
                                       f32 clip_motion, f32 kernel_motion) {
     const VkPipelineLayout layout = *temporal_upscale_pipeline_layout;
-    const VkPipeline pipeline = FindOrEmplaceTemporalUpscalePipeline(dst_framebuffer->RenderPass());
+    const VkPipeline pipeline = FindOrEmplaceTemporalUpscalePipeline(dst_framebuffer);
     const VkSampler sampler = *linear_sampler;
     const std::array<VkImageView, 4> views{input_color.Handle(Shader::TextureType::Color2D),
                                            motion_vectors.Handle(Shader::TextureType::Color2D),
@@ -1480,7 +1480,10 @@ VkPipeline BlitImageHelper::FindOrEmplaceColorPipeline(const BlitImagePipelineKe
     return *blit_color_pipelines.back();
 }
 
-VkPipeline BlitImageHelper::FindOrEmplaceTemporalUpscalePipeline(VkRenderPass renderpass) {
+VkPipeline BlitImageHelper::FindOrEmplaceTemporalUpscalePipeline(const Framebuffer* framebuffer) {
+    const VkRenderPass renderpass = framebuffer->RenderPass();
+    const bool write_alpha = framebuffer->RenderPassKeyBase().color_formats[0] ==
+                             VideoCore::Surface::PixelFormat::A8B8G8R8_UNORM;
     const auto it = std::ranges::find(temporal_upscale_keys, renderpass);
     if (it != temporal_upscale_keys.end()) {
         return *temporal_upscale_pipelines[std::distance(temporal_upscale_keys.begin(), it)];
@@ -1496,7 +1499,7 @@ VkPipeline BlitImageHelper::FindOrEmplaceTemporalUpscalePipeline(VkRenderPass re
         .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
         .alphaBlendOp = VK_BLEND_OP_ADD,
         .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                          VK_COLOR_COMPONENT_B_BIT,
+                          VK_COLOR_COMPONENT_B_BIT | (write_alpha ? VK_COLOR_COMPONENT_A_BIT : 0U),
     };
     const VkPipelineColorBlendStateCreateInfo color_blend_create_info{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,

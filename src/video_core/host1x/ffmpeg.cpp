@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstring>
+#include <cstdlib>
 #include <string_view>
 #include <vector>
 
@@ -314,12 +315,34 @@ bool DecoderContext::OpenContext(const Decoder& decoder, std::span<const u8> ext
         m_codec_context->extradata_size = static_cast<int>(extradata.size());
     }
 
+    // A/B control for NX2 AV1 software decode. Explicit workers also bypass platforms where
+    // dav1d's pthread affinity query cannot determine a usable automatic thread count.
+    if (decoder.GetCodec()->id == AV_CODEC_ID_AV1) {
+        if (const char* value = std::getenv("EDEN_NX2_VDEC_THREADS")) {
+            char* end{};
+            const long threads = std::strtol(value, &end, 10);
+            if (end != value && *end == '\0' && threads >= 1 && threads <= 16) {
+                m_codec_context->thread_count = static_cast<int>(threads);
+            }
+        }
+        if (const char* value = std::getenv("EDEN_NX2_VDEC_FRAME_DELAY")) {
+            char* end{};
+            const long delay = std::strtol(value, &end, 10);
+            if (end != value && *end == '\0' && delay >= 0 && delay <= 16) {
+                if (const int ret = av_opt_set_int(m_codec_context->priv_data,
+                                                   "max_frame_delay", delay, 0); ret < 0) {
+                    LOG_WARNING(HW_GPU, "AV1 max_frame_delay option rejected: {}", AVError(ret));
+                }
+            }
+        }
+    }
     if (const int ret = avcodec_open2(m_codec_context, decoder.GetCodec(), nullptr); ret < 0) {
         LOG_ERROR(HW_GPU, "avcodec_open2 error: {}", AVError(ret));
         return false;
     }
 
-    LOG_INFO(HW_GPU, "Using decoder {}", decoder.GetCodec()->name);
+    LOG_INFO(HW_GPU, "Using decoder {} (requested threads={}, frame delay={})",
+             decoder.GetCodec()->name, m_codec_context->thread_count, m_codec_context->delay);
 
     return true;
 }
