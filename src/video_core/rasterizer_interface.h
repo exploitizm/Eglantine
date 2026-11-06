@@ -116,11 +116,23 @@ public:
     /// Switch 2: the front flushed this command list page with the split drained.
     virtual void NoteGpuWrittenCommandListSynced([[maybe_unused]] DAddr page) {}
 
+    virtual void FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) {
+        for (const DAddr page : pages) {
+            FlushRegion(page, 0x1000, VideoCommon::CacheType::BufferCache);
+        }
+    }
+
     /// Check if the the specified memory area requires flushing to CPU Memory.
     virtual bool MustFlushRegion(DAddr addr, u64 size,
                                  VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;
 
     virtual RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) = 0;
+
+    /// Whether reports in the range wait for host query results not yet in guest memory.
+    [[nodiscard]] virtual bool HasPendingQueries([[maybe_unused]] DAddr addr,
+                                                 [[maybe_unused]] u64 size) {
+        return false;
+    }
 
     /// Notify rasterizer that any caches of the specified region should be invalidated
     virtual void InvalidateRegion(DAddr addr, u64 size,

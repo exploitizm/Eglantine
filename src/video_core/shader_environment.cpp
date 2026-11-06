@@ -61,6 +61,12 @@ static u64 MakeCbufKey(u32 index, u32 offset) {
     return (static_cast<u64>(index) << 32) | offset;
 }
 
+// Pointer-table entries share the classification map with plain constant buffer pointers.
+static u64 MakeIndirectCbufKey(u32 index, u32 offset, u32 indirect) {
+    return (u64{1} << 63) | (static_cast<u64>(indirect & 0x3fffff) << 40) |
+           MakeCbufKey(index, offset);
+}
+
 static Shader::TextureType ConvertTextureType(const Tegra::Texture::TICEntry& entry) {
     switch (entry.texture_type) {
     case Tegra::Texture::TextureType::Texture1D:
@@ -202,6 +208,25 @@ bool GenericEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
     return mapped;
 }
 
+bool GenericEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) {
+    const u64 key = MakeIndirectCbufKey(index, offset, indirect);
+    if (const auto it = storage_pointer_types.find(key); it != storage_pointer_types.end()) {
+        return it->second != 0;
+    }
+    bool mapped = false;
+    if (IsCbufStorageBufferPointer(index, offset)) {
+        const u64 holder =
+            u64{ReadCbufValue(index, offset)} | (u64{ReadCbufValue(index, offset + 4)} << 32);
+        if (gpu_memory->IsFullyMappedRange(holder + indirect, sizeof(u64))) {
+            const u64 address = gpu_memory->Read<u64>(holder + indirect);
+            mapped = address != 0 && gpu_memory->IsWithinGPUAddressRange(address) &&
+                     gpu_memory->IsFullyMappedRange(address, 1);
+        }
+    }
+    storage_pointer_types.emplace(key, static_cast<u8>(mapped));
+    return mapped;
+}
+
 std::optional<u64> GenericEnvironment::Analyze() {
     if (native_source_size) {
         // Include the converted header and a version tag to isolate this experimental ABI.
@@ -318,6 +343,11 @@ void GenericEnvironment::Serialize(std::ofstream& file) const {
         if (stage == Shader::Stage::Geometry) {
             file.write(reinterpret_cast<const char*>(&gp_passthrough_mask),
                        sizeof(gp_passthrough_mask));
+        }
+        if (stage == Shader::Stage::Task || stage == Shader::Stage::Mesh) {
+            file.write(reinterpret_cast<const char*>(&mesh_registers), sizeof(mesh_registers))
+                .write(reinterpret_cast<const char*>(&mesh_primitive_header),
+                       sizeof(mesh_primitive_header));
         }
     }
 }
@@ -1085,9 +1115,24 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
         if (stage == Shader::Stage::Geometry) {
             file.read(reinterpret_cast<char*>(&gp_passthrough_mask), sizeof(gp_passthrough_mask));
         }
+        if (stage == Shader::Stage::Task || stage == Shader::Stage::Mesh) {
+            file.read(reinterpret_cast<char*>(&mesh_registers), sizeof(mesh_registers))
+                .read(reinterpret_cast<char*>(&mesh_primitive_header),
+                      sizeof(mesh_primitive_header));
+        }
     }
     // Native programs fold bank 1 reads as they did when they were built.
     is_proprietary_driver = texture_bound == 2 || Shader::Ampere::HasNativeAddressMap(code);
+}
+
+size_t FileEnvironment::MemorySize() const {
+    const auto map_bytes = [](const auto& map) {
+        return (map.bucket_count() + 1) *
+               (sizeof(typename std::decay_t<decltype(map)>::value_type) + 2);
+    };
+    return sizeof(*this) + code.capacity() * sizeof(u64) + map_bytes(texture_types) +
+           map_bytes(texture_pixel_formats) + map_bytes(cbuf_values) +
+           map_bytes(storage_pointer_types) + map_bytes(cbuf_replacements);
 }
 
 void FileEnvironment::Dump(u64 pipeline_hash, u64 shader_hash) {
@@ -1109,6 +1154,14 @@ bool FileEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
     const auto it = storage_pointer_types.find(MakeCbufKey(index, offset));
     if (it == storage_pointer_types.end()) {
         throw Shader::LogicError("Uncached storage pointer classification");
+    }
+    return it->second != 0;
+}
+
+bool FileEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) {
+    const auto it = storage_pointer_types.find(MakeIndirectCbufKey(index, offset, indirect));
+    if (it == storage_pointer_types.end()) {
+        throw Shader::LogicError("Uncached storage pointer table classification");
     }
     return it->second != 0;
 }

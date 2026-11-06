@@ -14,11 +14,17 @@ endif()
 
 find_package(Qt6 REQUIRED COMPONENTS Widgets)
 
+if(YUZU_TESTS)
+    add_subdirectory(../tests/qt_compatibility ${CMAKE_BINARY_DIR}/qt_compatibility_tests)
+endif()
+
 add_executable(yuzu
     Info.plist
     about_dialog.cpp
     about_dialog.h
     aboutdialog.ui
+    compatibility_report.cpp
+    compatibility_report.h
     applets/qt_amiibo_settings.cpp
     applets/qt_amiibo_settings.h
     applets/qt_amiibo_settings.ui
@@ -171,6 +177,7 @@ add_executable(yuzu
     loading_screen.ui
 
     main.cpp
+    nx2_switches.h
 
     multiplayer/chat_room.cpp
     multiplayer/chat_room.h

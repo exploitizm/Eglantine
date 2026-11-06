@@ -5,6 +5,9 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_executable(tests
+    common/addon_config.cpp
+    video_core/buffer_cache_ports.cpp
+    video_core/unswizzle_workers.cpp
     video_core/aftermath_dump.cpp
     video_core/frame_dump_schedule.cpp
     video_core/gpu_timestamp.cpp
@@ -23,6 +26,7 @@ add_executable(tests
     video_core/texture_rect_descriptor.cpp
     audio_core/batch_decoder.cpp
     audio_core/hardware_audio_codec.cpp
+    core/gpu_dirty_memory.cpp
     core/memory_acquire.cpp
     core/builtin_patches.cpp
     core/system_test_context.h
@@ -53,10 +57,19 @@ add_executable(tests
     video_core/ampere_async_copy.cpp
     video_core/ampere_trap_guards.cpp
     video_core/async_draw_policy.cpp
+    video_core/async_shader_emission.cpp
+    video_core/pipeline_build.cpp
+    video_core/pipeline_optimization.cpp
+    video_core/spirv_atomic_retry.cpp
+    video_core/spirv_storage_alignment.cpp
+    video_core/spirv_fragment_shuffle.cpp
     video_core/multi_range_refresh.cpp
     video_core/command_fetch_order.cpp
+    video_core/command_writer.cpp
+    video_core/split_fence_wait.cpp
     video_core/command_snapshot_suspensions.cpp
     video_core/pending_maps.cpp
+    video_core/maxwell_fast_method.cpp
     hid_core/sensor_info.cpp
     common/paged_scalar.cpp
     common/queue_lifetime.cpp
@@ -116,6 +129,9 @@ add_executable(tests
     video_core/ampere_gradient_texture.cpp
     video_core/ampere_geometry.cpp
     video_core/ampere_integer_multiply.cpp
+    video_core/memory_manager_runs.cpp
+    video_core/nx2_perf_draw_binds.cpp
+    video_core/nx2_perf_texture_writes.cpp
     video_core/h264_packet.cpp
     video_core/nx2_gpu_mapping.cpp
     video_core/vertex_repack.cpp
@@ -140,7 +156,7 @@ add_executable(tests
 
 create_target_directory_groups(tests)
 
-target_link_libraries(tests PRIVATE common core audio_core input_common video_core)
+target_link_libraries(tests PRIVATE common core audio_core input_common video_core frontend_common)
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
 
 if (TARGET dynarmic::dynarmic)
@@ -160,6 +176,15 @@ add_executable(update_checker_tests
     ../frontend_common/update_checker.cpp)
 target_link_libraries(update_checker_tests PRIVATE common Catch2::Catch2WithMain)
 add_test(NAME update_checker_tests COMMAND update_checker_tests)
+
+if (NOT ANDROID)
+    add_executable(config_tests
+        common/first_run_config.cpp
+        ../frontend_common/config.cpp)
+    target_link_libraries(config_tests PRIVATE common SimpleIni::SimpleIni Catch2::Catch2WithMain
+        ${PLATFORM_LIBRARIES})
+    add_test(NAME config_tests COMMAND config_tests)
+endif()
 
 # needed for vma
 if (NOT MSVC)
