@@ -16,6 +16,8 @@
 #include <vector>
 #include <optional>
 #include <bit>
+#include <string>
+#include <utility>
 #include "common/container/unordered_map.h"
 #include <boost/container/small_vector.hpp>
 
@@ -67,6 +69,9 @@ using namespace Common::Literals;
 template <class P>
 TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManager& device_memory_)
     : runtime{runtime_}, device_memory{device_memory_} {
+    debug_stats = std::getenv("EDEN_NX2_TC_LOG") != nullptr &&
+                  Common::Log::IsLevelEnabled(Common::Log::Class::HW_GPU, Common::Log::Level::Debug);
+
     // Configure null sampler
     TSCEntry sampler_descriptor{};
     sampler_descriptor.min_filter.Assign(Tegra::Texture::TextureFilter::Linear);
@@ -144,15 +149,16 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
 }
 
 template <class P>
-void TextureCache<P>::RunGarbageCollector() {
+void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     bool high_priority_mode = false;
     bool aggressive_mode = false;
     bool evict_old_costly = false;
     u64 ticks_to_destroy = 0;
     size_t num_iterations = 0;
     const auto Configure = [&](bool allow_aggressive) {
-        high_priority_mode = total_used_memory >= expected_memory;
-        aggressive_mode = allow_aggressive && total_used_memory >= critical_memory;
+        high_priority_mode = out_of_memory || total_used_memory >= expected_memory;
+        aggressive_mode =
+            allow_aggressive && (out_of_memory || total_used_memory >= critical_memory);
         ticks_to_destroy = aggressive_mode ? 10ULL : high_priority_mode ? 25ULL : 50ULL;
         // EDEN_NX2_TC_MIN_AGE=<frames>: never evict images used more recently (thrash tests).
         static const u64 min_age = [] {
@@ -163,7 +169,7 @@ void TextureCache<P>::RunGarbageCollector() {
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
     };
     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,
-                          &evict_old_costly](ImageId image_id) {
+                          &evict_old_costly, out_of_memory](ImageId image_id) {
         if (num_iterations == 0) {
             return true;
         }
@@ -191,6 +197,9 @@ void TextureCache<P>::RunGarbageCollector() {
         ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
         UnregisterImage(image_id);
         DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+        if (out_of_memory) {
+            return false;
+        }
         if (aggressive_mode && total_used_memory < critical_memory) {
             num_iterations >>= 2;
             aggressive_mode = false;
@@ -262,7 +271,7 @@ void TextureCache<P>::RunGarbageCollector() {
         evict_old_costly = false;
     }
     Collect();
-    if (total_used_memory >= critical_memory) {
+    if (out_of_memory || total_used_memory >= critical_memory) {
         Configure(true);
         Collect();
     }
@@ -506,8 +515,24 @@ void TextureCache<P>::TickFrame() {
         gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
         images_created = images_deleted = 0;
     }
-    if (total_used_memory > minimum_memory) {
-        RunGarbageCollector();
+    // An image that could not be made at all: the driver is out of memory whatever the counts
+    // say, so collect as at the critical threshold.
+    bool out_of_memory = false;
+    if constexpr (requires { runtime.FailedImages(); }) {
+        const u32 failed = runtime.FailedImages();
+        out_of_memory = failed != seen_failed_images;
+        seen_failed_images = failed;
+    }
+    if (out_of_memory || total_used_memory > minimum_memory) {
+        RunGarbageCollector(out_of_memory);
+    }
+    if (out_of_memory) {
+        // Textures left out for lack of memory are made again on their next read, once a frame
+        // while images keep failing.
+        for (size_t c : active_channel_ids) {
+            channel_storage[c].graphics_image_table.Invalidate();
+            channel_storage[c].compute_image_table.Invalidate();
+        }
     }
     sentenced_images.Tick();
     sentenced_image_index = (sentenced_image_index + 1) % TICKS_TO_DESTROY;
@@ -939,7 +964,22 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
         if (IsValidEntry(*gpu_memory, descriptor)) {
             const auto [pair, is_new_tc] = channel_state->image_views.try_emplace(descriptor);
             if (is_new_tc) {
+                const auto failed_images = [&]() -> u32 {
+                    if constexpr (requires { runtime.FailedImages(); }) {
+                        return runtime.FailedImages();
+                    } else {
+                        return 0;
+                    }
+                };
+                const u32 failed_before = failed_images();
                 pair->second = CreateImageView(descriptor);
+                if (pair->second == NULL_IMAGE_VIEW_ID && failed_images() != failed_before) {
+                    // No memory for its image: TickFrame invalidates the table after collecting,
+                    // and the descriptor's next read makes the image again.
+                    channel_state->image_views.erase(pair);
+                    table.bound_ids[index] = NULL_IMAGE_VIEW_ID;
+                    return NULL_IMAGE_VIEW_ID;
+                }
                 if (pair->second != NULL_IMAGE_VIEW_ID) {
                     image_view_descriptors[pair->second].emplace_back(current_channel_id,
                                                                       descriptor);
@@ -1158,10 +1198,20 @@ template <class P>
 bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
                                 const Tegra::Engines::Fermi2D::Surface& src,
                                 const Tegra::Engines::Fermi2D::Config& copy) {
+    // A deferred clear parked before this copy has to land before it: realizing it afterwards
+    // starts its clear pass after the copy and wipes what the copy wrote. That is what made
+    // Ocarina of Time draw its terrain layer over the scene (#101): the game clears the
+    // occlusion depth, blits the scene depth over it, and reads it back during the layer draw.
+    // GetFramebufferId only flushes when it creates a framebuffer, so the bug starts on the
+    // second frame. Texture cache copies bypass render passes and keep stream order here.
+    // Only when the copy proceeds: a rejected blit writes nothing and must not realize the
+    // clear ahead of the next draw that consumes it as its load-op. GetBlitImages cannot
+    // invalidate the parked clear: framebuffer removal flushes first (RemoveFramebuffers).
     const auto result = GetBlitImages(dst, src, copy);
     if (!result) {
         return false;
     }
+    runtime.FlushDeferredClear();
     const BlitImages images = *result;
     const ImageId dst_id = images.dst_id;
     const ImageId src_id = images.src_id;
@@ -2742,6 +2792,9 @@ ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
                  static_cast<u32>(info.format), info.block.width, info.block.height, info.block.depth);
     }
     const ImageId image_id = JoinImages(storage_info, gpu_addr, *cpu_addr);
+    if (!image_id) {
+        return image_id;
+    }
     const Image& image = slot_images[image_id];
     // Using "image.gpu_addr" instead of "gpu_addr" is important because it might be different
     const auto [it, is_new] = image_allocs_table.try_emplace(image.gpu_addr);
@@ -2865,6 +2918,20 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
     }
     const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
+    if constexpr (requires(const Image& image) { image.OutOfMemory(); }) {
+        if (slot_images[new_image_id].OutOfMemory()) {
+            // Left out of the cache: lookups see no image (a null view) and make it again once
+            // the collector has freed memory.
+            slot_images.erase(new_image_id);
+            static u32 logged{};
+            if (logged++ < 32) {
+                LOG_ERROR(HW_GPU, "No memory for the {}x{}x{} image at {:#x} (format {}); skipping it",
+                          new_info.size.width, new_info.size.height, new_info.size.depth, gpu_addr,
+                          static_cast<u32>(new_info.format));
+            }
+            return ImageId{};
+        }
+    }
     Image& new_image = slot_images[new_image_id];
 
     new_image.allocation_tick = frame_tick;
@@ -2916,12 +2983,8 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
         const u32 width = new_info.size.width;
         const u32 height = new_info.size.height;
-        if (regs.clear_control.use_scissor != 0) {
-            const auto& scissor = regs.scissor_test[0];
-            if (scissor.min_x != 0 || scissor.min_y != 0 || scissor.max_x < width ||
-                scissor.max_y < height) {
-                return false;
-            }
+        if (!ClearCovers(width, height)) {
+            return false;
         }
         // The clear covers the framebuffer's render area, the smallest bound target.
         for (u32 index = 0; index < regs.rt_control.count && index < NUM_RT; ++index) {
@@ -2939,9 +3002,11 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         const bool full_stencil = surface.S && regs.stencil_front_mask == 0xFF;
         switch (VideoCore::Surface::GetFormatType(new_info.format)) {
         case VideoCore::Surface::SurfaceType::ColorTexture: {
+            // OpenGL clears draw buffer RT, which writes target rt_control.Map(RT).
             const u32 index = surface.RT;
             return surface.R && surface.G && surface.B && surface.A && index < NUM_RT &&
-                   index < regs.rt_control.count && regs.rt[index].Address() == gpu_addr;
+                   index < regs.rt_control.count && regs.rt_control.Map(index) == index &&
+                   regs.rt[index].Address() == gpu_addr;
         }
         case VideoCore::Surface::SurfaceType::Depth:
             return is_depth_target && surface.Z;
@@ -3113,6 +3178,9 @@ std::optional<typename TextureCache<P>::BlitImages> TextureCache<P>::GetBlitImag
             dst_id = InsertImage(dst_info, dst_addr, RelaxedOptions{});
         }
     } while (has_deleted_images);
+    if (!src_id || !dst_id) {
+        return std::nullopt;
+    }
     const ImageBase& src_image = slot_images[src_id];
     const ImageBase& dst_image = slot_images[dst_id];
     const bool native_bgr = runtime.HasNativeBgr();
@@ -3128,6 +3196,9 @@ std::optional<typename TextureCache<P>::BlitImages> TextureCache<P>::GetBlitImag
             src_id = FindOrInsertImage(src_info, src_addr, RelaxedOptions{});
             dst_id = FindOrInsertImage(dst_info, dst_addr, RelaxedOptions{});
         } while (has_deleted_images);
+        if (!src_id || !dst_id) {
+            return std::nullopt;
+        }
     }
     return {BlitImages{
         .dst_id = dst_id,
@@ -3193,6 +3264,11 @@ ImageId TextureCache<P>::FindDMAImage(const ImageInfo& info, GPUVAddr gpu_addr) 
 template <class P>
 std::pair<u32, u32> TextureCache<P>::PrepareDmaImage(ImageId dst_id, GPUVAddr base_addr,
                                                      bool mark_as_modified) {
+    // As in BlitImage: land a parked deferred clear before the DMA write, but only when the
+    // write happens (mark_as_modified); a read-only access writes nothing.
+    if (mark_as_modified) {
+        runtime.FlushDeferredClear();
+    }
     const auto& image = slot_images[dst_id];
     const auto base = image.TryFindBase(base_addr);
     PrepareImage(dst_id, mark_as_modified, false);
@@ -3495,6 +3571,8 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
+    image.channel = current_channel_id;
+    image.address_space = current_address_space;
     total_used_memory += ImageMemoryBytes(slot_images[image_id]);
     image.lru_index = lru_cache.Insert(image_id, frame_tick);
 
@@ -3504,6 +3582,7 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
     if (False(image.flags & ImageFlagBits::Sparse)) {
         auto map_id =
             slot_map_views.insert(image.gpu_addr, image.cpu_addr, image.guest_size_bytes, image_id);
+        page_filter.Mark(image.cpu_addr, image.guest_size_bytes);
         ForEachCPUPage(image.cpu_addr, image.guest_size_bytes,
                        [this, map_id](u64 page) { page_table[page].push_back(map_id); });
         image.map_view_id = map_id;
@@ -3513,6 +3592,7 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
     ForEachSparseSegment(
         image, [this, image_id, &sparse_maps](GPUVAddr gpu_addr, DAddr cpu_addr, size_t size) {
             auto map_id = slot_map_views.insert(gpu_addr, cpu_addr, size, image_id);
+            page_filter.Mark(cpu_addr, size);
             ForEachCPUPage(cpu_addr, size,
                            [this, map_id](u64 page) { page_table[page].push_back(map_id); });
             sparse_maps.push_back(map_id);
@@ -3524,6 +3604,37 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
 }
 
 template <class P>
+void TextureCache<P>::ReportMissingImagePage(ImageId image_id, const Image& image, u64 page) {
+    std::string spaces;
+    for (const auto& [id, ref] : address_spaces) {
+        spaces += fmt::format(" {}->{}", id, ref.storage_id);
+    }
+    std::string holders;
+    for (size_t index = 0; index < gpu_page_table_storage.size(); ++index) {
+        const auto& table = gpu_page_table_storage[index];
+        const auto it = table.find(page);
+        if (it == table.end()) {
+            continue;
+        }
+        const bool has_image = std::ranges::find(it->second, image_id) != it->second.end();
+        holders += fmt::format(" {}{}{}", index / 2, index % 2 == 0 ? "" : "s",
+                               has_image ? "+image" : "");
+    }
+    const ImageInfo& info = image.info;
+    LOG_CRITICAL(HW_GPU,
+                 "Unregistering image {} at {:#x}+{:#x} (type {} format {} {}x{}x{} levels {} "
+                 "layers {} flags {:#x}): page {:#x} is missing; registered on channel {} address "
+                 "space {}, now channel {} address space {}; address space->storage:{}; tables "
+                 "holding the page:{}",
+                 image_id.index, image.gpu_addr, image.guest_size_bytes,
+                 static_cast<u32>(info.type), static_cast<u32>(info.format), info.size.width,
+                 info.size.height, info.size.depth, info.resources.levels, info.resources.layers,
+                 static_cast<u32>(image.flags), page << YUZU_PAGEBITS, image.channel,
+                 image.address_space, current_channel_id, current_address_space, spaces,
+                 holders.empty() ? " none" : holders);
+}
+
+template <class P>
 void TextureCache<P>::UnregisterImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
@@ -3531,10 +3642,14 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
     image.flags &= ~ImageFlagBits::Registered;
     image.flags &= ~ImageFlagBits::BadOverlap;
     lru_cache.Free(image.lru_index);
+    bool reported_missing_page = false;
     const auto& clear_page_table =
-        [image_id](u64 page, ::Common::unordered_map<u64, std::vector<ImageId>, Common::IdentityHash<u64>>& selected_page_table) {
+        [this, image_id, &image, &reported_missing_page](u64 page, ::Common::unordered_map<u64, std::vector<ImageId>, Common::IdentityHash<u64>>& selected_page_table) {
             const auto page_it = selected_page_table.find(page);
             if (page_it == selected_page_table.end()) {
+                if (!std::exchange(reported_missing_page, true)) {
+                    ReportMissingImagePage(image_id, image, page);
+                }
                 ASSERT_MSG(false, "Unregistering unregistered page={:#x}", page << YUZU_PAGEBITS);
                 return;
             }
@@ -3977,6 +4092,8 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
         // same guest data, which is uploaded from guest memory instead.
         return;
     }
+    // As in BlitImage: land a parked deferred clear before the copy overwrites the image.
+    runtime.FlushDeferredClear();
     const bool is_rescaled = True(src.flags & ImageFlagBits::Rescaled);
     if (is_rescaled) {
         ASSERT(True(dst.flags & ImageFlagBits::Rescaled));
@@ -4114,19 +4231,36 @@ bool TextureCache<P>::IsFullClear(ImageViewId id) {
     const ImageViewBase& image_view = slot_image_views[id];
     const ImageBase& image = slot_images[image_view.image_id];
     const Extent3D size = image_view.size;
-    const auto& regs = maxwell3d->regs;
-    const auto& scissor = regs.scissor_test[0];
     if (image.info.resources.levels > 1 || image.info.resources.layers > 1) {
         // Images with multiple resources can't be cleared in a single call
         return false;
     }
+    // Make sure the clear covers all texels in the subresource
+    return ClearCovers(size.width, size.height);
+}
+
+template <class P>
+bool TextureCache<P>::ClearCovers(u32 width, u32 height) const {
+    const auto& regs = maxwell3d->regs;
+    // The render area is the surface clip's size.
+    if (regs.surface_clip.width < width || regs.surface_clip.height < height) {
+        return false;
+    }
     if (regs.clear_control.use_scissor == 0) {
-        // If scissor testing is disabled, the clear is always full
         return true;
     }
-    // Make sure the clear covers all texels in the subresource
-    return scissor.min_x == 0 && scissor.min_y == 0 && scissor.max_x >= size.width &&
-           scissor.max_y >= size.height;
+    // With a lower-left window origin, the clear's scissor is flipped around the surface clip's
+    // height (GetScissorState).
+    const auto& scissor = regs.scissor_test[0];
+    const bool lower_left =
+        regs.window_origin.mode != Tegra::Engines::Maxwell3D::Regs::WindowOrigin::Mode::UpperLeft;
+    const s32 clip_height = static_cast<s32>(regs.surface_clip.height.Value());
+    const s32 min_y = static_cast<s32>(scissor.min_y.Value());
+    const s32 max_y = static_cast<s32>(scissor.max_y.Value());
+    const s32 top = lower_left ? clip_height - max_y : min_y;
+    const s32 bottom = lower_left ? clip_height - min_y : max_y;
+    return scissor.min_x == 0 && top <= 0 && scissor.max_x >= width &&
+           bottom >= static_cast<s32>(height);
 }
 
 template <class P>
@@ -4137,6 +4271,9 @@ void TextureCache<P>::CreateChannel(struct Tegra::Control::ChannelState& channel
     const auto& this_as_ref = address_spaces[channel.memory_manager->GetID()];
     this_state->gpu_page_table = &gpu_page_table_storage[this_as_ref.storage_id * 2];
     this_state->sparse_page_table = &gpu_page_table_storage[this_as_ref.storage_id * 2 + 1];
+    LOG_INFO(HW_GPU, "Texture cache channel {} (slot {}): address space {}, storage {} of {}",
+             channel.bind_id, it->second, channel.memory_manager->GetID(), this_as_ref.storage_id,
+             address_spaces.size());
 }
 
 /// Bind a channel for execution.

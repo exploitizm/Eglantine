@@ -172,6 +172,7 @@ private:
     Core::System& system;
 
     bool m_isTreeMode = true;
+    bool m_populating = false;
     bool nup_conversion_running{};
     u64 reportable_program_id{};
     QAbstractItemView* m_currentView = nullptr;

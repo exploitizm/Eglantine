@@ -390,6 +390,7 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
         if (staged.empty() && mapped.empty()) {
             return;
         }
+        const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
         if (staged.empty()) {
             if constexpr (has_mapped) {
                 runtime.FinishForHostRead();
@@ -408,7 +409,8 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
                 runtime.Finish();
             }
             for (const Download& download : staged) {
-                device_memory.WriteBlockUnsafe(
+                WriteDownloadedMemory(
+                    cpu_written,
                     slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset,
                     staging.mapped_span.data() + (download.copy.dst_offset - staging.offset),
                     download.copy.size);
@@ -417,9 +419,9 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
         if constexpr (has_mapped) {
             for (const Download& download : mapped) {
                 Buffer& buffer = slot_buffers[download.buffer_id];
-                device_memory.WriteBlockUnsafe(buffer.CpuAddr() + download.copy.src_offset,
-                                               buffer.Mapped().data() + download.copy.src_offset,
-                                               download.copy.size);
+                WriteDownloadedMemory(cpu_written, buffer.CpuAddr() + download.copy.src_offset,
+                                      buffer.Mapped().data() + download.copy.src_offset,
+                                      download.copy.size);
             }
         }
     }
@@ -721,8 +723,8 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
             }
         }
     }
-    channel_state->enabled_storage_buffers[stage] |= 1U << ssbo_index;
-    channel_state->written_storage_buffers[stage] |= (is_written ? 1U : 0U) << ssbo_index;
+    channel_state->enabled_storage_buffers[stage] |= u64{1} << ssbo_index;
+    channel_state->written_storage_buffers[stage] |= u64{is_written ? 1U : 0U} << ssbo_index;
     if constexpr (requires { runtime.ShouldLimitDynamicStorageBuffers(); }) {
         if (runtime.ShouldLimitDynamicStorageBuffers() && !already_enabled) {
             ++channel_state->total_graphics_storage_buffers;
@@ -810,8 +812,8 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
             }
         }
     }
-    channel_state->enabled_compute_storage_buffers |= 1U << ssbo_index;
-    channel_state->written_compute_storage_buffers |= (is_written ? 1U : 0U) << ssbo_index;
+    channel_state->enabled_compute_storage_buffers |= u64{1} << ssbo_index;
+    channel_state->written_compute_storage_buffers |= u64{is_written ? 1U : 0U} << ssbo_index;
     if constexpr (requires { runtime.ShouldLimitDynamicStorageBuffers(); }) {
         if (runtime.ShouldLimitDynamicStorageBuffers() && !already_enabled) {
             ++channel_state->total_compute_storage_buffers;
@@ -1009,6 +1011,43 @@ void BufferCache<P>::PopAsyncFlushes() {
 }
 
 template <class P>
+void BufferCache<P>::ClaimCpuWrites(std::span<const std::pair<DAddr, u64>> ranges) {
+    for (const auto& [device_addr, size] : ranges) {
+        if (IsRegionGpuModified(device_addr, size)) {
+            ClearDownload(device_addr, size);
+            gpu_modified_ranges.Subtract(device_addr, size);
+        }
+    }
+}
+
+template <class P>
+Common::RangeSet<DAddr> BufferCache<P>::PendingCpuWriteRanges() {
+    Common::RangeSet<DAddr> ranges;
+    if (pending_cpu_writes) {
+        pending_cpu_writes(
+            [&ranges](DAddr device_addr, size_t size) { ranges.Add(device_addr, size); });
+    }
+    return ranges;
+}
+
+template <class P>
+void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written,
+                                           DAddr device_addr, const u8* data, u64 size) {
+    if (!cpu_written.Intersects(device_addr, size)) {
+        device_memory.WriteBlockUnsafe(device_addr, data, size);
+        return;
+    }
+    Common::RangeSet<DAddr> parts;
+    parts.Add(device_addr, size);
+    cpu_written.ForEachInRange(device_addr, size, [&parts](DAddr start, DAddr end) {
+        parts.Subtract(start, end - start);
+    });
+    parts.ForEach([&](DAddr start, DAddr end) {
+        device_memory.WriteBlockUnsafe(start, data + (start - device_addr), end - start);
+    });
+}
+
+template <class P>
 void BufferCache<P>::PopAsyncBuffers() {
     if (async_buffers.empty()) {
         return;
@@ -1022,6 +1061,9 @@ void BufferCache<P>::PopAsyncBuffers() {
     auto& async_buffer = async_buffers.front();
     u8* base = async_buffer->mapped_span.data();
     const size_t base_offset = async_buffer->offset;
+    // This runs on the fencing thread while the CPU keeps writing: CPU writes collected since the
+    // copy was taken are newer than it, and the GPU thread hasn't dropped them from `ranges` yet.
+    const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
     for (const auto& copy : downloads) {
         const DAddr device_addr = static_cast<DAddr>(copy.src_offset);
         const u64 dst_offset = copy.dst_offset - base_offset;
@@ -1029,8 +1071,8 @@ void BufferCache<P>::PopAsyncBuffers() {
         // Only what no write replaced since the copy was taken: the rest is older than guest
         // memory (CPU writes) or than the GPU's copy (GPU writes, still to be downloaded).
         ranges.ForEachInRange(device_addr, copy.size, [&](DAddr start, DAddr end) {
-            device_memory.WriteBlockUnsafe(start, &read_mapped_memory[start - device_addr],
-                                           end - start);
+            WriteDownloadedMemory(cpu_written, start, &read_mapped_memory[start - device_addr],
+                                  end - start);
             gpu_modified_ranges.Subtract(start, end - start);
         });
     }
@@ -2750,10 +2792,12 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
     }
     runtime.Finish();
     const u8* const mapped_memory = download_staging.mapped_span.data();
+    const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
     for (const Download& download : downloads) {
         const DAddr device_addr = slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset;
-        device_memory.WriteBlockUnsafe(
-            device_addr, mapped_memory + (download.copy.dst_offset - download_staging.offset),
+        WriteDownloadedMemory(
+            cpu_written, device_addr,
+            mapped_memory + (download.copy.dst_offset - download_staging.offset),
             download.copy.size);
     }
 }
@@ -2788,13 +2832,14 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
     if (total_size_bytes == 0) {
         return;
     }
+    const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
 
     if constexpr (requires { buffer.Mapped(); }) {
         if (const auto mapped = buffer.Mapped(); !mapped.empty()) {
             runtime.FinishForHostRead();
             for (const BufferCopy& copy : copies) {
-                device_memory.WriteBlockUnsafe(buffer.CpuAddr() + copy.src_offset,
-                                               mapped.data() + copy.src_offset, copy.size);
+                WriteDownloadedMemory(cpu_written, buffer.CpuAddr() + copy.src_offset,
+                                      mapped.data() + copy.src_offset, copy.size);
             }
             return;
         }
@@ -2815,14 +2860,14 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
             // Undo the modified offset
             const u64 dst_offset = copy.dst_offset - download_staging.offset;
             const u8* copy_mapped_memory = mapped_memory + dst_offset;
-            device_memory.WriteBlockUnsafe(copy_device_addr, copy_mapped_memory, copy.size);
+            WriteDownloadedMemory(cpu_written, copy_device_addr, copy_mapped_memory, copy.size);
         }
     } else {
         const std::span<u8> immediate_buffer = ImmediateBuffer(largest_copy);
         for (const BufferCopy& copy : copies) {
             buffer.ImmediateDownload(copy.src_offset, immediate_buffer.subspan(0, copy.size));
             const DAddr copy_device_addr = buffer.CpuAddr() + copy.src_offset;
-            device_memory.WriteBlockUnsafe(copy_device_addr, immediate_buffer.data(), copy.size);
+            WriteDownloadedMemory(cpu_written, copy_device_addr, immediate_buffer.data(), copy.size);
         }
     }
 }
@@ -2986,14 +3031,19 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     }
     const Binding binding = [&]() -> Binding {
         u32 size = [&]() {
-            const u32 memory_layout_size =
-                static_cast<u32>(gpu_memory->GetMemoryLayoutSize(gpu_addr));
+            const u32 memory_layout_size = static_cast<u32>((std::min)(
+                u64{gpu_memory->GetMemoryLayoutSize(gpu_addr)}, u64{(std::numeric_limits<u32>::max)()}));
             // A pointer read from a table in memory is the base of an object pool, read anywhere in
-            // it (Ocarina of Time's grass instances lie 12-18 MiB past theirs): bound to the end of
-            // its mapping, up to 64 MiB. The 8 MiB cap made those reads return 0 and culled every
-            // blade. Written pools keep the cap: a write marks the whole binding GPU-modified.
+            // it: bound to the end of its mapping, as far as a storage buffer may reach (at most
+            // 1 GiB). Ocarina of Time's grass instances lie 12-18 MiB past theirs (an 8 MiB cap
+            // culled every blade), and its light probe records reach about 130 MiB past theirs: a
+            // 64 MiB cap left the far probes outside the binding, and the fog took one overbright
+            // constant from them. Written pools keep a cap: a write marks the whole binding
+            // GPU-modified.
             if (table_pointer && !is_written) {
-                return (std::min)(memory_layout_size, static_cast<u32>(64_MiB));
+                const u64 reach = (std::min)(runtime.GetMaxStorageBufferRange(), u64{1_GiB});
+                const u32 limit = static_cast<u32>(reach - (std::min)(reach, u64{64_KiB}));
+                return (std::min)(memory_layout_size, limit);
             }
             // A native (Switch 2) compute program's pointer is bare: the word after it is another
             // parameter (a dimension, stride or texture handle), not an NVN buffer size. Taking it

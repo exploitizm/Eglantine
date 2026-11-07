@@ -364,10 +364,10 @@ Id CasFunction(EmitContext& ctx, Operation operation, Id value_type) {
         result = ctx.OpFAdd(value_type, op_a, op_b);
         break;
     case Operation::FPMin:
-        result = ctx.OpFMin(value_type, op_a, op_b);
+        result = ctx.OpNMin(value_type, op_a, op_b);
         break;
     case Operation::FPMax:
-        result = ctx.OpFMax(value_type, op_a, op_b);
+        result = ctx.OpNMax(value_type, op_a, op_b);
         break;
     default:
         break;
@@ -501,6 +501,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineAttributeMemAccess(program.info);
     DefineWriteStorageCasLoopFunction(program.info);
     DefineGlobalMemoryFunctions(program);
+    DefineMeshEmulationOutput();
     DefineRescalingInput(program.info);
     DefineRenderArea(program.info);
 }
@@ -1164,32 +1165,75 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         })) {
         return;
     }
-    for (const auto opcode : {IR::Opcode::GlobalAtomicIAdd32, IR::Opcode::GlobalAtomicUMax32}) {
-        if (!std::ranges::any_of(program.blocks, [opcode](const IR::Block* block) {
-                return std::ranges::any_of(block->Instructions(), [opcode](const IR::Inst& inst) {
-                    return inst.GetOpcode() == opcode;
-                });
-            })) {
+    // Atomics the storage buffer pass could not track: the same routing, with the operation on
+    // the routed word (INC, DEC and F32 add through their storage buffer CAS loops).
+    using enum GlobalAtomic;
+    const auto kind_of = [](IR::Opcode opcode) -> std::optional<GlobalAtomic> {
+        switch (opcode) {
+        case IR::Opcode::GlobalAtomicIAdd32: return IAdd;
+        case IR::Opcode::GlobalAtomicSMin32: return SMin;
+        case IR::Opcode::GlobalAtomicUMin32: return UMin;
+        case IR::Opcode::GlobalAtomicSMax32: return SMax;
+        case IR::Opcode::GlobalAtomicUMax32: return UMax;
+        case IR::Opcode::GlobalAtomicInc32: return Inc;
+        case IR::Opcode::GlobalAtomicDec32: return Dec;
+        case IR::Opcode::GlobalAtomicAnd32: return And;
+        case IR::Opcode::GlobalAtomicOr32: return Or;
+        case IR::Opcode::GlobalAtomicXor32: return Xor;
+        case IR::Opcode::GlobalAtomicExchange32: return Exchange;
+        case IR::Opcode::GlobalAtomicAddF32: return AddF32;
+        default: return std::nullopt;
+        }
+    };
+    std::array<bool, static_cast<size_t>(Count)> used{};
+    for (const IR::Block* const block : program.blocks) {
+        for (const IR::Inst& inst : block->Instructions()) {
+            if (const auto kind = kind_of(inst.GetOpcode())) {
+                used[static_cast<size_t>(*kind)] = true;
+            }
+        }
+    }
+    const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
+    for (size_t index = 0; index < used.size(); ++index) {
+        if (!used[index]) {
             continue;
         }
-        const Id function_type{TypeFunction(U32[1], U64, U32[1])};
-        const Id function{OpFunction(U32[1], spv::FunctionControlMask::MaskNone, function_type)};
-        if (opcode == IR::Opcode::GlobalAtomicIAdd32) {
-            atomic_add_global_func_u32 = function;
-        } else {
-            atomic_umax_global_func_u32 = function;
-        }
-        const Id address{OpFunctionParameter(U64)};
-        const Id value{OpFunctionParameter(U32[1])};
-        const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
-        define_body(&StorageDefinitions::U32, address, storage_types.U32.element, 2,
-                    [&](Id pointer, Id, Id) {
-                        OpReturnValue(opcode == IR::Opcode::GlobalAtomicIAdd32
-                                          ? OpAtomicIAdd(U32[1], pointer, scope, u32_zero_value, value)
-                                          : OpAtomicUMax(U32[1], pointer, scope, u32_zero_value, value));
+        const auto kind = static_cast<GlobalAtomic>(index);
+        const Id type{kind == AddF32 ? F32[1] : U32[1]};
+        const Id func_id{OpFunction(type, spv::FunctionControlMask::MaskNone,
+                                    TypeFunction(type, U64, type))};
+        const Id addr{OpFunctionParameter(U64)};
+        const Id value{OpFunctionParameter(type)};
+        define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
+                    [&](Id pointer, Id ssbo, Id word) {
+                        const auto atomic = [&](Id (Sirit::Module::*op)(Id, Id, Id, Id, Id)) {
+                            return (this->*op)(U32[1], pointer, scope, zero, value);
+                        };
+                        switch (kind) {
+                        case IAdd: OpReturnValue(atomic(&Sirit::Module::OpAtomicIAdd)); break;
+                        case SMin: OpReturnValue(atomic(&Sirit::Module::OpAtomicSMin)); break;
+                        case UMin: OpReturnValue(atomic(&Sirit::Module::OpAtomicUMin)); break;
+                        case SMax: OpReturnValue(atomic(&Sirit::Module::OpAtomicSMax)); break;
+                        case UMax: OpReturnValue(atomic(&Sirit::Module::OpAtomicUMax)); break;
+                        case And: OpReturnValue(atomic(&Sirit::Module::OpAtomicAnd)); break;
+                        case Or: OpReturnValue(atomic(&Sirit::Module::OpAtomicOr)); break;
+                        case Xor: OpReturnValue(atomic(&Sirit::Module::OpAtomicXor)); break;
+                        case Exchange: OpReturnValue(atomic(&Sirit::Module::OpAtomicExchange)); break;
+                        case Inc:
+                            OpReturnValue(OpFunctionCall(U32[1], increment_cas_ssbo, word, value, ssbo));
+                            break;
+                        case Dec:
+                            OpReturnValue(OpFunctionCall(U32[1], decrement_cas_ssbo, word, value, ssbo));
+                            break;
+                        case AddF32:
+                            OpReturnValue(OpFunctionCall(F32[1], f32_add_cas, word, value, ssbo));
+                            break;
+                        case Count: break;
+                        }
                     });
-        OpReturnValue(u32_zero_value);
+        OpReturnValue(ConstantNull(type));
         OpFunctionEnd();
+        global_atomic_funcs[index] = func_id;
     }
     if (std::ranges::any_of(program.blocks, [](const IR::Block* block) {
             return std::ranges::any_of(block->Instructions(), [](const IR::Inst& inst) {
@@ -1202,7 +1246,6 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         const Id address{OpFunctionParameter(U64)};
         const Id comparator{OpFunctionParameter(U32[1])};
         const Id value{OpFunctionParameter(U32[1])};
-        const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
         define_body(&StorageDefinitions::U32, address, storage_types.U32.element, 2,
                     [&](Id pointer, Id, Id) {
                         OpReturnValue(OpAtomicCompareExchange(U32[1], pointer, scope,
@@ -1656,7 +1699,7 @@ void EmitContext::DefineInputs(const IR::Program& program) {
     if (info.uses_is_helper_invocation) {
         is_helper_invocation = DefineInput(*this, U1, false, spv::BuiltIn::HelperInvocation);
     }
-    if (info.uses_subgroup_mask && profile.SupportsSubgroupStage(stage)) {
+    if (info.uses_subgroup_mask && SupportsSubgroups()) {
         subgroup_mask_eq = DefineInput(*this, U32[4], false, spv::BuiltIn::SubgroupEqMaskKHR);
         subgroup_mask_lt = DefineInput(*this, U32[4], false, spv::BuiltIn::SubgroupLtMaskKHR);
         subgroup_mask_le = DefineInput(*this, U32[4], false, spv::BuiltIn::SubgroupLeMaskKHR);
@@ -1673,7 +1716,7 @@ void EmitContext::DefineInputs(const IR::Program& program) {
     if ((info.uses_fswzadd || info.uses_subgroup_invocation_id || info.uses_subgroup_shuffles ||
          (profile.warp_size_potentially_larger_than_guest &&
           (info.uses_subgroup_vote || info.uses_subgroup_mask))) &&
-        profile.SupportsSubgroupStage(stage)) {
+        SupportsSubgroups()) {
         AddCapability(spv::Capability::GroupNonUniform);
         subgroup_local_invocation_id =
             DefineInput(*this, U32[1], false, spv::BuiltIn::SubgroupLocalInvocationId);
@@ -1838,16 +1881,22 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     if (stage != Stage::Task && stage != Stage::Mesh) {
         return;
     }
-    AddExtension("SPV_EXT_mesh_shader");
-    AddCapability(spv::Capability::MeshShadingEXT);
+    // Mesh emulation: a compute shader with the same workgroup memory, writing a storage buffer.
+    const bool as_compute{runtime_info.mesh_as_compute};
+    if (!as_compute) {
+        AddExtension("SPV_EXT_mesh_shader");
+        AddCapability(spv::Capability::MeshShadingEXT);
+    }
     mesh_info = program.mesh;
     mesh_threads = program.workgroup_size[0];
-    // The task's output region, which its mesh workgroups read as their input region.
-    const Id payload_type{TypeArray(U32[1], Const(mesh_info.payload_words))};
-    mesh_payload = DefineVariable(*this, payload_type, std::nullopt,
-                                  spv::StorageClass::TaskPayloadWorkgroupEXT);
+    // The task's output region, which its mesh workgroups read as their input region. In the
+    // emulation it is plain workgroup memory, copied through the task payload buffer.
+    const spv::StorageClass payload_class{as_compute ? spv::StorageClass::Workgroup
+                                                     : spv::StorageClass::TaskPayloadWorkgroupEXT};
+    const Id payload_type{TypeArray(U32[1], Const((std::max)(mesh_info.payload_words, 1U)))};
+    mesh_payload = DefineVariable(*this, payload_type, std::nullopt, payload_class);
     Name(mesh_payload, "task_payload");
-    mesh_payload_u32 = TypePointer(spv::StorageClass::TaskPayloadWorkgroupEXT, U32[1]);
+    mesh_payload_u32 = TypePointer(payload_class, U32[1]);
     if (stage == Stage::Task) {
         return;
     }
@@ -1859,7 +1908,7 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     mesh_attribute_words = (std::max)(
         mesh_primitive_base + Common::DivCeil(mesh_info.max_primitives, 32U) * primitive_lines * 32,
         1U);
-    mesh_map_bytes = 4 + 3 * mesh_info.max_primitives;
+    mesh_map_bytes = 4 + mesh_info.PrimitiveVertices() * mesh_info.max_primitives;
     mesh_shared_u32 = TypePointer(spv::StorageClass::Workgroup, U32[1]);
     mesh_attributes = DefineVariable(*this, TypeArray(U32[1], Const(mesh_attribute_words)),
                                      std::nullopt, spv::StorageClass::Workgroup);
@@ -1871,13 +1920,26 @@ void EmitContext::DefineMesh(const IR::Program& program) {
         DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Workgroup);
     Name(mesh_primitive_count, "isbe_primitive_count");
 
+    if (as_compute) {
+        return; // the output buffer: DefineMeshEmulationOutput, after the storage buffers
+    }
+
     const Id vertex_count{Const(mesh_info.max_vertices)};
     const Id primitive_count{Const(mesh_info.max_primitives)};
-    mesh_primitive_indices =
-        DefineVariable(*this, TypeArray(U32[3], primitive_count),
-                       spv::BuiltIn::PrimitiveTriangleIndicesEXT, spv::StorageClass::Output);
+    const u32 primitive_vertices{mesh_info.PrimitiveVertices()};
+    mesh_primitive_indices = DefineVariable(
+        *this, TypeArray(U32[primitive_vertices], primitive_count),
+        primitive_vertices == 1   ? spv::BuiltIn::PrimitivePointIndicesEXT
+        : primitive_vertices == 2 ? spv::BuiltIn::PrimitiveLineIndicesEXT
+                                  : spv::BuiltIn::PrimitiveTriangleIndicesEXT,
+        spv::StorageClass::Output);
     std::array<Id, IR::NUM_GENERICS> generics[2]{};
-    Id point_size{}, primitive_layer{}, primitive_viewport{}, primitive_id_output{};
+    Id& point_size{mesh_point_size};
+    Id primitive_layer{}, primitive_viewport{}, primitive_id_output{};
+    if (primitive_vertices == 1) {
+        point_size = DefineVariable(*this, TypeArray(F32[1], vertex_count), spv::BuiltIn::PointSize,
+                                    spv::StorageClass::Output);
+    }
     const auto per_primitive_builtin = [&](Id& variable, spv::BuiltIn builtin) {
         if (!Sirit::ValidId(variable)) {
             variable = DefineVariable(*this, TypeArray(U32[1], primitive_count), builtin,
@@ -1940,6 +2002,58 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     }
     for (const u32 line : mesh_info.primitive_lines) {
         mesh_primitive_targets.push_back(target(line, true));
+    }
+}
+
+void EmitContext::DefineMeshEmulationOutput() {
+    if ((stage != Stage::Mesh && stage != Stage::Task) || !runtime_info.mesh_as_compute) {
+        return;
+    }
+    // u32 arrays: the output MeshEpilogue writes each workgroup's block to
+    // (EmitMeshEmulationVertex) and the task payload, offset and argument buffers (RuntimeInfo).
+    // Sirit shares identical types, so reuse the u32 storage buffer type when the program's own
+    // storage buffers declared it: decorating it again would be invalid SPIR-V.
+    AddExtension("SPV_KHR_storage_buffer_storage_class");
+    Id struct_pointer{storage_types.U32.array};
+    if (!Sirit::ValidId(struct_pointer)) {
+        const Id array_type{TypeRuntimeArray(U32[1])};
+        Decorate(array_type, spv::Decoration::ArrayStride, 4U);
+        const Id struct_type{TypeStruct(array_type)};
+        Decorate(struct_type, spv::Decoration::Block);
+        MemberDecorate(struct_type, 0, spv::Decoration::Offset, 0U);
+        struct_pointer = TypePointer(spv::StorageClass::StorageBuffer, struct_type);
+    }
+    const auto define = [&](u32 binding, std::string_view name) {
+        const Id buffer{AddGlobalVariable(struct_pointer, spv::StorageClass::StorageBuffer)};
+        Decorate(buffer, spv::Decoration::Binding, binding);
+        Decorate(buffer, spv::Decoration::DescriptorSet, 0U);
+        Name(buffer, name);
+        if (profile.supported_spirv >= 0x00010400) {
+            interfaces.push_back(buffer);
+        }
+        return buffer;
+    };
+    mesh_output_u32 = TypePointer(spv::StorageClass::StorageBuffer, U32[1]);
+    const bool has_task{runtime_info.mesh_task_payload_binding != ~0U};
+    if (has_task) {
+        mesh_task_payload_buffer =
+            define(runtime_info.mesh_task_payload_binding, "mesh_emulation_task_payload");
+    }
+    if (stage == Stage::Task) {
+        return;
+    }
+    mesh_output_buffer = define(runtime_info.mesh_output_binding, "mesh_emulation_output");
+    if (has_task) {
+        mesh_task_offsets_buffer =
+            define(runtime_info.mesh_task_offsets_binding, "mesh_emulation_task_offsets");
+        mesh_task_args_buffer =
+            define(runtime_info.mesh_task_args_binding, "mesh_emulation_task_args");
+        mesh_group_index = AddGlobalVariable(TypePointer(spv::StorageClass::Private, U32[1]),
+                                             spv::StorageClass::Private);
+        Name(mesh_group_index, "mesh_group_index");
+        if (profile.supported_spirv >= 0x00010400) {
+            interfaces.push_back(mesh_group_index);
+        }
     }
 }
 

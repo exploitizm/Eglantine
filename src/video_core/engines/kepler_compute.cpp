@@ -35,6 +35,7 @@
 #include "video_core/game_dlss_status.h"
 #include "video_core/memory_manager.h"
 #include "video_core/native_query_trace.h"
+#include "video_core/oot_network.h"
 #ifdef ARCHITECTURE_x86_64
 #include "video_core/macro_turing_jit.h"
 #endif
@@ -54,6 +55,12 @@ KeplerCompute::KeplerCompute(MemoryManager& memory_manager_)
                      fmt::ptr(this), memory_manager.GetID());
         };
     }
+    native_qmd.skipped_release = [](u64 address, std::size_t slot, std::span<const u32, 4> words) {
+        static std::unordered_set<u32> logged;
+        if (!logged.insert(words[1]).second) return;
+        LOG_WARNING(HW_GPU, "Native QMD {:#x} skipped release slot {} with unsupported format, words={:08x}",
+                    address, slot, fmt::join(words, ","));
+    };
     execution_mask.reset();
     execution_mask[KEPLER_COMPUTE_REG_INDEX(exec_upload)] = true;
     execution_mask[KEPLER_COMPUTE_REG_INDEX(data_upload)] = true;
@@ -111,16 +118,8 @@ void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
     if ((argument >> 3) & 1) {
         const u32 reduction = (argument >> 9) & 7;
         rasterizer->SignalFence([this, address, payload, reduction] {
-            const u32 old_value = memory_manager.Read<u32>(address);
-            const u32 value = reduction == 0   ? old_value + payload
-                              : reduction == 1 ? (std::min)(old_value, payload)
-                              : reduction == 2 ? (std::max)(old_value, payload)
-                              : reduction == 3 ? (old_value >= payload ? 0 : old_value + 1)
-                              : reduction == 4 ? (old_value == 0 || old_value > payload ? payload : old_value - 1)
-                              : reduction == 5 ? (old_value & payload)
-                              : reduction == 6 ? (old_value | payload)
-                                               : (old_value ^ payload);
-            memory_manager.Write<u32>(address, value);
+            memory_manager.Write<u32>(address, ReduceSemaphore(reduction, false,
+                                                               memory_manager.Read<u32>(address), payload));
         });
         return;
     }
@@ -370,10 +369,12 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                 return true;
             },
             [&](u64 address, u32 payload, u32 flags) {
-                if (!memory_manager.IsFullyMappedRange(address, sizeof(payload))) return false;
+                const bool four_words = (flags >> 30) == 0;
+                if (!memory_manager.IsFullyMappedRange(address, four_words ? 16 : sizeof(payload))) return false;
                 if (flags & (1U << 26)) {
-                    rasterizer->SignalFence([this, address, payload] {
-                        const u32 value = memory_manager.Read<u32>(address) + payload;
+                    rasterizer->SignalFence([this, address, payload, flags] {
+                        const u32 value = ReduceSemaphore((flags >> 20) & 7, (flags >> 24) & 1,
+                                                          memory_manager.Read<u32>(address), payload);
                         memory_manager.Write<u32>(address, value);
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
                             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
@@ -383,11 +384,15 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                             return text ? u64{std::strtoull(text, nullptr, 16)} : u64{};
                         }();
                         if (watch != 0 && (address & ~u64{0xf}) == watch) {
-                            LOG_INFO(HW_GPU, "Semaphore watch: QMD release add {:#x} -> {:#x}", address, value);
+                            LOG_INFO(HW_GPU, "Semaphore watch: QMD release reduction {:#x} -> {:#x}", address, value);
                         }
                         VideoCommon::TraceNativeQuery(1, memory_manager.GetID(), address,
                             memory_manager.GpuToCpuAddress(address).value_or(0), 0, value, 1U << 26);
                     });
+                } else if (four_words) {
+                    rasterizer->Query(address, VideoCommon::QueryType::Payload,
+                        VideoCommon::QueryPropertiesFlags::IsAFence | VideoCommon::QueryPropertiesFlags::HasTimeout,
+                        payload, 0);
                 } else if (flags & (1U << 19)) {
                     // NVN2 tracks QMD completion with a max release (bit 19) into a word other
                     // releases also advance: a plain write would move it backwards and leave
@@ -449,6 +454,9 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
 }
 
 void KeplerCompute::CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
+    if (front_macros && !VideoCommon::GpuSplit::OnBackThread()) {
+        ReleaseFront();
+    }
     if (native_mode) {
         // Most of the compute class's register writes (QMD fields replayed by its macros for
         // each of thousands of dispatches a second) only store the value: ~4% of title 1's GPU
@@ -1283,6 +1291,112 @@ void KeplerCompute::DescribeNativeResources(const NativeQmdScheduler::Descriptor
     }
 }
 
+std::optional<Texture::TICEntry> KeplerCompute::ConstBuffer0Image(u32 offset) const {
+    const auto& cbuf = launch_description.const_buffer_config[0];
+    const GPUVAddr cbuf_address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
+    if (!(launch_description.const_buffer_enable_mask & 1) || cbuf.size.Value() < offset + 4 ||
+        !memory_manager.IsFullyMappedRange(cbuf_address + offset, 4)) {
+        return std::nullopt;
+    }
+    const u32 tic_index = memory_manager.Read<u32>(cbuf_address + offset) & 0xfffff;
+    if (tic_index > regs.tic.limit ||
+        !memory_manager.IsFullyMappedRange(regs.tic.Address() +
+                                               u64{tic_index} * sizeof(Texture::TICEntry),
+                                           sizeof(Texture::TICEntry))) {
+        return std::nullopt;
+    }
+    return GetTICEntry(tic_index);
+}
+
+bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
+    using namespace VideoCommon::OotNetwork;
+    if (!BypassEnabled(program_id)) {
+        return false;
+    }
+    auto* const state = rasterizer->OotNetworkBypass();
+    if (!state) {
+        return false;
+    }
+    // The tonemap pass draws before the network every frame; until it has been seen (menus, the
+    // first frame) the network runs as usual. Its first passes are skipped only while the output
+    // pass is being replaced, so a failed replacement brings the whole network back next frame.
+    Maxwell3D::Regs::RenderTargetConfig tonemapped;
+    {
+        std::scoped_lock lock{state->mutex};
+        tonemapped = state->tonemapped;
+    }
+    if (tonemapped.Address() == 0) {
+        return false;
+    }
+    if (native_key == PrepassProgramKey || native_key == NetworkProgramKey) {
+        return state->output_replaced.load(std::memory_order_relaxed);
+    }
+    if (native_key != OutputProgramKey) {
+        return false;
+    }
+    // The copy needs the tonemapped image to be a B10G11R11 block-linear image of the output's size.
+    const auto output = ConstBuffer0Image(OutputImageHandleOffset);
+    if (!output || output->format != Texture::TextureFormat::B10G11R11 || output->Address() == 0 ||
+        output->Address() == tonemapped.Address() || !output->IsBlockLinear() ||
+        tonemapped.format != Tegra::RenderTargetFormat::B10G11R11_FLOAT ||
+        tonemapped.tile_mode.is_pitch_linear || tonemapped.width != output->Width() ||
+        tonemapped.height != output->Height()) {
+        state->output_replaced.store(false, std::memory_order_relaxed);
+        static bool warned = false;
+        if (!std::exchange(warned, true)) {
+            LOG_WARNING(HW_GPU,
+                        "Ocarina of Time: unexpected network images; not replaced (tonemapped {}x{}, "
+                        "output {})",
+                        tonemapped.width, tonemapped.height,
+                        output ? fmt::format("{}x{}", output->Width(), output->Height())
+                               : std::string{"unreadable"});
+        }
+        return false;
+    }
+    Fermi2D::Surface destination{};
+    destination.format = Tegra::RenderTargetFormat::B10G11R11_FLOAT;
+    destination.linear = Fermi2D::MemoryLayout::BlockLinear;
+    destination.block_width.Assign(output->block_width);
+    destination.block_height.Assign(output->block_height);
+    destination.block_depth.Assign(output->block_depth);
+    destination.depth = 1;
+    destination.width = output->Width();
+    destination.height = output->Height();
+    destination.addr_upper = static_cast<u32>(output->Address() >> 32);
+    destination.addr_lower = static_cast<u32>(output->Address());
+    Fermi2D::Surface source = destination;
+    source.block_width.Assign(tonemapped.tile_mode.block_width);
+    source.block_height.Assign(tonemapped.tile_mode.block_height);
+    source.block_depth.Assign(tonemapped.tile_mode.block_depth);
+    source.addr_upper = tonemapped.address_high;
+    source.addr_lower = tonemapped.address_low;
+    const s32 width = static_cast<s32>(output->Width());
+    const s32 height = static_cast<s32>(output->Height());
+    const Fermi2D::Config config{
+        .operation = Fermi2D::Operation::SrcCopy,
+        .filter = Fermi2D::Filter::Point,
+        .must_accelerate = true,
+        .dst_x0 = 0,
+        .dst_y0 = 0,
+        .dst_x1 = width,
+        .dst_y1 = height,
+        .src_x0 = 0,
+        .src_y0 = 0,
+        .src_x1 = width,
+        .src_y1 = height,
+    };
+    const bool copied = rasterizer->AccelerateSurfaceCopy(source, destination, config);
+    state->output_replaced.store(copied, std::memory_order_relaxed);
+    static bool logged = false;
+    if (!std::exchange(logged, true)) {
+        LOG_INFO(HW_GPU,
+                 "Ocarina of Time: anti-aliasing network bypassed ({}): {:#x} -> {:#x} {}x{}",
+                 copied ? "copy of the tonemapped image" : "copy failed", tonemapped.Address(),
+                 output->Address(), width, height);
+    }
+    return copied;
+}
+
 std::atomic<u32> g_nx2_trace_draws_after_upscale{};
 
 // Fire Emblem: Fortune's Weave's first DLSS pass (rejected, before the network) has the input colour
@@ -1541,6 +1655,18 @@ KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
         front_macros = true;
     }
     return *front;
+}
+
+// As Maxwell3D::ReleaseFront: the split stopped, the engine runs its macros again.
+void KeplerCompute::ReleaseFront() {
+    native_executing_macro = front->executing_macro;
+    native_parameters = std::move(front->parameters);
+    native_compute_uploaded = front->compute_uploaded;
+    native_bind_pointer = front->bind_pointer;
+    native_macro = front->macro;
+    front.reset();
+    front_macros = false;
+    LOG_INFO(HW_GPU, "GPU thread split stopped: compute macros back on the engine");
 }
 
 void KeplerCompute::FrontApply(FrontState& fs, u32 method, u32 argument) {

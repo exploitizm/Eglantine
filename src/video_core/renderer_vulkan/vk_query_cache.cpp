@@ -219,6 +219,15 @@ public:
         // Time's title screen and file select reached 16,384 slots over 64 banks (its gameplay
         // windows span at most 36 slots). Past a bank, drop the count as a reset would.
         if (current_query && current_query->size_slots > SamplesQueryBank::BANK_SIZE) {
+            // It drops a real count. Logged on the 1st, 2nd, 4th, 8th... drop, so a window this
+            // long during gameplay doesn't go unnoticed and a title screen doesn't flood the log.
+            ++bank_bound_resets;
+            if ((bank_bound_resets & (bank_bound_resets - 1)) == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "Samples query ran {} slots with no reset or report, dropped its "
+                            "count (drop {})",
+                            current_query->size_slots, bank_bound_resets);
+            }
             ResetCounter();
         }
     }
@@ -625,6 +634,7 @@ private:
     bool accumulation_since_last_sync{};
     VideoCommon::HostQueryBase* current_query;
     bool has_started{};
+    u64 bank_bound_resets{}; ///< Counts CloseCounter dropped once a query outgrew a bank.
     std::mutex flush_guard;
     std::optional<QueriesPrefixScanPass> queries_prefix_scan_pass;
 };

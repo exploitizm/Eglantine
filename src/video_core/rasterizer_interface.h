@@ -34,6 +34,10 @@ struct TICEntry;
 }
 } // namespace Tegra
 
+namespace VideoCommon::OotNetwork {
+struct BypassState;
+}
+
 namespace VideoCore {
 
 enum class LoadCallbackStage {
@@ -94,6 +98,11 @@ public:
 
     /// Release all pending fences.
     virtual void ReleaseFences(bool force = true) = 0;
+
+    /// Writes the region's query reports to guest memory, waiting for pending host results.
+    virtual void FlushQueryResults(DAddr addr, u64 size) {
+        FlushRegion(addr, size, VideoCommon::CacheType::QueryCache);
+    }
 
     /// Notify rasterizer that all caches should be flushed to Switch memory
     virtual void FlushAll() = 0;
@@ -156,6 +165,13 @@ public:
 
     /// Notify rasterizer that any caches of the specified region are desync with guest
     virtual void OnCacheInvalidation(PAddr addr, u64 size) = 0;
+
+    /// OnCacheInvalidation for each of the CPU writes InvalidateGPUCache collected.
+    virtual void OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
+        for (const auto& [addr, size] : ranges) {
+            OnCacheInvalidation(addr, size);
+        }
+    }
 
     virtual bool TryCacheInvalidation(DAddr addr, u64 size) {
         if (MustFlushRegion(addr, size, VideoCommon::CacheType::BufferCache)) return false;
@@ -238,6 +254,12 @@ public:
     [[nodiscard]] virtual std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(
         const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst) {
         return std::nullopt;
+    }
+
+    /// State of the Ocarina of Time anti-aliasing network bypass (oot_network.h), or null when
+    /// this backend cannot bypass it or NVIDIA DLSS replaces the same output pass.
+    [[nodiscard]] virtual VideoCommon::OotNetwork::BypassState* OotNetworkBypass() {
+        return nullptr;
     }
 
     [[nodiscard]] virtual Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() = 0;

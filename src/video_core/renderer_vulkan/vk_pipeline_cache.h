@@ -111,6 +111,11 @@ struct ShaderPools {
 struct ComputePipelineCacheEntry {
     std::unique_ptr<ComputePipeline> pipeline;
     std::string failure;
+    /// Constant buffer slots that were null pointers at translation (see NullStoragePointerSlots)
+    std::vector<std::pair<u32, u32>> null_pointer_slots;
+    /// Constant buffer slots bound as storage buffer pointers (see MappedStoragePointerKeys)
+    std::vector<u64> mapped_pointers;
+    u32 rebuilds{};
 
     [[nodiscard]] ComputePipeline* Get(bool native, GPUVAddr address,
                                        const ComputePipelineCacheKey& key) const;
@@ -140,7 +145,7 @@ private:
 
     /// Returns `pipeline` when it is built or its draw must wait for it, nullptr when the draw
     /// may be skipped while it builds (asynchronous shaders, CanDiscardPendingDraw).
-    [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) const noexcept;
+    [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) noexcept;
 
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
 
@@ -150,8 +155,13 @@ private:
         bool build_in_parallel, std::shared_ptr<ShaderPools> emit_pools = nullptr,
         std::unique_ptr<EmissionBudget::Reservation> reservation = nullptr);
 
+    [[nodiscard]] bool StaleNullPointerSlot(const ComputePipelineCacheEntry& entry) const;
+
+    /// Translates the current compute program, binding the pointers in keep_pointers whatever
+    /// their slots hold now (see GenericEnvironment::KeepStoragePointers)
     ComputePipelineCacheEntry CreateComputePipeline(const ComputePipelineCacheKey& key,
-                                                     const ShaderInfo* shader);
+                                                    const ShaderInfo* shader,
+                                                    std::span<const u64> keep_pointers = {});
 
     ComputePipelineCacheEntry CreateComputePipeline(ShaderPools& pools,
                                                      const ComputePipelineCacheKey& key,
@@ -187,10 +197,17 @@ private:
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();
     u64 frame_count{};
+    /// Wait budget of native draws for unbuilt pipelines left in this frame, in microseconds
+    /// (native_async_draws = Bounded). Only touched on the GPU thread; reset in TickFrame.
+    s64 native_wait_budget_us{8000};
+    s64 native_wait_used_us{}; ///< Budget spent since the last 10 s log line.
     std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> evicted_pipelines; ///< (tick, pipeline)
     std::unordered_set<u64> used_and_evicted; ///< Key hashes of pipelines used this session, evicted since
 
     ::Common::unordered_map<ComputePipelineCacheKey, ComputePipelineCacheEntry> compute_cache;
+    /// Replaced compute pipelines, destroyed once the GPU and their queued build are done with
+    /// them (tick, pipeline)
+    std::deque<std::pair<u64, std::unique_ptr<ComputePipeline>>> retired_compute_pipelines;
     ::Common::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> graphics_cache;
 
     ShaderPools main_pools;

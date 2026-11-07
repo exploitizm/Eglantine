@@ -163,6 +163,9 @@ public:
                 wait_cv.notify_all();
             });
             SignalFence(std::move(func));
+            // The fence's commands can be held back by a deferred flush that only this thread
+            // submits. The fencing thread waits for that submission before releasing the fence,
+            // so waiting here without submitting deadlocks (Ocarina of Time entering gameplay).
             SubmitDeferredWork();
             std::unique_lock lk(wait_mutex);
             wait_cv.wait(
@@ -199,6 +202,7 @@ protected:
     virtual bool IsFenceSignaled(TFence& fence) const = 0;
     /// Waits until a fence has been signalled by the host GPU.
     virtual void WaitFence(TFence& fence) = 0;
+    /// Submits work whose submission the backend deferred (called before blocking on a fence).
     virtual void SubmitDeferredWork() {}
 
     VideoCore::RasterizerInterface& rasterizer;
