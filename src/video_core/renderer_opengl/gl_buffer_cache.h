@@ -207,6 +207,12 @@ public:
         return static_cast<u32>(device.GetShaderStorageBufferAlignment());
     }
 
+    /// Largest range of a storage buffer binding (GL_MAX_SHADER_STORAGE_BLOCK_SIZE)
+    u32 GetMaxStorageBufferRange() const {
+        return static_cast<u32>((std::min)(device.GetMaxShaderStorageBlockSize(),
+                                           u64{(std::numeric_limits<u32>::max)()}));
+    }
+
 private:
     static constexpr std::array PABO_LUT{
         GL_VERTEX_PROGRAM_PARAMETER_BUFFER_NV,          GL_TESS_CONTROL_PROGRAM_PARAMETER_BUFFER_NV,
