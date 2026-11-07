@@ -117,35 +117,6 @@ AppLoader_NUP::AppLoader_NUP(FileSys::VirtualFile file_)
 
     const auto& program = nup->GetPackages()[*program_index];
     base_title_id = program.title_id;
-
-    NupContainer::PackageInfo meta;
-    meta.title_id = program.title_id;
-    meta.title_name = program.title_name;
-    meta.localized_titles = program.localized_titles;
-    meta.source_dump = program.source_dump;
-    meta.publisher = program.publisher;
-    meta.icon = program.icon;
-    meta.localized_icons = program.localized_icons;
-    if (base_index && *base_index != *program_index) {
-        const auto& base = nup->GetPackages()[*base_index];
-        if (!base.title_name.empty()) {
-            meta.title_name = base.title_name;
-        }
-        if (!base.localized_titles.empty()) {
-            meta.localized_titles = base.localized_titles;
-        }
-        if (!base.source_dump.empty()) {
-            meta.source_dump = base.source_dump;
-        }
-        if (!base.publisher.empty()) {
-            meta.publisher = base.publisher;
-        }
-        if (!base.icon.empty() || !base.localized_icons.empty()) {
-            meta.icon = base.icon;
-            meta.localized_icons = base.localized_icons;
-        }
-    }
-    display_title = meta.title_name;
     has_program = true;
 
     const auto exefs = nup->GetExeFSDir(*exefs_index);
@@ -164,19 +135,19 @@ AppLoader_NUP::AppLoader_NUP(FileSys::VirtualFile file_)
         display_version = program.display_version.empty() ? DecodeVersion(program.version)
                                                           : program.display_version;
     }
-    nacp_file = BuildNacp(meta, display_version);
-    if (!meta.icon.empty()) {
-        icon_file = std::make_shared<FileSys::VectorVfsFile>(meta.icon, "icon.dat");
-    } else {
-        for (const auto& [lang, icon] : meta.localized_icons) {
+    nacp_file = BuildNacp(program, display_version);
+    if (!program.icon.empty()) {
+        icon_file = std::make_shared<FileSys::VectorVfsFile>(program.icon, "icon.dat");
+    } else if (!program.localized_icons.empty()) {
+        for (const auto& [lang, icon] : program.localized_icons) {
             if (lang == "en-us") {
                 icon_file = std::make_shared<FileSys::VectorVfsFile>(icon, "icon_" + lang + ".dat");
                 break;
             }
         }
-        if (icon_file == nullptr && !meta.localized_icons.empty()) {
+        if (icon_file == nullptr && !program.localized_icons.empty()) {
             icon_file = std::make_shared<FileSys::VectorVfsFile>(
-                meta.localized_icons.front().second, "icon.dat");
+                program.localized_icons.front().second, "icon.dat");
         }
     }
 
