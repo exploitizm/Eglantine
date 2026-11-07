@@ -254,7 +254,11 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
         dynamic_state.Refresh2(regs, topology_, extended_dynamic_state_2);
     }
     if (!extended_dynamic_state_3_blend) {
-        if (maxwell3d.dirty.flags[Dirty::Blending]) {
+        // Without dynamic blending the blend state is part of the pipeline: read it on every
+        // refresh, not only when Dirty::Blending is set. Writes that change it without setting the
+        // flag left a pipeline with the previous draw's blending, which showed as a white veil and
+        // flashes on AMD (Ocarina of Time; Shakoquo's Lichii-sharkiix-version, via Aflakon).
+        {
             maxwell3d.dirty.flags[Dirty::Blending] = false;
             for (size_t index = 0; index < attachments.size(); ++index) {
                 attachments[index].Refresh(regs, index);

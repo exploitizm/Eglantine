@@ -4712,6 +4712,10 @@ Sampler::VariantKey Sampler::MakeKey(const ImageView& image_view, bool is_depth)
     key.drop_reduction = has_minmax_reduction && !image_view.SupportsMinmaxFilter();
     key.drop_custom_border = has_custom_border_colors && image_view.RequiresBorderColorFormat();
     key.srgb_border = has_srgb_border_color && IsPixelFormatSRGB(image_view.format);
+    // A depth-compare sampler read by a plain sample (not a shadow lookup): without the compare.
+    // AMD returns the compare's result for it (white where it should be the texture), and fog
+    // shaders were rejected (Ocarina of Time; Shakoquo's Lichii-sharkiix-version, via Aflakon).
+    key.drop_compare = has_depth_comparison && !is_depth;
     if (needs_swizzle_mapping && !key.drop_custom_border && !image_view.HasIdentitySwizzle()) {
         const VkComponentMapping& mapping = image_view.Swizzle();
         key.swizzle = {mapping.r, mapping.g, mapping.b, mapping.a};
@@ -4776,6 +4780,9 @@ VkSampler Sampler::Emplace(VariantKey key) {
 
     VkSamplerCreateInfo create_info = base_ci;
     create_info.pNext = chain;
+    if (key.drop_compare) {
+        create_info.compareEnable = VK_FALSE;
+    }
     if (key.force_nearest) {
         create_info.magFilter = VK_FILTER_NEAREST;
         create_info.minFilter = VK_FILTER_NEAREST;
